@@ -31,7 +31,7 @@ reqwest = { workspace = true }
 # Pinned to 0.15 — openlark-auth 0.16 added an exact `uuid = "=1.6.1"`
 # pin that conflicts with the rest of the workspace. Revisit when upstream
 # relaxes the constraint.
-openlark = { version = "0.15", default-features = false, features = ["auth", "communication", "websocket"] }
+openlark = { version = "0.17", default-features = false, features = ["auth", "communication", "websocket"] }
 # rustls is pulled in transitively (via reqwest + tokio-tungstenite via
 # openlark's WS client). Recent rustls releases require the consuming
 # binary to *explicitly* install a CryptoProvider before any TLS use,
