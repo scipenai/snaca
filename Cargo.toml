@@ -78,7 +78,7 @@ blake3 = "1.8"
 data-encoding = "2.11"
 
 # Time
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 
 # HTTP
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart", "query"] }
