@@ -231,6 +231,10 @@ impl Runtime {
                 Some(n) => Some(n),
                 None => Some(3),
             },
+            repeated_tool_failure_feedback: config
+                .engine
+                .repeated_tool_failure_feedback
+                .unwrap_or(true),
             history_max_bytes: config.engine.history_max_bytes.unwrap_or(1_500_000),
             // None keeps the engine-default behaviour (no wall-clock
             // cap). Operators opt in by setting a positive value.

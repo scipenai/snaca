@@ -409,10 +409,10 @@ impl Tool for BashTool {
         let combined = format_streams(&stdout_str, &stderr_str);
 
         if !status.success() {
+            let summary =
+                format_failure_summary(status.code().unwrap_or(-1), &stdout_str, &stderr_str);
             return Err(ToolError::Execution(format!(
-                "command exited with code {}\n{}",
-                status.code().unwrap_or(-1),
-                combined
+                "{summary}\n\nFull output:\n{combined}"
             )));
         }
 
@@ -443,6 +443,27 @@ fn format_streams(stdout: &str, stderr: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+fn format_failure_summary(code: i32, stdout: &str, stderr: &str) -> String {
+    let mut out = format!("command exited with code {code}");
+    let tail = failure_tail(stdout, stderr);
+    if !tail.is_empty() {
+        out.push_str("\n\nLikely relevant output tail:\n");
+        out.push_str(&tail);
+    }
+    out
+}
+
+fn failure_tail(stdout: &str, stderr: &str) -> String {
+    let source = if !stderr.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.len().saturating_sub(20);
+    lines[start..].join("\n")
 }
 
 fn is_first_word_allowed(first: &str) -> bool {

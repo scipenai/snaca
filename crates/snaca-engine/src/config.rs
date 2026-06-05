@@ -96,6 +96,14 @@ pub struct EngineConfig {
     /// retry with a full Read.
     pub loop_guard_max_repeats: Option<usize>,
 
+    /// If enabled, a repeated identical tool failure inside one turn
+    /// triggers a synthetic User feedback message before the model gets
+    /// another chance to continue. This gives the model an explicit
+    /// diagnostic nudge ("do not repeat this exact call; inspect the
+    /// error and change approach") before the harder loop guard aborts
+    /// the turn. Default true.
+    pub repeated_tool_failure_feedback: bool,
+
     /// Hard byte cap on the loaded history's serialised content
     /// before the LLM call. When the loaded history exceeds this,
     /// `load_history` drops the oldest messages until it fits. This
@@ -198,6 +206,7 @@ impl EngineConfig {
             compact_summary_max_tokens: 2048,
             compact_blocking: false,
             loop_guard_max_repeats: Some(5),
+            repeated_tool_failure_feedback: true,
             history_max_bytes: 1_500_000,
             turn_timeout_secs: None,
             concurrent_tool_limit: 5,

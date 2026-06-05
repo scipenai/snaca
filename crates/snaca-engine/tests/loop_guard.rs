@@ -13,7 +13,11 @@ use snaca_workspace::WorkspaceLayout;
 use std::sync::Arc;
 
 mod common;
+use async_trait::async_trait;
 use common::{EchoTool, MockLlmClient};
+use snaca_tools_api::{
+    ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolResult,
+};
 
 fn assistant_tool_call_with_input(id: &str, name: &str, input: Value) -> MessageResponse {
     MessageResponse {
@@ -39,6 +43,87 @@ struct Fixture {
     _tmp: tempfile::TempDir,
 }
 
+struct FailingTool;
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn name(&self) -> &str {
+        "Failing"
+    }
+
+    fn description(&self) -> &str {
+        "Always fails with the provided text."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"]
+        })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
+
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Never
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        Err(ToolError::Execution(format!("script failed: {text}")))
+    }
+}
+
+struct FlakyTool {
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl FlakyTool {
+    fn new() -> Self {
+        Self {
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FlakyTool {
+    fn name(&self) -> &str {
+        "Flaky"
+    }
+
+    fn description(&self) -> &str {
+        "Fails once, then succeeds."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {"text": {"type": "string"}}})
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
+
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Never
+    }
+
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+        let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            Err(ToolError::Execution("temporary failure".into()))
+        } else {
+            Ok(ToolOutput::text("recovered"))
+        }
+    }
+}
+
 async fn fixture(loop_guard_limit: Option<usize>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = WorkspaceLayout::new(tmp.path()).unwrap();
@@ -48,6 +133,25 @@ async fn fixture(loop_guard_limit: Option<usize>) -> Fixture {
     let mut cfg = EngineConfig::default_for("mock-model");
     cfg.loop_guard_max_repeats = loop_guard_limit;
     cfg.max_iterations = 100; // make sure max_iterations isn't what trips
+    let engine = Engine::new(llm.clone(), tools, db, workspace, cfg);
+    Fixture {
+        engine,
+        llm,
+        _tmp: tmp,
+    }
+}
+
+async fn fixture_with_tools(
+    loop_guard_limit: Option<usize>,
+    tools: snaca_tools_api::ToolRegistry,
+) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = WorkspaceLayout::new(tmp.path()).unwrap();
+    let db = Database::open_in_memory().await.unwrap();
+    let llm = Arc::new(MockLlmClient::new());
+    let mut cfg = EngineConfig::default_for("mock-model");
+    cfg.loop_guard_max_repeats = loop_guard_limit;
+    cfg.max_iterations = 100;
     let engine = Engine::new(llm.clone(), tools, db, workspace, cfg);
     Fixture {
         engine,
@@ -127,6 +231,134 @@ async fn loop_guard_disabled_via_none_config() {
 
     let outcome = fix.engine.handle_turn(turn_request()).await.unwrap();
     assert_eq!(outcome.iterations, 6);
+}
+
+#[tokio::test]
+async fn repeated_tool_failure_injects_diagnostic_feedback_and_continues() {
+    let tools = ToolRegistryBuilder::default().add(FailingTool).build();
+    let fix = fixture_with_tools(Some(3), tools).await;
+
+    for i in 0..2 {
+        fix.llm.enqueue(assistant_tool_call_with_input(
+            &format!("tu_fail_{i}"),
+            "Failing",
+            json!({"text": "same"}),
+        ));
+    }
+    fix.llm.enqueue(common::assistant_text("changed approach"));
+
+    let outcome = fix.engine.handle_turn(turn_request()).await.unwrap();
+    assert_eq!(outcome.assistant_text, "changed approach");
+    assert_eq!(outcome.iterations, 3);
+
+    let observed = fix.llm.observed_requests();
+    let third = observed.last().expect("third LLM request");
+    let feedback = third
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| ContentBlock::collect_text(&m.content))
+        .unwrap_or_default();
+    assert!(feedback.contains("identical tool call failed 2 times"));
+    assert!(feedback.contains("Tool: `Failing`"));
+    assert!(feedback.contains("\"text\":\"same\""));
+    assert!(feedback.contains("script failed: same"));
+    assert!(feedback.contains("Do not run this exact same `Failing` call again"));
+    assert!(feedback.contains("change the approach"));
+}
+
+#[tokio::test]
+async fn different_failed_inputs_do_not_inject_repeated_failure_feedback() {
+    let tools = ToolRegistryBuilder::default().add(FailingTool).build();
+    let fix = fixture_with_tools(Some(3), tools).await;
+
+    fix.llm.enqueue(assistant_tool_call_with_input(
+        "tu_fail_a",
+        "Failing",
+        json!({"text": "a"}),
+    ));
+    fix.llm.enqueue(assistant_tool_call_with_input(
+        "tu_fail_b",
+        "Failing",
+        json!({"text": "b"}),
+    ));
+    fix.llm.enqueue(common::assistant_text("done"));
+
+    let outcome = fix.engine.handle_turn(turn_request()).await.unwrap();
+    assert_eq!(outcome.assistant_text, "done");
+
+    let observed = fix.llm.observed_requests();
+    let third = observed.last().expect("third LLM request");
+    let combined_user_text = third
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| ContentBlock::collect_text(&m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!combined_user_text.contains("identical tool call failed"));
+}
+
+#[tokio::test]
+async fn reordered_object_keys_still_count_as_repeated_failure() {
+    let tools = ToolRegistryBuilder::default().add(FailingTool).build();
+    let fix = fixture_with_tools(Some(3), tools).await;
+
+    fix.llm.enqueue(assistant_tool_call_with_input(
+        "tu_fail_a",
+        "Failing",
+        json!({"text": "same", "extra": 1}),
+    ));
+    fix.llm.enqueue(assistant_tool_call_with_input(
+        "tu_fail_b",
+        "Failing",
+        json!({"extra": 1, "text": "same"}),
+    ));
+    fix.llm.enqueue(common::assistant_text("done"));
+
+    let outcome = fix.engine.handle_turn(turn_request()).await.unwrap();
+    assert_eq!(outcome.assistant_text, "done");
+
+    let observed = fix.llm.observed_requests();
+    let third = observed.last().expect("third LLM request");
+    let combined_user_text = third
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| ContentBlock::collect_text(&m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined_user_text.contains("identical tool call failed 2 times"));
+}
+
+#[tokio::test]
+async fn failure_then_success_does_not_inject_repeated_failure_feedback() {
+    let tools = ToolRegistryBuilder::default().add(FlakyTool::new()).build();
+    let fix = fixture_with_tools(Some(3), tools).await;
+
+    for i in 0..2 {
+        fix.llm.enqueue(assistant_tool_call_with_input(
+            &format!("tu_flaky_{i}"),
+            "Flaky",
+            json!({"text": "same"}),
+        ));
+    }
+    fix.llm.enqueue(common::assistant_text("done"));
+
+    let outcome = fix.engine.handle_turn(turn_request()).await.unwrap();
+    assert_eq!(outcome.assistant_text, "done");
+
+    let observed = fix.llm.observed_requests();
+    let third = observed.last().expect("third LLM request");
+    let combined_user_text = third
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| ContentBlock::collect_text(&m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!combined_user_text.contains("identical tool call failed"));
 }
 
 #[tokio::test]

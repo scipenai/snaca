@@ -65,6 +65,11 @@ model = "deepseek-chat"
 # self-similar tool chains the operator has explicitly accepted).
 # loop_guard_max_repeats = 3
 
+# Inject a synthetic User feedback message after the same tool call fails
+# twice in one turn, so the model diagnoses the error and changes approach
+# before the hard loop guard aborts. Default true.
+# repeated_tool_failure_feedback = true
+
 # Wall-clock cap on one turn in seconds. Default unset = no timeout
 # (extended-thinking models and long tool chains can legitimately
 # take minutes). Set on untrusted multi-tenant deployments to bound

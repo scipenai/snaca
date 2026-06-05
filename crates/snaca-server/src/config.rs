@@ -353,6 +353,12 @@ pub struct EngineSection {
     #[serde(default)]
     pub loop_guard_max_repeats: Option<usize>,
 
+    /// Enable synthetic User feedback when the same tool call fails
+    /// repeatedly inside one turn. Default true; set false to rely only
+    /// on raw tool_error messages plus loop_guard.
+    #[serde(default)]
+    pub repeated_tool_failure_feedback: Option<bool>,
+
     /// Memory embedder backend for vector recall. Recognised values:
     /// - `"none"` / unset → no recall, only the static MEMORY.md index
     /// - `"hash"` → deterministic stub (good for dev / smoke tests)

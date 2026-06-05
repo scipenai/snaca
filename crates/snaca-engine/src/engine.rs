@@ -86,6 +86,26 @@ pub struct TurnOutcome {
     pub outbound_files: Vec<OutboundFile>,
 }
 
+#[derive(Debug, Clone)]
+struct ToolFailureEvent {
+    tool: String,
+    input: Value,
+    input_signature: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct ToolBatchResult {
+    blocks: Vec<ContentBlock>,
+    failures: Vec<ToolFailureEvent>,
+}
+
+#[derive(Debug)]
+struct ToolBlockOutcome {
+    block: ContentBlock,
+    failure: Option<ToolFailureEvent>,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     llm: Arc<dyn LlmClient>,
@@ -691,6 +711,7 @@ impl Engine {
             // can't write valid JSON doesn't burn the whole iteration budget.
             let mut malformed_args_attempts: u8 = 0;
             let max_malformed_args_retries = self.config.malformed_tool_args_max_retries;
+            let mut repeated_tool_failures: HashMap<(String, String), usize> = HashMap::new();
 
             loop {
                 if iterations >= self.config.max_iterations {
@@ -998,7 +1019,7 @@ impl Engine {
                 }
 
                 // Tool calls — execute each, then append a tool message with the results.
-                let tool_results = match self
+                let tool_batch = match self
                     .run_tool_calls(
                         &resp.message.content,
                         &assistant_msg.id,
@@ -1034,7 +1055,7 @@ impl Engine {
                     Err(e) => return Err(e),
                 };
 
-                if tool_results.is_empty() {
+                if tool_batch.blocks.is_empty() {
                     // Model said "tool_use" but emitted no tool blocks — defensive
                     // exit; treat as terminal so we don't loop forever.
                     warn!("stop_reason=ToolUse but no ToolUse blocks; treating as terminal");
@@ -1054,9 +1075,38 @@ impl Engine {
                         thread_id: thread_id.clone(),
                         session_id,
                         role: Role::Tool,
-                        content: tool_results,
+                        content: tool_batch.blocks,
                     })
                     .await?;
+
+                if self.config.repeated_tool_failure_feedback {
+                    let mut feedback: Option<String> = None;
+                    for failure in tool_batch.failures {
+                        let key = (failure.tool.clone(), failure.input_signature.clone());
+                        let count = repeated_tool_failures.entry(key).or_insert(0);
+                        *count += 1;
+                        if *count >= 2 {
+                            feedback = Some(repeated_tool_failure_feedback(&failure, *count));
+                            warn!(
+                                tool = %failure.tool,
+                                count = *count,
+                                "repeated identical tool failure; injecting diagnostic feedback"
+                            );
+                            break;
+                        }
+                    }
+                    if let Some(text) = feedback {
+                        self.state
+                            .append_message(&NewMessage {
+                                thread_id: thread_id.clone(),
+                                session_id,
+                                role: Role::User,
+                                content: vec![ContentBlock::text(text)],
+                            })
+                            .await?;
+                        continue;
+                    }
+                }
             }
         };
 
@@ -2128,7 +2178,7 @@ impl Engine {
         tools: &ToolRegistry,
         loop_guard: Option<&mut LoopGuard>,
         mut prerun_cache: PrerunCache,
-    ) -> EngineResult<Vec<ContentBlock>> {
+    ) -> EngineResult<ToolBatchResult> {
         // 1. Collect every ToolUse block in original order. We keep
         // the position so the result list can be re-ordered to match
         // tool_use → tool_result (Anthropic / DeepSeek both require
@@ -2209,7 +2259,7 @@ impl Engine {
         // across parallel futures, so we move ownership up-front and
         // hand each future its own `Option`.
         let limit = self.config.concurrent_tool_limit.max(1);
-        let mut results: Vec<(usize, ContentBlock)> = Vec::with_capacity(pending.len());
+        let mut results: Vec<(usize, ToolBlockOutcome)> = Vec::with_capacity(pending.len());
         for seg in segments {
             // Take ownership of each segment's pending entries before
             // building futures so the parallel path doesn't need to
@@ -2260,7 +2310,7 @@ impl Engine {
                         (position, block)
                     }
                 });
-                let collected: Vec<(usize, ContentBlock)> = futures::stream::iter(futs)
+                let collected: Vec<(usize, ToolBlockOutcome)> = futures::stream::iter(futs)
                     .buffer_unordered(limit)
                     .collect()
                     .await;
@@ -2271,7 +2321,14 @@ impl Engine {
         // 5. Restore original tool_use order; buffer_unordered may
         // have completed them out of order.
         results.sort_by_key(|(pos, _)| *pos);
-        Ok(results.into_iter().map(|(_, b)| b).collect())
+        let mut batch = ToolBatchResult::default();
+        for (_, outcome) in results {
+            if let Some(failure) = outcome.failure {
+                batch.failures.push(failure);
+            }
+            batch.blocks.push(outcome.block);
+        }
+        Ok(batch)
     }
 
     // 9 args is over clippy's 7 default. Each is independently
@@ -2288,7 +2345,7 @@ impl Engine {
         gate: &dyn ApprovalGate,
         tools: &ToolRegistry,
         prebuilt: Option<ToolResult>,
-    ) -> ContentBlock {
+    ) -> ToolBlockOutcome {
         // Every `tool_use` block in the assistant message MUST get a
         // corresponding `tool_result` (or `tool_error`) block,
         // otherwise providers like DeepSeek reject the next history
@@ -2298,7 +2355,7 @@ impl Engine {
             .execute_one(
                 id,
                 name,
-                input,
+                input.clone(),
                 assistant_msg_id,
                 tool_ctx,
                 gate,
@@ -2316,11 +2373,24 @@ impl Engine {
                     snaca_tools_api::ToolOutput::Blocks(bs) => bs,
                     other => vec![ContentBlock::text(other.render_text())],
                 };
-                ContentBlock::tool_result(id.clone(), content)
+                ToolBlockOutcome {
+                    block: ContentBlock::tool_result(id.clone(), content),
+                    failure: None,
+                }
             }
             Ok(Err(e)) => {
                 warn!(tool = %name, error = %e, "tool execution returned error");
-                ContentBlock::tool_error(id.clone(), e.to_string())
+                let error = e.to_string();
+                let signature = input_signature(&input);
+                ToolBlockOutcome {
+                    block: ContentBlock::tool_error(id.clone(), error.clone()),
+                    failure: Some(ToolFailureEvent {
+                        tool: name.to_string(),
+                        input,
+                        input_signature: signature,
+                        error,
+                    }),
+                }
             }
             Err(engine_err) => {
                 warn!(
@@ -2328,7 +2398,17 @@ impl Engine {
                     error = %engine_err,
                     "engine-level error during tool dispatch; surfacing as tool_error"
                 );
-                ContentBlock::tool_error(id.clone(), format!("tool dispatch failed: {engine_err}"))
+                let error = format!("tool dispatch failed: {engine_err}");
+                let signature = input_signature(&input);
+                ToolBlockOutcome {
+                    block: ContentBlock::tool_error(id.clone(), error.clone()),
+                    failure: Some(ToolFailureEvent {
+                        tool: name.to_string(),
+                        input,
+                        input_signature: signature,
+                        error,
+                    }),
+                }
             }
         }
     }
@@ -2518,6 +2598,51 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+fn snippet(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+fn input_snippet(input: &Value) -> String {
+    let rendered = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
+    snippet(&rendered, 500)
+}
+
+fn error_snippet(error: &str) -> String {
+    let lines: Vec<&str> = error.lines().collect();
+    let start = lines.len().saturating_sub(20);
+    snippet(&lines[start..].join("\n"), 2000)
+}
+
+fn repeated_tool_failure_feedback(failure: &ToolFailureEvent, count: usize) -> String {
+    format!(
+        "Your previous identical tool call failed {count} times in this turn.\n\n\
+         Tool: `{tool}`\n\
+         Input: `{input}`\n\n\
+         Latest error excerpt:\n\
+         ```text\n{error}\n```\n\n\
+         Do not run this exact same `{tool}` call again. First inspect the \
+         error output, explain the likely root cause, and change the approach \
+         before retrying. For example, modify the command/script/arguments, \
+         restore corrupted inputs, or run a different diagnostic command that \
+         can disambiguate the failure.",
+        tool = failure.tool,
+        input = input_snippet(&failure.input),
+        error = error_snippet(&failure.error),
+    )
 }
 
 /// Drain the outbound-file queue collected during a turn. Returns
