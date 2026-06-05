@@ -3853,7 +3853,7 @@ dependencies = [
  "file-rotate",
  "futures",
  "mime_guess",
- "rand 0.8.6",
+ "rand 0.9.4",
  "reqwest 0.13.3",
  "rust-embed",
  "serde",
