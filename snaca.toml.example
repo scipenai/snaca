@@ -124,6 +124,12 @@ model = "deepseek-chat"
 # rules so the model can self-correct on the next iteration. 0
 # disables (surface the error immediately). Default 2.
 # malformed_tool_args_max_retries = 2
+#
+# Per-turn retries for mid-stream LLM connection/body failures after
+# a response has already started (for example "Connection reset by
+# peer" while reading SSE). The engine discards partial deltas and
+# re-issues the same request. 0 disables. Default 2.
+# stream_interrupted_max_retries = 2
 
 # Override the built-in system prompt. Leave commented to use the default.
 # system_prompt = """

@@ -253,6 +253,10 @@ impl Runtime {
                 .collapse_tool_results_threshold
                 .unwrap_or(1024),
             stream_tool_execution: config.engine.stream_tool_execution.unwrap_or(true),
+            stream_interrupted_max_retries: config
+                .engine
+                .stream_interrupted_max_retries
+                .unwrap_or(2),
             // 0 disables escalation entirely; any other value caps it.
             max_output_token_escalation_attempts: config
                 .engine

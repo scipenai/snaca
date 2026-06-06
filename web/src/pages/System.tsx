@@ -35,6 +35,7 @@ type FormState = {
   concurrentToolLimit: string;
   collapseToolResultsThreshold: string;
   streamToolExecution: boolean;
+  streamInterruptedMaxRetries: string;
   loopGuardMaxRepeats: string;
   malformedToolArgsMaxRetries: string;
   maxOutputTokenEscalationAttempts: string;
@@ -358,6 +359,7 @@ export function System() {
                 <TextField label={t("system.collapse_tool_results_threshold")} value={form.collapseToolResultsThreshold} onChange={(v) => updateField("collapseToolResultsThreshold", v)} inputMode="numeric" placeholder="1024" hint={t("system.help.collapse_tool_results_threshold")} />
                 <TextField label={t("system.loop_guard_max_repeats")} value={form.loopGuardMaxRepeats} onChange={(v) => updateField("loopGuardMaxRepeats", v)} inputMode="numeric" placeholder="3" hint={t("system.help.loop_guard_max_repeats")} />
                 <TextField label={t("system.malformed_tool_args_max_retries")} value={form.malformedToolArgsMaxRetries} onChange={(v) => updateField("malformedToolArgsMaxRetries", v)} inputMode="numeric" placeholder="2" hint={t("system.help.malformed_tool_args_max_retries")} />
+                <TextField label={t("system.stream_interrupted_max_retries")} value={form.streamInterruptedMaxRetries} onChange={(v) => updateField("streamInterruptedMaxRetries", v)} inputMode="numeric" placeholder="2" hint={t("system.help.stream_interrupted_max_retries")} />
                 <TextField label={t("system.max_output_token_escalation_attempts")} value={form.maxOutputTokenEscalationAttempts} onChange={(v) => updateField("maxOutputTokenEscalationAttempts", v)} inputMode="numeric" placeholder="2" hint={t("system.help.max_output_token_escalation_attempts")} />
                 <TextField label={t("system.max_output_token_ceiling")} value={form.maxOutputTokenCeiling} onChange={(v) => updateField("maxOutputTokenCeiling", v)} inputMode="numeric" placeholder="32768" hint={t("system.help.max_output_token_ceiling")} />
                 <ToggleField label={t("system.stream_tool_execution")} checked={form.streamToolExecution} onChange={(v) => updateField("streamToolExecution", v)} hint={t("system.help.stream_tool_execution")} />
@@ -682,6 +684,7 @@ function formFromToml(toml: string): FormState {
     concurrentToolLimit: getScalar(toml, "engine", "concurrent_tool_limit") ?? "",
     collapseToolResultsThreshold: getScalar(toml, "engine", "collapse_tool_results_threshold") ?? "",
     streamToolExecution: getBoolean(toml, "engine", "stream_tool_execution") ?? true,
+    streamInterruptedMaxRetries: getScalar(toml, "engine", "stream_interrupted_max_retries") ?? "",
     loopGuardMaxRepeats: getScalar(toml, "engine", "loop_guard_max_repeats") ?? "",
     malformedToolArgsMaxRetries: getScalar(toml, "engine", "malformed_tool_args_max_retries") ?? "",
     maxOutputTokenEscalationAttempts: getScalar(toml, "engine", "max_output_token_escalation_attempts") ?? "",
@@ -771,6 +774,8 @@ function applyFormField(
       return setTomlValue(toml, "engine", "collapse_tool_results_threshold", optionalNumber(value));
     case "streamToolExecution":
       return setTomlValue(toml, "engine", "stream_tool_execution", String(value));
+    case "streamInterruptedMaxRetries":
+      return setTomlValue(toml, "engine", "stream_interrupted_max_retries", optionalNumber(value));
     case "loopGuardMaxRepeats":
       return setTomlValue(toml, "engine", "loop_guard_max_repeats", optionalNumber(value));
     case "malformedToolArgsMaxRetries":

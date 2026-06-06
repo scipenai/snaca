@@ -51,6 +51,7 @@ use snaca_workspace::WorkspaceLayout;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -1969,6 +1970,53 @@ impl Engine {
         listener: &dyn TurnEventListener,
         max_tokens_override: Option<u32>,
     ) -> EngineResult<(MessageResponse, PrerunCache)> {
+        let mut attempt: u8 = 0;
+        loop {
+            match self
+                .call_llm_and_prerun_once(
+                    system_segments,
+                    history.clone(),
+                    tool_schemas.clone(),
+                    tools,
+                    tool_ctx,
+                    listener,
+                    max_tokens_override,
+                )
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(EngineError::Llm(e))
+                    if matches!(e, LlmError::StreamInterrupted(_))
+                        && attempt < self.config.stream_interrupted_max_retries =>
+                {
+                    attempt += 1;
+                    let delay = stream_retry_delay(attempt);
+                    warn!(
+                        attempt,
+                        max = self.config.stream_interrupted_max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "LLM stream interrupted; retrying the same request"
+                    );
+                    listener.on_stream_retry(attempt, &e).await;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_llm_and_prerun_once(
+        &self,
+        system_segments: &[SystemSegment],
+        history: Vec<Message>,
+        tool_schemas: Vec<ToolSchema>,
+        tools: &ToolRegistry,
+        tool_ctx: &ToolContext,
+        listener: &dyn TurnEventListener,
+        max_tokens_override: Option<u32>,
+    ) -> EngineResult<(MessageResponse, PrerunCache)> {
         let mut req = MessageRequest::new(&self.config.model)
             .with_system_segments(system_segments.to_vec())
             .with_messages(history)
@@ -2854,6 +2902,11 @@ struct StreamToolUse {
     id: String,
     name: String,
     args: String,
+}
+
+fn stream_retry_delay(attempt: u8) -> Duration {
+    let exp = attempt.saturating_sub(1).min(5);
+    Duration::from_millis(500u64.saturating_mul(1u64 << exp))
 }
 
 /// Whether `name` resolves in the registry to a tool that is safe to

@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use serde_json::json;
 use snaca_core::{ContentBlock, ProjectId, Role, TenantId, ThreadId};
-use snaca_engine::{Engine, EngineConfig, TurnRequest};
+use snaca_engine::{
+    Engine, EngineConfig, NoopApprovalGate, NoopQuestionGate, TurnEventListener, TurnRequest,
+};
 use snaca_llm::{
     ContentBlockStart, ContentDelta, LlmClient, LlmError, LlmResult, MessageRequest,
     MessageResponse, ProviderCaps, StopReason, StreamEvent,
@@ -28,7 +30,7 @@ use common::EchoTool;
 /// stream. Asserts the engine consumes streaming output, not just the
 /// non-streaming fallback.
 struct StreamingMockLlm {
-    queue: Mutex<Vec<Vec<StreamEvent>>>,
+    queue: Mutex<Vec<Vec<LlmResult<StreamEvent>>>>,
     /// Counter to make sure the streaming path was actually exercised.
     stream_calls: std::sync::atomic::AtomicUsize,
 }
@@ -42,6 +44,11 @@ impl StreamingMockLlm {
     }
 
     fn enqueue(&self, events: Vec<StreamEvent>) {
+        let mut q = self.queue.lock().unwrap();
+        q.push(events.into_iter().map(Ok).collect());
+    }
+
+    fn enqueue_results(&self, events: Vec<LlmResult<StreamEvent>>) {
         let mut q = self.queue.lock().unwrap();
         q.push(events);
     }
@@ -86,9 +93,7 @@ impl LlmClient for StreamingMockLlm {
             }
             q.remove(0)
         };
-        Ok(Box::pin(stream::iter(
-            events.into_iter().map(Ok::<_, LlmError>),
-        )))
+        Ok(Box::pin(stream::iter(events.into_iter())))
     }
 }
 
@@ -145,6 +150,26 @@ fn text_stream(text: &str) -> Vec<StreamEvent> {
         },
         StreamEvent::MessageStop,
     ]
+}
+
+#[derive(Default)]
+struct RetryRecordingListener {
+    events: Mutex<Vec<StreamEvent>>,
+    retries: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl TurnEventListener for RetryRecordingListener {
+    async fn on_event(&self, event: &StreamEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+
+    async fn on_stream_retry(&self, attempt: u8, error: &LlmError) {
+        self.retries
+            .lock()
+            .unwrap()
+            .push(format!("{attempt}:{error}"));
+    }
 }
 
 fn tool_call_stream(call_id: &str, tool: &str, input_json: &str) -> Vec<StreamEvent> {
@@ -274,6 +299,61 @@ async fn split_text_deltas_concatenate_into_one_block() {
     let (engine, _db, _tmp) = fixture(llm.clone()).await;
     let outcome = engine.handle_turn(turn_request("c3")).await.unwrap();
     assert_eq!(outcome.assistant_text, "Hello, world");
+}
+
+#[tokio::test]
+async fn interrupted_stream_retries_same_request_and_discards_partial_response() {
+    let llm = Arc::new(StreamingMockLlm::new());
+    llm.enqueue_results(vec![
+        Ok(StreamEvent::MessageStart {
+            message_id: "broken".into(),
+            model: None,
+        }),
+        Ok(StreamEvent::ContentBlockStart {
+            index: 0,
+            block: ContentBlockStart::Text,
+        }),
+        Ok(StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::Text {
+                text: "partial ".into(),
+            },
+        }),
+        Err(LlmError::StreamInterrupted(
+            "error reading a body from connection -> Connection reset by peer".into(),
+        )),
+    ]);
+    llm.enqueue(text_stream("recovered"));
+
+    let (engine, db, _tmp) = fixture(llm.clone()).await;
+    let listener = Arc::new(RetryRecordingListener::default());
+    let outcome = engine
+        .handle_turn_full(
+            turn_request("c_stream_retry"),
+            Arc::new(NoopApprovalGate),
+            listener.clone(),
+            Arc::new(NoopQuestionGate),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.assistant_text, "recovered");
+    assert_eq!(llm.stream_call_count(), 2);
+    assert_eq!(listener.retries.lock().unwrap().len(), 1);
+
+    let msgs = db
+        .recent_messages(&ThreadId::new("c_stream_retry"), 10)
+        .await
+        .unwrap();
+    let assistant_msgs: Vec<_> = msgs
+        .iter()
+        .filter(|m| matches!(m.role, Role::Assistant))
+        .collect();
+    assert_eq!(assistant_msgs.len(), 1);
+    match &assistant_msgs[0].content[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "recovered"),
+        other => panic!("got {other:?}"),
+    }
 }
 
 /// Mock that simulates DeepSeek's behaviour on long-Chinese tool args:

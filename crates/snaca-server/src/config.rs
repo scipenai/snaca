@@ -447,6 +447,13 @@ pub struct EngineSection {
     #[serde(default)]
     pub stream_tool_execution: Option<bool>,
 
+    /// Per-turn retries for mid-stream LLM transport failures after
+    /// the response has already started. This covers broken SSE body
+    /// reads such as "Connection reset by peer". Default 2. Set to 0
+    /// to surface immediately.
+    #[serde(default)]
+    pub stream_interrupted_max_retries: Option<u8>,
+
     /// How many times one turn may re-issue an LLM request with a
     /// higher output-token cap after `stop_reason == MaxTokens`. Each
     /// attempt doubles the previous cap (capped at

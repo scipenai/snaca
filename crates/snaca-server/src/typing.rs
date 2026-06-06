@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use snaca_channel_host::PluginHandle;
 use snaca_channel_protocol::methods::{MessageSendParams, MessageUpdateParams};
 use snaca_engine::TurnEventListener;
-use snaca_llm::{ContentDelta, StreamEvent};
+use snaca_llm::{ContentDelta, LlmError, StreamEvent};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -119,6 +119,13 @@ impl ChannelTypingListener {
 
 #[async_trait]
 impl TurnEventListener for ChannelTypingListener {
+    async fn on_stream_retry(&self, _attempt: u8, _error: &LlmError) {
+        let mut state = self.state.lock().await;
+        state.accumulated.clear();
+        state.pushed_text.clear();
+        state.last_pushed_at = None;
+    }
+
     async fn on_event(&self, event: &StreamEvent) {
         let StreamEvent::ContentBlockDelta { delta, .. } = event else {
             return;

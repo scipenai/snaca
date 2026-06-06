@@ -155,6 +155,15 @@ pub struct EngineConfig {
     /// confuses the eager dispatch).
     pub stream_tool_execution: bool,
 
+    /// Number of times one LLM request may be transparently re-issued
+    /// after the provider stream is interrupted mid-response
+    /// (`Connection reset by peer`, broken body, idle read timeout,
+    /// etc.). This retry happens at the engine layer because any
+    /// deltas from the failed stream must be discarded before the new
+    /// stream starts. Set to 0 to surface stream interruptions
+    /// immediately. Default 2.
+    pub stream_interrupted_max_retries: u8,
+
     /// Number of times one turn may transparently re-issue a request
     /// with a higher output-token cap after `stop_reason == MaxTokens`.
     /// Each attempt doubles the previous cap (subject to
@@ -212,6 +221,7 @@ impl EngineConfig {
             concurrent_tool_limit: 5,
             collapse_tool_results_threshold: 1024,
             stream_tool_execution: true,
+            stream_interrupted_max_retries: 2,
             max_output_token_escalation_attempts: 2,
             max_output_token_ceiling: 32_768,
             recall_confidence_floor: 0.30,

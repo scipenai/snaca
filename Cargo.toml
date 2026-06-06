@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -30,21 +30,21 @@ authors = ["SNACA Authors"]
 
 [workspace.dependencies]
 # Internal crates
-snaca-core = { path = "crates/snaca-core", version = "0.1.2" }
-snaca-agent-api = { path = "crates/snaca-agent-api", version = "0.1.2" }
-snaca-sdk = { path = "crates/snaca-sdk", version = "0.1.2" }
-snaca-tools-api = { path = "crates/snaca-tools-api", version = "0.1.2" }
-snaca-llm = { path = "crates/snaca-llm", version = "0.1.2" }
-snaca-tools = { path = "crates/snaca-tools", version = "0.1.2" }
-snaca-mcp = { path = "crates/snaca-mcp", version = "0.1.2" }
-snaca-skills = { path = "crates/snaca-skills", version = "0.1.2" }
-snaca-workspace = { path = "crates/snaca-workspace", version = "0.1.2" }
-snaca-state = { path = "crates/snaca-state", version = "0.1.2" }
-snaca-memory = { path = "crates/snaca-memory", version = "0.1.2" }
-snaca-engine = { path = "crates/snaca-engine", version = "0.1.2" }
-snaca-channel-protocol = { path = "crates/snaca-channel-protocol", version = "0.1.2" }
-snaca-channel-host = { path = "crates/snaca-channel-host", version = "0.1.2" }
-snaca-server = { path = "crates/snaca-server", version = "0.1.2" }
+snaca-core = { path = "crates/snaca-core", version = "0.1.3" }
+snaca-agent-api = { path = "crates/snaca-agent-api", version = "0.1.3" }
+snaca-sdk = { path = "crates/snaca-sdk", version = "0.1.3" }
+snaca-tools-api = { path = "crates/snaca-tools-api", version = "0.1.3" }
+snaca-llm = { path = "crates/snaca-llm", version = "0.1.3" }
+snaca-tools = { path = "crates/snaca-tools", version = "0.1.3" }
+snaca-mcp = { path = "crates/snaca-mcp", version = "0.1.3" }
+snaca-skills = { path = "crates/snaca-skills", version = "0.1.3" }
+snaca-workspace = { path = "crates/snaca-workspace", version = "0.1.3" }
+snaca-state = { path = "crates/snaca-state", version = "0.1.3" }
+snaca-memory = { path = "crates/snaca-memory", version = "0.1.3" }
+snaca-engine = { path = "crates/snaca-engine", version = "0.1.3" }
+snaca-channel-protocol = { path = "crates/snaca-channel-protocol", version = "0.1.3" }
+snaca-channel-host = { path = "crates/snaca-channel-host", version = "0.1.3" }
+snaca-server = { path = "crates/snaca-server", version = "0.1.3" }
 
 # Async runtime & utilities
 tokio = { version = "1.52", features = ["full"] }
