@@ -2314,7 +2314,8 @@ async fn post_card_message(
 /// is opaque from its point of view, but we encode enough information
 /// in it to make `file.download` stateless:
 /// - `file:<message_id>:<file_key>:<filename>` — generic file/audio/video
-/// - `image:<image_key>:<filename>` — image (different endpoint)
+/// - `image:<message_id>:<image_key>:<filename>` — inbound image resource
+/// - `image:<image_key>:<filename>` — legacy image id fallback
 async fn handle_file_download(
     cfg: Arc<LarkConfig>,
     id: RequestId,
@@ -2550,9 +2551,10 @@ async fn upload_and_send_file(
 struct AttachmentRef {
     /// `Image` uses a different endpoint than `File`/`Audio`/etc.
     kind: AttachmentKind,
-    /// `Some(_)` for file/audio/video (Lark needs the originating
-    /// message_id alongside the file_key to authorise the fetch);
-    /// `None` for images (image_key is enough).
+    /// `Some(_)` for message resources (file/audio/video/image). Lark needs
+    /// the originating message_id alongside the resource key to authorise the
+    /// fetch. Older image ids did not include this, so `None` remains a legacy
+    /// fallback for images.
     message_id: Option<String>,
     /// Lark-side opaque key — `file_key` or `image_key` depending on kind.
     key: String,
@@ -2805,8 +2807,8 @@ fn flatten_post_to_text(content_obj: &Value) -> String {
     out.trim().to_string()
 }
 
-fn build_image_id(image_key: &str, filename: &str) -> String {
-    format!("image:{}:{}", image_key, filename)
+fn build_image_id(message_id: &str, image_key: &str, filename: &str) -> String {
+    format!("image:{}:{}:{}", message_id, image_key, filename)
 }
 
 fn parse_attachment_id(s: &str) -> Option<AttachmentRef> {
@@ -2829,9 +2831,23 @@ fn parse_attachment_id(s: &str) -> Option<AttachmentRef> {
             },
         })
     } else if let Some(rest) = s.strip_prefix("image:") {
-        let mut parts = rest.splitn(2, ':');
-        let key = parts.next()?.to_string();
-        let name = parts.next()?.to_string();
+        let fields: Vec<&str> = rest.splitn(3, ':').collect();
+        let (message_id, key, name) = match fields.as_slice() {
+            // Current format: image:<message_id>:<image_key>:<filename>
+            [mid, key, name] => {
+                if mid.is_empty() {
+                    return None;
+                }
+                (
+                    Some((*mid).to_string()),
+                    (*key).to_string(),
+                    (*name).to_string(),
+                )
+            }
+            // Legacy format: image:<image_key>:<filename>
+            [key, name] => (None, (*key).to_string(), (*name).to_string()),
+            _ => return None,
+        };
         if key.is_empty() {
             return None;
         }
@@ -2842,7 +2858,7 @@ fn parse_attachment_id(s: &str) -> Option<AttachmentRef> {
         };
         Some(AttachmentRef {
             kind: AttachmentKind::Image,
-            message_id: None,
+            message_id,
             key,
             filename,
         })
@@ -2856,22 +2872,7 @@ async fn download_attachment(cfg: &LarkConfig, att: &AttachmentRef) -> Result<Ve
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
-    let url = match att.kind {
-        AttachmentKind::File => {
-            let mid = att.message_id.as_deref().unwrap_or_default();
-            format!(
-                "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
-                cfg.base_url.trim_end_matches('/'),
-                mid,
-                att.key
-            )
-        }
-        AttachmentKind::Image => format!(
-            "{}/open-apis/im/v1/images/{}",
-            cfg.base_url.trim_end_matches('/'),
-            att.key
-        ),
-    };
+    let url = attachment_download_url(cfg, att);
     let resp = client
         .get(url)
         .bearer_auth(&token)
@@ -2885,6 +2886,36 @@ async fn download_attachment(cfg: &LarkConfig, att: &AttachmentRef) -> Result<Ve
     }
     let bytes = resp.bytes().await.context("read attachment body")?;
     Ok(bytes.to_vec())
+}
+
+fn attachment_download_url(cfg: &LarkConfig, att: &AttachmentRef) -> String {
+    match att.kind {
+        AttachmentKind::File => {
+            let mid = att.message_id.as_deref().unwrap_or_default();
+            format!(
+                "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+                cfg.base_url.trim_end_matches('/'),
+                mid,
+                att.key
+            )
+        }
+        AttachmentKind::Image => {
+            if let Some(mid) = att.message_id.as_deref() {
+                format!(
+                    "{}/open-apis/im/v1/messages/{}/resources/{}?type=image",
+                    cfg.base_url.trim_end_matches('/'),
+                    mid,
+                    att.key
+                )
+            } else {
+                format!(
+                    "{}/open-apis/im/v1/images/{}",
+                    cfg.base_url.trim_end_matches('/'),
+                    att.key
+                )
+            }
+        }
+    }
 }
 
 /// Crude filename → MIME guesser. The import pipeline doesn't trust
@@ -3432,8 +3463,8 @@ async fn handle_lark_payload(
                 .get("image_key")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if image_key.is_empty() {
-                warn!("image message missing image_key; dropping");
+            if image_key.is_empty() || inbound_msg_id.is_empty() {
+                warn!("image message missing image_key or message_id; dropping");
                 return Ok(());
             }
             // Images get a synthetic .png filename. The downloader
@@ -3443,7 +3474,7 @@ async fn handle_lark_payload(
             // captured.
             let filename = format!("{image_key}.png");
             attachments.push(Attachment {
-                id: build_image_id(image_key, &filename),
+                id: build_image_id(&inbound_msg_id, image_key, &filename),
                 filename,
                 mime_type: "image/png".to_string(),
                 size: 0,
@@ -3623,6 +3654,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_cfg(base_url: &str) -> LarkConfig {
+        LarkConfig {
+            app_id: "cli_a".to_string(),
+            app_secret: "secret".to_string(),
+            base_url: base_url.to_string(),
+            tenant_id: "tenant".to_string(),
+            plugin_token: "token".to_string(),
+        }
+    }
+
     #[test]
     fn flatten_post_simple_text_only() {
         let body = json!({
@@ -3754,6 +3795,50 @@ mod tests {
     fn flatten_post_empty_returns_empty() {
         let body = json!({"title": "", "content": []});
         assert_eq!(flatten_post_to_text(&body), "");
+    }
+
+    #[test]
+    fn image_attachment_id_includes_message_id() {
+        let id = build_image_id("om_123", "img_abc", "img_abc.png");
+        assert_eq!(id, "image:om_123:img_abc:img_abc.png");
+
+        let parsed = parse_attachment_id(&id).expect("image id should parse");
+        assert_eq!(parsed.kind, AttachmentKind::Image);
+        assert_eq!(parsed.message_id.as_deref(), Some("om_123"));
+        assert_eq!(parsed.key, "img_abc");
+        assert_eq!(parsed.filename, "img_abc.png");
+    }
+
+    #[test]
+    fn legacy_image_attachment_id_still_parses() {
+        let parsed =
+            parse_attachment_id("image:img_legacy:img_legacy.png").expect("legacy id should parse");
+        assert_eq!(parsed.kind, AttachmentKind::Image);
+        assert_eq!(parsed.message_id, None);
+        assert_eq!(parsed.key, "img_legacy");
+        assert_eq!(parsed.filename, "img_legacy.png");
+    }
+
+    #[test]
+    fn inbound_image_download_uses_message_resource_endpoint() {
+        let cfg = test_cfg("https://open.feishu.cn/");
+        let att = parse_attachment_id("image:om_123:img_abc:img_abc.png").unwrap();
+
+        assert_eq!(
+            attachment_download_url(&cfg, &att),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_123/resources/img_abc?type=image"
+        );
+    }
+
+    #[test]
+    fn legacy_image_download_keeps_image_endpoint_fallback() {
+        let cfg = test_cfg("https://open.feishu.cn/");
+        let att = parse_attachment_id("image:img_legacy:img_legacy.png").unwrap();
+
+        assert_eq!(
+            attachment_download_url(&cfg, &att),
+            "https://open.feishu.cn/open-apis/im/v1/images/img_legacy"
+        );
     }
 
     #[test]
