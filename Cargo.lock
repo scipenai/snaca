@@ -3027,9 +3027,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3093,7 +3093,7 @@ dependencies = [
  "http",
  "pin-project-lite",
  "process-wrap",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sse-stream",
@@ -3680,7 +3680,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "escargot",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde_json",
  "snaca-channel-protocol",
  "snaca-core",
@@ -3744,7 +3744,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "snaca-core",
@@ -3761,7 +3761,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "http",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rmcp",
  "serde",
  "serde_json",
@@ -3806,7 +3806,7 @@ dependencies = [
  "chrono",
  "data-encoding",
  "openlark",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls",
  "serde_json",
  "snaca-channel-protocol",
@@ -3854,7 +3854,7 @@ dependencies = [
  "futures",
  "mime_guess",
  "rand 0.9.4",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rust-embed",
  "serde",
  "serde_json",
@@ -3925,7 +3925,7 @@ dependencies = [
  "dirs",
  "globset",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "snaca-agent-api",
@@ -5203,7 +5203,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
