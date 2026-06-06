@@ -93,7 +93,7 @@ impl LlmClient for StreamingMockLlm {
             }
             q.remove(0)
         };
-        Ok(Box::pin(stream::iter(events.into_iter())))
+        Ok(Box::pin(stream::iter(events)))
     }
 }
 

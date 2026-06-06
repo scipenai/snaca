@@ -440,7 +440,7 @@ pub fn spawn_worker(
                 _ = tokio::time::sleep(WORKER_TICK) => {}
             }
             tick = tick.wrapping_add(1);
-            if tick % PURGE_EVERY_TICKS == 0 {
+            if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                 let outbox_cutoff = Utc::now() - ChronoDuration::days(RETENTION_DAYS);
                 match db.outbox_purge_delivered_older_than(outbox_cutoff).await {
                     Ok(n) if n > 0 => {

@@ -731,7 +731,7 @@ impl Config {
 fn generate_admin_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 20];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     data_encoding::BASE32_NOPAD.encode(&bytes)
 }
 
