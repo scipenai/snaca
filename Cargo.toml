@@ -95,7 +95,7 @@ mime_guess = "2"
 # Constant-time bearer-token comparison + random token generation for the
 # admin web surface.
 subtle = "2.6"
-rand = "0.9"
+rand = "0.10"
 
 # Database
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono"] }
