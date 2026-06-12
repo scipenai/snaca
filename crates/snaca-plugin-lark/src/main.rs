@@ -3899,9 +3899,7 @@ mod tests {
         // No file_key.
         assert!(extract_message_attachments("file", &json!({}), "om_parent").is_empty());
         // No owning message id (can't form a download URL).
-        assert!(
-            extract_message_attachments("image", &json!({"image_key": "k"}), "").is_empty()
-        );
+        assert!(extract_message_attachments("image", &json!({"image_key": "k"}), "").is_empty());
         // Non-attachment type.
         assert!(
             extract_message_attachments("text", &json!({"text": "hi"}), "om_parent").is_empty()
