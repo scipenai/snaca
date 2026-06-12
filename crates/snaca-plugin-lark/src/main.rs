@@ -3122,6 +3122,163 @@ async fn fetch_message_chat_id(cfg: &LarkConfig, message_id: &str) -> Result<Str
     Ok(chat_id.to_string())
 }
 
+/// Fetch a message by id and render its body to text plus any
+/// downloadable attachments. Used to resolve the *quoted* message when a
+/// user replies to (引用) an earlier message: Lark only delivers the new
+/// reply text plus a `parent_id` pointing at the quoted message — the
+/// quoted body and its files are never inlined, so without this hop the
+/// engine never sees what the user was pointing at.
+///
+/// We reuse the same `GET /im/v1/messages/{id}` endpoint as
+/// `fetch_message_chat_id`. The response carries `msg_type` and a
+/// JSON-encoded `body.content`; we render `text`/`post` to text (typed
+/// marker otherwise) and extract `file`/`image`/`media` resources, keyed
+/// by the quoted message's own id so `file.download` resolves them.
+/// Returns `(text, attachments)` — text may be empty, attachments may be
+/// empty; the caller decides what's worth surfacing.
+async fn fetch_quoted_message(
+    cfg: &LarkConfig,
+    message_id: &str,
+) -> Result<(String, Vec<Attachment>)> {
+    let token = fetch_app_access_token(cfg).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}",
+        cfg.base_url.trim_end_matches('/'),
+        message_id
+    );
+    let resp = client
+        .get(url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .context("GET /im/v1/messages/{id}")?;
+    let body = validate_lark_response(resp, "lark fetch quoted message").await?;
+    let item = body
+        .pointer("/data/items/0")
+        .ok_or_else(|| anyhow::anyhow!("message response missing data.items[0]: {body}"))?;
+    let msg_type = item
+        .pointer("/msg_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content_raw = item
+        .pointer("/body/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content_obj: Value = serde_json::from_str(content_raw).unwrap_or(Value::Null);
+    let text = render_message_content_text(msg_type, &content_obj);
+    let attachments = extract_message_attachments(msg_type, &content_obj, message_id);
+    Ok((text, attachments))
+}
+
+/// Render a Lark message `(msg_type, parsed-content)` pair to plain text.
+/// Shared by the inbound handler's primary parse and by
+/// `fetch_message_text` (quoted-message resolution) so both produce the
+/// same rendering for a given message shape.
+fn render_message_content_text(msg_type: &str, content_obj: &Value) -> String {
+    match msg_type {
+        "text" => content_obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        "post" => flatten_post_to_text(content_obj),
+        "image" => "[image]".to_string(),
+        "file" | "audio" | "video" | "media" => {
+            let name = content_obj
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("file");
+            format!("[{msg_type}: {name}]")
+        }
+        "sticker" => "[sticker]".to_string(),
+        "share_chat" => "[shared chat]".to_string(),
+        "share_user" => "[shared user]".to_string(),
+        "location" => "[location]".to_string(),
+        "interactive" => "[interactive card]".to_string(),
+        other => format!("[{other}]"),
+    }
+}
+
+/// Build the downloadable `Attachment`(s) for a message body. Shared by
+/// the inbound `file`/`image` arms and by quoted-message resolution so a
+/// file or image that the user *replied to* gets imported just like one
+/// they sent directly.
+///
+/// `message_id` is the id of the message that **owns** the resource — the
+/// current message for a direct send, the *parent* for a quote — because
+/// Lark's download endpoint is keyed by that id
+/// (`/im/v1/messages/{id}/resources/{key}`). Returns empty when the body
+/// carries no extractable resource or the required keys are missing; the
+/// caller decides whether that's a drop (direct send) or a no-op (quote).
+fn extract_message_attachments(
+    msg_type: &str,
+    content_obj: &Value,
+    message_id: &str,
+) -> Vec<Attachment> {
+    let mut out = Vec::new();
+    if message_id.is_empty() {
+        return out;
+    }
+    match msg_type {
+        "file" | "audio" | "video" | "media" => {
+            let file_key = content_obj
+                .get("file_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if file_key.is_empty() {
+                return out;
+            }
+            let filename = content_obj
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("attachment")
+                .to_string();
+            let size = content_obj
+                .get("file_size")
+                .and_then(|v| {
+                    // Lark sometimes reports size as a string, sometimes as a number.
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0);
+            out.push(Attachment {
+                id: build_file_id(message_id, file_key, &filename),
+                filename,
+                mime_type: content_obj
+                    .get("file_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                size,
+            });
+        }
+        "image" => {
+            let image_key = content_obj
+                .get("image_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if image_key.is_empty() {
+                return out;
+            }
+            // Images get a synthetic .png filename. The downloader serves
+            // the raw bytes regardless of actual format.
+            let filename = format!("{image_key}.png");
+            out.push(Attachment {
+                id: build_image_id(message_id, image_key, &filename),
+                filename,
+                mime_type: "image/png".to_string(),
+                size: 0,
+            });
+        }
+        _ => {}
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // Lark inbound — WebSocket long-poll → event.message_received
 // ---------------------------------------------------------------------
@@ -3374,7 +3531,7 @@ async fn handle_lark_payload(
     // resolve later via `file.download`. Every match arm below either
     // assigns `text` or returns early, so we leave it uninitialized
     // here rather than pay for a `String::new()` that's always discarded.
-    let text: String;
+    let mut text: String;
     let mut attachments: Vec<Attachment> = Vec::new();
     let inbound_msg_id = message
         .pointer("/message_id")
@@ -3423,62 +3580,27 @@ async fn handle_lark_payload(
             }
         }
         "file" | "audio" | "video" | "media" => {
-            let file_key = content_obj
-                .get("file_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if file_key.is_empty() || inbound_msg_id.is_empty() {
+            let atts = extract_message_attachments(message_type, &content_obj, &inbound_msg_id);
+            if atts.is_empty() {
                 warn!(message_type, "missing file_key or message_id; dropping");
                 return Ok(());
             }
-            let filename = content_obj
-                .get("file_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("attachment")
-                .to_string();
-            let size = content_obj
-                .get("file_size")
-                .and_then(|v| {
-                    // Lark sometimes reports size as a string, sometimes as a number.
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(0);
-            attachments.push(Attachment {
-                id: build_file_id(&inbound_msg_id, file_key, &filename),
-                filename,
-                mime_type: content_obj
-                    .get("file_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
-                size,
-            });
             // Mention the filename in `content` so the LLM has a hint
             // about what was uploaded even before the import lands.
-            text = format!("[uploaded file: {}]", attachments[0].filename);
+            text = format!("[uploaded file: {}]", atts[0].filename);
+            attachments.extend(atts);
         }
         "image" => {
-            let image_key = content_obj
-                .get("image_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if image_key.is_empty() || inbound_msg_id.is_empty() {
+            // Images get a synthetic .png filename. The downloader serves
+            // the raw bytes regardless of actual format; the import
+            // pipeline won't run useful extraction over them until we add
+            // proper image support, but the bytes are captured.
+            let atts = extract_message_attachments(message_type, &content_obj, &inbound_msg_id);
+            if atts.is_empty() {
                 warn!("image message missing image_key or message_id; dropping");
                 return Ok(());
             }
-            // Images get a synthetic .png filename. The downloader
-            // serves the raw bytes regardless of actual format; the
-            // import pipeline won't run useful extraction over them
-            // until we add proper image support, but the bytes are
-            // captured.
-            let filename = format!("{image_key}.png");
-            attachments.push(Attachment {
-                id: build_image_id(&inbound_msg_id, image_key, &filename),
-                filename,
-                mime_type: "image/png".to_string(),
-                size: 0,
-            });
+            attachments.extend(atts);
             text = "[uploaded image]".to_string();
         }
         "post" => {
@@ -3574,6 +3696,50 @@ async fn handle_lark_payload(
         }
     }
 
+    // Quoted (引用/回复) message resolution. When a user replies to an
+    // earlier message, Lark delivers only the new reply text plus a
+    // `parent_id` (the immediately-quoted message) and, for replies
+    // inside a topic thread, a `root_id` (the thread's first message).
+    // The quoted body is never inlined, so without an extra hop the
+    // engine sees only the bare reply (e.g. "这个") and loses the thing
+    // the user was pointing at. We fetch the parent's text and prepend it
+    // as a clearly-marked quote block. Best-effort: any failure (deleted
+    // message, permission, API error) just logs and forwards the reply
+    // unchanged rather than dropping the event.
+    let parent_id = message
+        .pointer("/parent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !parent_id.is_empty() && parent_id != inbound_msg_id {
+        match fetch_quoted_message(cfg, parent_id).await {
+            Ok((quoted, quoted_atts)) => {
+                let quoted = quoted.trim();
+                if !quoted.is_empty() {
+                    debug!(
+                        parent_id,
+                        quoted_len = quoted.len(),
+                        quoted_attachments = quoted_atts.len(),
+                        "resolved quoted message for reply"
+                    );
+                    text = format!("[引用消息]\n{quoted}\n[/引用消息]\n\n{text}");
+                } else if !quoted_atts.is_empty() {
+                    debug!(
+                        parent_id,
+                        quoted_attachments = quoted_atts.len(),
+                        "quoted message has no text but carries attachments"
+                    );
+                }
+                // Pull the quoted message's files/images into this turn so
+                // the import pipeline downloads them just like a direct
+                // upload. The reply's own attachments (if any) come first.
+                attachments.extend(quoted_atts);
+            }
+            Err(e) => {
+                debug!(error = %e, parent_id, "could not resolve quoted message; forwarding reply without it");
+            }
+        }
+    }
+
     // Routing identifiers. For p2p chats the sender's open_id is the
     // natural reply target; for groups, it's the chat_id. We hand the
     // host the chat_id we should send back to so outbound can use it
@@ -3634,7 +3800,15 @@ async fn handle_lark_payload(
         content: text,
         mentions: Vec::new(),
         attachments,
-        reply_to: None,
+        // Carry the quoted message id so the host's assembler keeps a
+        // reply in its own batch rather than merging it with unrelated
+        // concurrent messages. Thread routing is unaffected (it derives
+        // from chat_id + project), so this only sharpens micro-batching.
+        reply_to: if parent_id.is_empty() {
+            None
+        } else {
+            Some(parent_id.to_string())
+        },
         received_at: Utc::now().to_rfc3339(),
     };
     let notif = JsonRpcNotification::new(
@@ -3662,6 +3836,76 @@ mod tests {
             tenant_id: "tenant".to_string(),
             plugin_token: "token".to_string(),
         }
+    }
+
+    #[test]
+    fn render_content_text_unwraps_text_message() {
+        let body = json!({"text": "  hello there  "});
+        assert_eq!(render_message_content_text("text", &body), "hello there");
+    }
+
+    #[test]
+    fn render_content_text_flattens_post() {
+        let body = json!({
+            "title": "T",
+            "content": [[{"tag": "text", "text": "body line"}]]
+        });
+        assert_eq!(render_message_content_text("post", &body), "T\nbody line");
+    }
+
+    #[test]
+    fn render_content_text_marks_non_text_types() {
+        assert_eq!(render_message_content_text("image", &json!({})), "[image]");
+        assert_eq!(
+            render_message_content_text("file", &json!({"file_name": "spec.pdf"})),
+            "[file: spec.pdf]"
+        );
+        assert_eq!(
+            render_message_content_text("audio", &json!({"file_name": "voice.opus"})),
+            "[audio: voice.opus]"
+        );
+        // Unknown types still produce a typed marker, never a panic.
+        assert_eq!(render_message_content_text("todo", &json!({})), "[todo]");
+    }
+
+    #[test]
+    fn extract_attachments_builds_file_id_from_owning_message() {
+        let body = json!({
+            "file_key": "file_abc",
+            "file_name": "spec.pdf",
+            "file_type": "pdf",
+            "file_size": "2048"
+        });
+        let atts = extract_message_attachments("file", &body, "om_parent");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].id, "file:om_parent:file_abc:spec.pdf");
+        assert_eq!(atts[0].filename, "spec.pdf");
+        assert_eq!(atts[0].mime_type, "pdf");
+        // file_size tolerates the string shape Lark sometimes sends.
+        assert_eq!(atts[0].size, 2048);
+    }
+
+    #[test]
+    fn extract_attachments_builds_image_id_from_owning_message() {
+        let body = json!({"image_key": "img_xyz"});
+        let atts = extract_message_attachments("image", &body, "om_parent");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].id, "image:om_parent:img_xyz:img_xyz.png");
+        assert_eq!(atts[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn extract_attachments_empty_when_keys_or_owner_missing() {
+        // No file_key.
+        assert!(extract_message_attachments("file", &json!({}), "om_parent").is_empty());
+        // No owning message id (can't form a download URL).
+        assert!(
+            extract_message_attachments("image", &json!({"image_key": "k"}), "").is_empty()
+        );
+        // Non-attachment type.
+        assert!(
+            extract_message_attachments("text", &json!({"text": "hi"}), "om_parent").is_empty()
+        );
     }
 
     #[test]
