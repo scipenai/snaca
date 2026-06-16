@@ -729,7 +729,7 @@ impl Config {
 /// 20 random bytes → 32-char base32 (no padding). 160 bits of entropy
 /// — well above the 128-bit floor for a session-grade bearer token.
 fn generate_admin_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 20];
     rand::rng().fill_bytes(&mut bytes);
     data_encoding::BASE32_NOPAD.encode(&bytes)
