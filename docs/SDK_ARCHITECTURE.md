@@ -57,16 +57,17 @@ The SDK exposes traits for replaceable infrastructure:
 
 Current state:
 
-- Memory provider injection is wired through built-in memory tools, system
-  prompt memory index, recall blocks, and extractor writes.
+- Memory provider injection is wired through built-in memory tools, the
+  frozen prompt memory snapshot, and extractor writes.
 - Conversation and workspace provider traits are available with default
   adapters. The engine still uses `Database` and `WorkspaceLayout` internally
   in this refactor phase.
 
 The remaining store/workspace engine refactor is intentionally deferred. The
 current turn loop uses SQLite for more than plain message history: compaction
-summaries, approval decisions, tool-call audit, memory vector rows, and server
-attachment import paths all touch `Database` or `WorkspaceLayout` directly.
+summaries, approval decisions, tool-call audit, transcript FTS search, and
+server attachment import paths all touch `Database` or `WorkspaceLayout`
+directly.
 Replacing those safely needs wider runtime contracts than the first SDK
 boundary pass introduced.
 

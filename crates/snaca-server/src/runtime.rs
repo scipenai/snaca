@@ -267,16 +267,7 @@ impl Runtime {
                 .max_output_token_ceiling
                 .filter(|n| *n > 0)
                 .unwrap_or(32_768),
-            recall_confidence_floor: config
-                .engine
-                .recall_confidence_floor
-                .filter(|f| (0.0..=1.0).contains(f))
-                .unwrap_or(0.30),
-            extractor_default_confidence: config
-                .engine
-                .extractor_default_confidence
-                .filter(|f| (0.0..=1.0).contains(f))
-                .unwrap_or(0.6),
+            memory_write_approval: config.engine.memory_write_approval.unwrap_or(false),
         };
         // The static `tools` parameter on `Engine::new` is the fallback
         // registry — used only if no factory is attached. We always attach
@@ -297,14 +288,8 @@ impl Runtime {
             .config(engine_cfg)
             .tool_factory(tool_factory.clone())
             .task_registry(task_registry_opaque);
-        if let Some(embedder) = build_embedder(&config) {
-            engine_builder = engine_builder.embedder(embedder);
-        }
         if let Some(extractor) = build_memory_extractor(&config, llm.clone(), workspace.clone()) {
             engine_builder = engine_builder.memory_extractor(extractor);
-        }
-        if let Some(reranker) = build_memory_reranker(&config, llm.clone()) {
-            engine_builder = engine_builder.reranker(reranker);
         }
         let engine = Arc::new(engine_builder.build()?);
 
@@ -538,57 +523,6 @@ fn build_retry_config(llm: &crate::config::LlmSection) -> RetryConfig {
     }
 }
 
-/// Construct an embedder from `config.engine.memory_embedder`. Returns
-/// `None` when the operator opts out (the default), the value is
-/// unrecognised, or the requested backend isn't compiled in. We log
-/// rather than panic so a misconfiguration only disables recall — the
-/// rest of the engine still runs.
-fn build_embedder(config: &Config) -> Option<Arc<dyn snaca_memory::Embedder>> {
-    let kind = config
-        .engine
-        .memory_embedder
-        .as_deref()
-        .unwrap_or("none")
-        .to_ascii_lowercase();
-    match kind.as_str() {
-        "" | "none" => None,
-        "hash" => {
-            let dim = config.engine.memory_embedder_dim.unwrap_or(128);
-            info!(dim, "memory embedder = hash (development / tests only)");
-            Some(Arc::new(snaca_memory::HashEmbedder::new(dim)))
-        }
-        "fastembed" => {
-            #[cfg(feature = "fastembed")]
-            {
-                info!("memory embedder = fastembed (multilingual-e5-small)");
-                match snaca_memory::FastEmbedEmbedder::try_new(
-                    snaca_memory::FastEmbedConfig::default(),
-                ) {
-                    Ok(e) => Some(Arc::new(e) as Arc<dyn snaca_memory::Embedder>),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "fastembed init failed; recall disabled");
-                        None
-                    }
-                }
-            }
-            #[cfg(not(feature = "fastembed"))]
-            {
-                tracing::warn!(
-                    "memory_embedder = \"fastembed\" but `fastembed` feature isn't compiled in; recall disabled"
-                );
-                None
-            }
-        }
-        other => {
-            tracing::warn!(
-                memory_embedder = other,
-                "unknown memory embedder; recall disabled"
-            );
-            None
-        }
-    }
-}
-
 /// Construct the post-turn memory extractor when enabled in config.
 /// Always wraps the LLM extractor in the default sensitive-info filter
 /// unless the operator explicitly opts out via
@@ -627,25 +561,6 @@ fn build_memory_extractor(
             snaca_engine::SensitiveFilter::default_set(),
         )))
     }
-}
-
-/// Build the retrieval reranker when enabled in config. Returns
-/// `None` (the default) when rerank is off — the engine falls back to
-/// truncating cosine recall.
-fn build_memory_reranker(
-    config: &Config,
-    llm: Arc<dyn LlmClient>,
-) -> Option<snaca_engine::SharedReranker> {
-    if !config.engine.memory_reranker.unwrap_or(false) {
-        return None;
-    }
-    let model = config
-        .engine
-        .memory_reranker_model
-        .clone()
-        .unwrap_or_else(|| config.llm.model.clone());
-    info!(model = %model, "memory reranker enabled");
-    Some(Arc::new(snaca_engine::LlmReranker::new(llm, model)))
 }
 
 /// Shared state for the admin HTTP surface. Grows as new handlers
@@ -739,7 +654,7 @@ impl ConfigSnapshot {
                 "history_limit": cfg.engine.history_limit,
                 "compact_after_input_tokens": cfg.engine.compact_after_input_tokens,
                 "memory_extractor": cfg.engine.memory_extractor.unwrap_or(true),
-                "memory_embedder": cfg.engine.memory_embedder,
+                "memory_write_approval": cfg.engine.memory_write_approval.unwrap_or(false),
             },
             "im_input": {
                 "assembly_enabled": cfg.im_input.assembly_enabled.unwrap_or(true),

@@ -17,9 +17,9 @@ pub use approval::{
     DenyAllApprovalGate, NoopApprovalGate,
 };
 pub use memory::{
-    MemoryEntryData, MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError,
-    MemoryProviderSlot, MemoryReadRequest, MemoryRecallHit, MemoryRecallRequest,
-    MemoryWriteRequest,
+    CompactReason, MemoryEntryData, MemoryIndexRequest, MemoryListRequest, MemoryProvider,
+    MemoryProviderError, MemoryProviderSlot, MemoryReadRequest, MemoryWriteAction, MemoryWriteCtx,
+    MemoryWriteRequest, PreCompactCtx, SessionSwitchCtx,
 };
 pub use question::{
     FixedQuestionGate, NoopQuestionGate, QuestionAnswer, QuestionAnswers, QuestionError,

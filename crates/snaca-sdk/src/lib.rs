@@ -32,17 +32,16 @@ pub use snaca_agent_api::{
     ApprovalDecision, ApprovalError, ApprovalGate, ApprovalRequest, ConversationMessage,
     ConversationStore, EnsureThread, HistoryQuery, InMemoryConversationStore, MemoryEntryData,
     MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError, MemoryProviderSlot,
-    MemoryReadRequest, MemoryRecallHit, MemoryRecallRequest, MemoryWriteRequest, QuestionAnswer,
-    QuestionAnswers, QuestionError, QuestionGate, QuestionOption, QuestionRequest, QuestionSpec,
-    StoreError, StoreMessageResult, ToolCallCompletion, ToolCallStart, WorkspaceProvider,
-    WorkspaceProviderError, WorkspaceRequest,
+    MemoryReadRequest, MemoryWriteRequest, QuestionAnswer, QuestionAnswers, QuestionError,
+    QuestionGate, QuestionOption, QuestionRequest, QuestionSpec, StoreError, StoreMessageResult,
+    ToolCallCompletion, ToolCallStart, WorkspaceProvider, WorkspaceProviderError, WorkspaceRequest,
 };
 pub use snaca_core::{
     ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolSchema,
     ToolUseId, Usage,
 };
 pub use snaca_engine::{
-    MemoryExtractor, Reranker, RuntimeToolFactory, SharedExtractor, SharedReranker, TurnOutcome,
+    MemoryExtractor, RuntimeToolFactory, SharedExtractor, TurnOutcome,
     TurnRequest as EngineTurnRequest,
 };
 pub use snaca_llm::{
@@ -927,6 +926,12 @@ mod tests {
 
     #[tokio::test]
     async fn sdk_memory_helper_roundtrips() {
+        // Clean any leftover state from a prior run so the
+        // file-tree provider's drift detection sees a fresh dir.
+        // The fixture path is intentionally outside tmpfs so the
+        // helper exercises the same workspace path a real SDK
+        // user would, but that means we own the cleanup.
+        let _ = std::fs::remove_dir_all("./target/snaca-sdk-test-memory");
         let provider = crate::memory::file_tree("./target/snaca-sdk-test-memory").unwrap();
         let tenant_id = TenantId::new("tenant");
         let project_id = ProjectId::from_raw("project");
@@ -1025,26 +1030,6 @@ mod tests {
                 name: request.name,
                 content,
             })
-        }
-
-        async fn recall(
-            &self,
-            request: MemoryRecallRequest,
-        ) -> std::result::Result<Vec<MemoryRecallHit>, MemoryProviderError> {
-            let query = request.query.to_lowercase();
-            let mut hits = Vec::new();
-            for ((scope, name), content) in self.entries.lock().unwrap().iter() {
-                if content.to_lowercase().contains(&query) {
-                    hits.push(MemoryRecallHit {
-                        scope: scope.clone(),
-                        name: name.clone(),
-                        content: content.clone(),
-                        score: Some(0.95),
-                    });
-                }
-            }
-            hits.truncate(request.limit);
-            Ok(hits)
         }
     }
 

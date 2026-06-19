@@ -31,9 +31,7 @@ use crate::tools_factory::RuntimeToolFactory;
 use chrono::Utc;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use snaca_agent_api::{
-    MemoryIndexRequest, MemoryProvider, MemoryProviderSlot, MemoryRecallRequest, MemoryWriteRequest,
-};
+use snaca_agent_api::{MemoryIndexRequest, MemoryProvider, MemoryProviderSlot, MemoryWriteRequest};
 use snaca_core::{
     ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolUseId,
     Usage,
@@ -48,7 +46,7 @@ use snaca_tools_api::{
     ToolResult,
 };
 use snaca_workspace::WorkspaceLayout;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,12 +116,6 @@ pub struct Engine {
     state: Database,
     workspace: WorkspaceLayout,
     config: EngineConfig,
-    /// Optional embedder. When attached, the engine runs vector recall
-    /// against the project's memory store at turn start and splices the
-    /// top-k matches into the system prompt under a `## Relevant
-    /// Memories` heading. None disables retrieval; the rest of the turn
-    /// loop is unchanged.
-    embedder: Option<Arc<dyn snaca_memory::Embedder>>,
     /// Optional memory extractor. When attached, the engine fires it
     /// on a background task after every successful turn; proposals are
     /// written through the project's `MemoryStore`. None disables
@@ -131,15 +123,10 @@ pub struct Engine {
     extractor: Option<crate::memory_extractor::SharedExtractor>,
     /// Optional SDK-level memory provider. When attached, MemoryRead /
     /// MemoryWrite tools use this provider instead of deriving the
-    /// file-tree store from `workspace_root`; system-prompt index and
-    /// recall also prefer this provider. None keeps the historical
-    /// file-tree memory behavior.
+    /// file-tree store from `workspace_root`; system-prompt index also
+    /// prefers this provider. None keeps the historical file-tree
+    /// memory behavior.
     memory_provider: Option<Arc<dyn MemoryProvider>>,
-    /// Optional retrieval reranker. When attached, the engine pulls
-    /// `RECALL_POOL_SIZE` cosine candidates and asks the reranker to
-    /// pick the top `RECALL_TOP_K`. None falls back to a simple
-    /// truncation of the cosine top-k — same behaviour as M3 chunk 2.
-    reranker: Option<crate::reranker::SharedReranker>,
     /// Optional background-task registry. When attached, Bash's
     /// `run_in_background = true` path can spawn long-lived tasks
     /// whose status is polled via the TaskOutput tool. Held as an
@@ -159,16 +146,6 @@ pub struct Engine {
     /// IM ids get a UUID fallback during turn entry; the value
     /// stored here is always non-empty.
     inflight: Arc<Mutex<HashMap<(ThreadId, String), CancellationToken>>>,
-    /// Per-thread ring of memories already surfaced through the recall
-    /// block in earlier turns. Retrieval filters these out before
-    /// picking the top-K so a long IM conversation doesn't re-splice
-    /// the same entries every turn — by then the model has already
-    /// seen them in prior context and re-listing just burns tokens.
-    /// Bounded at `SURFACED_RING_CAP` per thread; old entries roll out
-    /// and become eligible for resurfacing. In-memory only — process
-    /// restart resets dedup state, which is acceptable since recall
-    /// itself is also stateless across restarts.
-    surfaced_memories: SurfacedMemoryMap,
     /// Per-thread Read tracker — shared across turns on the same
     /// thread. Each `ReadTracker` is itself `Arc<Mutex<HashMap<...>>>`,
     /// so the engine just hands the same Arc to every turn on a given
@@ -200,6 +177,21 @@ pub struct Engine {
     /// `std::sync::Mutex` only guards the map's entry/insert and is
     /// released before any await.
     extraction_locks: Arc<Mutex<HashMap<ProjectId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-thread frozen memory snapshot. Computed lazily on the
+    /// first turn that needs the system prompt; reused verbatim
+    /// across every subsequent turn on the same thread so the
+    /// LLM provider's prompt-prefix cache holds. `MemoryWrite`
+    /// tool calls and the post-turn extractor still hit disk —
+    /// in-session writes only become visible on the next thread.
+    /// Process-restart resets the cache; the next first turn
+    /// re-renders.
+    memory_snapshots: Arc<Mutex<HashMap<ThreadId, Arc<String>>>>,
+    /// Per-project file-tree memory stores shared by MemoryRead /
+    /// MemoryWrite tool calls. `MemoryStore` carries the last-seen
+    /// hashes used for external-drift detection, so constructing a
+    /// fresh store for every tool call would make the check toothless.
+    /// Process-local only; restart trusts the current disk state.
+    memory_stores: Arc<Mutex<HashMap<(String, String), snaca_memory::MemoryStore>>>,
 }
 
 /// One-shot hint about a loop_guard trip, injected into the next
@@ -212,17 +204,6 @@ struct LoopGuardHint {
     input_snippet: String,
     count: usize,
 }
-
-/// One entry on the surfaced-memories dedup ring — the `(scope, name)`
-/// pair that uniquely identifies a memory file in a project.
-type SurfacedKey = (String, String);
-/// Per-thread ring buffer of `SurfacedKey`s. Backed by `VecDeque` so
-/// eviction at the front is O(1) when we roll past `SURFACED_RING_CAP`.
-type SurfacedRing = VecDeque<SurfacedKey>;
-/// Shared map of `ThreadId -> SurfacedRing`. Wrapped in
-/// `Arc<Mutex<…>>` because both turn entry and retrieval read from /
-/// write to it across awaits.
-type SurfacedMemoryMap = Arc<Mutex<HashMap<ThreadId, SurfacedRing>>>;
 
 /// RAII guard that removes a turn's cancellation token from the
 /// inflight map on drop, even if the turn panics or returns early.
@@ -255,16 +236,15 @@ impl Engine {
             state,
             workspace,
             config,
-            embedder: None,
             extractor: None,
             memory_provider: None,
-            reranker: None,
             task_registry: None,
             inflight: Arc::new(Mutex::new(HashMap::new())),
-            surfaced_memories: Arc::new(Mutex::new(HashMap::new())),
             read_trackers: Arc::new(Mutex::new(HashMap::new())),
             loop_guard_hints: Arc::new(Mutex::new(HashMap::new())),
             extraction_locks: Arc::new(Mutex::new(HashMap::new())),
+            memory_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            memory_stores: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -327,112 +307,63 @@ impl Engine {
         self
     }
 
-    /// Attach an embedder. With one in place, every turn embeds the
-    /// user's text and looks up the top-k closest memory entries; their
-    /// excerpts get spliced into the system prompt before the LLM call.
-    /// Without one (the default), only the static `MEMORY.md` index is
-    /// injected — the same as M3's first chunk.
-    pub fn with_embedder(mut self, embedder: Arc<dyn snaca_memory::Embedder>) -> Self {
-        self.embedder = Some(embedder);
-        self
-    }
-
     /// Attach a memory provider. Built-in memory tools, project
-    /// memory index injection, retrieval, and extractor writes prefer
-    /// this provider. Without one, the engine uses the existing
-    /// file-tree memory store under `WorkspaceLayout`.
+    /// memory index injection, and extractor writes prefer this
+    /// provider. Without one, the engine uses the existing file-tree
+    /// memory store under `WorkspaceLayout`.
     pub fn with_memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
         self.memory_provider = Some(provider);
         self
     }
 
-    /// Import an attachment's bytes into the project. Two side effects:
-    ///
-    /// 1. **Workspace drop**: bytes land at
-    ///    `<workspace>/<basename(filename)>` so the `Read` / `Glob` /
-    ///    `Bash` tools can open the file by name. This matches user
-    ///    expectations — "I uploaded `spec.pdf`, you should be able to
-    ///    read spec.pdf".
-    /// 2. **Memory import**: bytes also go through the standard bulk-
-    ///    import pipeline (extract → chunk → embed → store). Useful
-    ///    when the file is large enough that a future turn would
-    ///    benefit from vector recall over its content.
+    /// Stage an attachment in the project's workspace dir. The bytes
+    /// land at `<workspace>/<basename(filename)>` so the `Read` /
+    /// `Glob` / `Bash` tools can open the file by name. Returns the
+    /// final path on success.
     ///
     /// Filename is sanitised to its basename — directory components
-    /// are stripped before either side-effect runs, defending against
-    /// a malicious / buggy plugin sending `../escape.txt`.
+    /// are stripped before write, defending against a malicious /
+    /// buggy plugin sending `../escape.txt`. Empty / dot-only names
+    /// fall back to `attachment.bin`.
     ///
-    /// Falls back to `HashEmbedder` when no production embedder is
-    /// configured — imports always produce embeddings, but they only
-    /// surface in retrieval if the engine has its own embedder
-    /// configured (so vector spaces match). With matching embedders,
-    /// imported attachments become retrievable on the next turn.
-    pub async fn import_attachment(
+    /// Note: this used to also push the bytes through a chunk, embed,
+    /// and memory-vector pipeline. That pipeline was removed when the
+    /// engine adopted the frozen-snapshot memory model — attachments
+    /// no longer auto-populate the memory tree. The dispatch layer
+    /// surfaces the staged file in the next turn's user message
+    /// (filename + size + optional preview); the LLM decides whether
+    /// to persist anything via `MemoryWrite`.
+    pub async fn stage_attachment(
         &self,
         tenant: &TenantId,
         project: &ProjectId,
-        bytes: Vec<u8>,
-        filename: String,
-    ) -> Result<snaca_memory::ImportReport, snaca_memory::MemoryError> {
-        // Workspace dir must exist before the memory tree under it.
-        // `WorkspaceError` doesn't auto-convert into `MemoryError`;
-        // map to its IO arm with the path/reason flattened in.
+        bytes: &[u8],
+        filename: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
         self.workspace
             .ensure_project(tenant, project)
-            .map_err(|e| {
-                snaca_memory::MemoryError::Io(std::io::Error::other(format!(
-                    "ensure_project failed: {e}"
-                )))
-            })?;
+            .map_err(|e| std::io::Error::other(format!("ensure_project failed: {e}")))?;
 
-        // Side effect 1: workspace drop. Strip any path components
-        // from the filename — only the basename lands in the
-        // workspace dir. Empty / dot-only names get a fallback so we
-        // don't try to write `<workspace>/`.
-        let basename = std::path::Path::new(&filename)
+        let basename = std::path::Path::new(filename)
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty() && *s != "." && *s != "..")
             .unwrap_or("attachment.bin");
-        let workspace_dir = self.workspace.workspace_dir(tenant, project);
-        let target = workspace_dir.join(basename);
-        if let Err(e) = tokio::fs::write(&target, &bytes).await {
+        let target = self.workspace.workspace_dir(tenant, project).join(basename);
+        tokio::fs::write(&target, bytes).await.map_err(|e| {
             warn!(
                 error = %e,
                 path = %target.display(),
-                "attachment workspace drop failed; continuing with memory import only"
+                "attachment workspace drop failed"
             );
-        } else {
-            debug!(
-                path = %target.display(),
-                bytes = bytes.len(),
-                "attachment dropped into workspace"
-            );
-        }
-
-        let memory_dir = self.workspace.memory_dir(tenant, project);
-        let store = snaca_memory::MemoryStore::new(memory_dir);
-        let embedder: std::sync::Arc<dyn snaca_memory::Embedder> = match self.embedder.clone() {
-            Some(e) => e,
-            None => std::sync::Arc::new(snaca_memory::HashEmbedder::default()),
-        };
-        let indexed = snaca_memory::IndexedMemoryStore::new(
-            store,
-            self.state.clone(),
-            embedder,
-            tenant.clone(),
-            project.clone(),
+            e
+        })?;
+        debug!(
+            path = %target.display(),
+            bytes = bytes.len(),
+            "attachment dropped into workspace"
         );
-        snaca_memory::import_one(
-            &indexed,
-            snaca_memory::ImportSource {
-                bytes,
-                filename,
-                kind: None,
-            },
-            &snaca_memory::ImportConfig::default(),
-        )
-        .await
+        Ok(target)
     }
 
     /// Attach a memory extractor. With one in place, every successful
@@ -444,15 +375,6 @@ impl Engine {
         extractor: crate::memory_extractor::SharedExtractor,
     ) -> Self {
         self.extractor = Some(extractor);
-        self
-    }
-
-    /// Attach a retrieval reranker. With one in place, the engine
-    /// pulls `RECALL_POOL_SIZE` cosine candidates and asks the
-    /// reranker to pick the top `RECALL_TOP_K`. Without one, the
-    /// engine truncates the cosine top-k itself.
-    pub fn with_reranker(mut self, reranker: crate::reranker::SharedReranker) -> Self {
-        self.reranker = Some(reranker);
         self
     }
 
@@ -587,7 +509,29 @@ impl Engine {
         )
         .with_outbound_files(outbound_slot.clone())
         .with_read_tracker(read_tracker)
-        .with_cancellation_token(cancel_token.clone());
+        .with_cancellation_token(cancel_token.clone())
+        .with_db_handle(Arc::new(self.state.clone()) as Arc<dyn std::any::Any + Send + Sync>)
+        .with_memory_write_approval(self.config.memory_write_approval);
+        let shared_memory_store = {
+            let key = (
+                tenant_id.as_str().to_string(),
+                project_id.as_str().to_string(),
+            );
+            let mut map = self
+                .memory_stores
+                .lock()
+                .expect("memory_stores mutex poisoned");
+            map.entry(key)
+                .or_insert_with(|| {
+                    snaca_memory::MemoryStore::new(
+                        self.workspace.memory_dir(&tenant_id, &project_id),
+                    )
+                })
+                .clone()
+        };
+        tool_ctx = tool_ctx.with_memory_store(
+            Arc::new(shared_memory_store) as Arc<dyn std::any::Any + Send + Sync>
+        );
         // Bash run_in_background + TaskOutput / TaskStop share a
         // process-wide registry attached to the engine. When not
         // attached the companion tools surface a clear "no registry"
@@ -653,12 +597,10 @@ impl Engine {
             // schema cache between rounds.
             let runtime_tools = self.runtime_tools(&tenant_id, &project_id).await;
             let tool_schemas = registry_schemas(&runtime_tools);
-            // Build the per-turn system prompt by splicing in MEMORY.md if
-            // any project memory has been recorded, plus optional vector
-            // recall against the user's text. Reading once per turn is
-            // fine — memory rarely changes mid-turn, and a stale read in the
-            // middle of an iteration would only mean the model misses an
-            // entry that was added a couple of seconds ago.
+            // Build the per-turn system prompt by splicing in the
+            // per-thread frozen memory snapshot. Memory writes made
+            // later in the same thread stay on disk until a new thread
+            // or explicit invalidation refreshes the snapshot.
             // Drain a one-shot loop_guard hint if the previous turn on
             // this thread tripped the guard. None on the common path.
             let loop_guard_hint = self
@@ -1301,7 +1243,6 @@ impl Engine {
         // see — same window the engine uses for retrieval, so the
         // extractor sees the same context the LLM did.
         let history_limit = self.config.history_limit;
-        let default_confidence = self.config.extractor_default_confidence;
         // Per-project serial lock so two concurrent extractor tasks on
         // the same project don't trample each other's `MEMORY.md`
         // regeneration or same-name entry writes. Map insert is fast
@@ -1352,35 +1293,55 @@ impl Engine {
                     continue;
                 }
                 // Wrap the proposal body in YAML frontmatter so the
-                // recall path can downweight by `confidence` and the
-                // index can audit `source`. Missing confidence falls
-                // back to the engine's configured default — better
-                // than treating an extractor that ignored the schema
-                // as fully trusted.
-                let confidence = proposal.confidence.unwrap_or(default_confidence);
+                // index can audit `source` and `created_at`. The
+                // legacy `confidence` field is no longer consumed
+                // (the vector recall layer that used it has been
+                // removed); proposal.confidence is still surfaced
+                // through the extractor → write log so operators can
+                // see what the extractor was thinking.
+                let confidence = proposal.confidence;
                 let meta = snaca_memory::MemoryMeta {
                     source: Some("extractor".into()),
-                    confidence: Some(confidence),
+                    confidence: None,
                     created_at: Some(chrono::Utc::now().to_rfc3339()),
                 };
                 let wrapped = snaca_memory::render_with_frontmatter(&meta, &proposal.content);
                 if let Some(provider) = memory_provider.clone() {
+                    let scope_str = proposal.scope.as_str().to_string();
+                    let name_str = proposal.name.clone();
                     match provider
                         .write(MemoryWriteRequest {
                             tenant_id: tenant.clone(),
                             project_id: project.clone(),
-                            scope: proposal.scope.as_str().to_string(),
-                            name: proposal.name.clone(),
+                            scope: scope_str.clone(),
+                            name: name_str.clone(),
                             content: wrapped,
                         })
                         .await
                     {
-                        Ok(entry) => debug!(
-                            scope = entry.scope.as_str(),
-                            name = entry.name.as_str(),
-                            confidence,
-                            "extractor wrote memory entry through provider"
-                        ),
+                        Ok(entry) => {
+                            debug!(
+                                scope = entry.scope.as_str(),
+                                name = entry.name.as_str(),
+                                confidence = ?confidence,
+                                "extractor wrote memory entry through provider"
+                            );
+                            // Fire-and-forget hook so observers can
+                            // mirror or invalidate caches. We don't
+                            // bubble errors — the hook is advisory.
+                            if let Err(e) = provider
+                                .on_memory_write(&snaca_agent_api::MemoryWriteCtx {
+                                    tenant_id: tenant.clone(),
+                                    project_id: project.clone(),
+                                    action: snaca_agent_api::MemoryWriteAction::Extractor,
+                                    scope: scope_str,
+                                    name: name_str,
+                                })
+                                .await
+                            {
+                                warn!(error = %e, "memory provider on_memory_write hook failed");
+                            }
+                        }
                         Err(e) => warn!(
                             scope = %proposal.scope,
                             name = proposal.name.as_str(),
@@ -1390,11 +1351,14 @@ impl Engine {
                     }
                     continue;
                 }
-                match store.write(proposal.scope, &proposal.name, &wrapped).await {
+                match store
+                    .write_force(proposal.scope, &proposal.name, &wrapped)
+                    .await
+                {
                     Ok(entry) => debug!(
                         scope = %entry.scope,
                         name = entry.name.as_str(),
-                        confidence,
+                        confidence = ?confidence,
                         "extractor wrote memory entry"
                     ),
                     Err(e) => warn!(
@@ -1409,28 +1373,69 @@ impl Engine {
     }
 
     /// Compose the system prompt actually sent to the LLM for one turn:
-    /// base prompt + optional `## Project Memory` index + optional
-    /// `## Relevant Memories` recall. Both memory sections are
-    /// best-effort — IO or embedder failures fall back to the base
-    /// prompt rather than aborting the turn, since memory is auxiliary
-    /// context, not a hard requirement.
+    /// base prompt + frozen `## Project Memory` snapshot. The snapshot
+    /// is rendered once per thread and reused verbatim on every
+    /// subsequent turn — the entire prefix stays byte-stable so the
+    /// LLM provider's prompt cache holds. `MemoryWrite` calls and the
+    /// post-turn extractor still hit disk, but their effects only
+    /// surface in the next thread (or after an explicit
+    /// [`Self::invalidate_memory_snapshot`] call).
     ///
-    /// Returns the prompt as ordered [`SystemSegment`]s so the
-    /// provider layer can apply prompt-cache breakpoints precisely:
-    /// the base + MEMORY.md prefix is `cacheable`, the per-turn
-    /// `Relevant Memories` block is not. Anthropic uses this to hold
-    /// the stable prefix in cache across turns; DeepSeek flattens
-    /// back to a single string.
+    /// IO failures degrade gracefully: a project with no memory tree
+    /// or a transient read error caches an empty snapshot for the
+    /// thread instead of bouncing the turn.
     async fn system_prompt_for(
         &self,
         tenant: &TenantId,
         project: &ProjectId,
         thread: &ThreadId,
-        user_query: &str,
+        _user_query: &str,
         loop_guard_hint: Option<&LoopGuardHint>,
     ) -> Vec<SystemSegment> {
-        let (idx, recall_block) = if let Some(provider) = self.memory_provider.clone() {
-            let idx = match provider
+        // Cache hit on the second-and-later turns of a thread; this
+        // is the whole point of the frozen-snapshot model.
+        if let Some(cached) = self
+            .memory_snapshots
+            .lock()
+            .ok()
+            .and_then(|m| m.get(thread).cloned())
+        {
+            return compose_system_segments(
+                &self.config.system_prompt,
+                &cached,
+                "",
+                loop_guard_hint,
+            );
+        }
+
+        let snapshot_text = self.render_memory_snapshot(tenant, project).await;
+
+        if let Ok(mut map) = self.memory_snapshots.lock() {
+            map.insert(thread.clone(), Arc::new(snapshot_text.clone()));
+        }
+
+        compose_system_segments(
+            &self.config.system_prompt,
+            &snapshot_text,
+            "",
+            loop_guard_hint,
+        )
+    }
+
+    /// Render the full memory tree as the frozen snapshot text used
+    /// inside `## Project Memory`. Pulled out of `system_prompt_for`
+    /// so tests and the future `on_session_switch` hook can call it
+    /// directly. IO errors are logged and surfaced as an empty
+    /// string — no memory beats a poisoned turn.
+    async fn render_memory_snapshot(&self, tenant: &TenantId, project: &ProjectId) -> String {
+        // SDK-injected provider: defer to its `index` text. We cannot
+        // call snaca-memory's snapshot renderer through the trait
+        // without leaking concrete types, so the provider's `index`
+        // is the snapshot for that case. The built-in
+        // `FileTreeMemoryProvider` returns `MEMORY.md` here, which
+        // is a structurally similar listing.
+        if let Some(provider) = self.memory_provider.clone() {
+            return match provider
                 .index(MemoryIndexRequest {
                     tenant_id: tenant.clone(),
                     project_id: project.clone(),
@@ -1443,362 +1448,28 @@ impl Engine {
                     String::new()
                 }
             };
-            let recall = if !user_query.trim().is_empty() {
-                self.provider_retrieval_block(tenant, project, thread, provider, user_query)
-                    .await
-            } else {
-                String::new()
-            };
-            (idx, recall)
-        } else {
-            let memory_dir = self.workspace.memory_dir(tenant, project);
-            let store = snaca_memory::MemoryStore::new(memory_dir);
+        }
 
-            let idx = match store.index_text().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "memory index read failed; turning without memory preamble");
-                    String::new()
-                }
-            };
-
-            let recall = if !user_query.trim().is_empty() {
-                self.retrieval_block(tenant, project, thread, &store, user_query)
-                    .await
-            } else {
-                String::new()
-            };
-            (idx, recall)
-        };
-
-        compose_system_segments(
-            &self.config.system_prompt,
-            &idx,
-            &recall_block,
-            loop_guard_hint,
-        )
-    }
-
-    async fn provider_retrieval_block(
-        &self,
-        tenant: &TenantId,
-        project: &ProjectId,
-        thread: &ThreadId,
-        provider: Arc<dyn MemoryProvider>,
-        query: &str,
-    ) -> String {
-        let limit = if self.surfaced_has_entries(thread) {
-            RECALL_POOL_SIZE
-        } else {
-            RECALL_TOP_K
-        };
-        let hits = match provider
-            .recall(MemoryRecallRequest {
-                tenant_id: tenant.clone(),
-                project_id: project.clone(),
-                query: query.to_string(),
-                limit,
-            })
-            .await
-        {
-            Ok(hits) => hits,
+        let memory_dir = self.workspace.memory_dir(tenant, project);
+        let store = snaca_memory::MemoryStore::new(memory_dir);
+        match snaca_memory::render_snapshot(&store, &snaca_memory::RenderConfig::default()).await {
+            Ok(snap) => snap.text,
             Err(e) => {
-                warn!(error = %e, "memory provider recall failed; skipping retrieval block");
-                return String::new();
+                warn!(error = %e, "memory snapshot render failed; turning without memory preamble");
+                String::new()
             }
-        };
-        if hits.is_empty() {
-            return String::new();
-        }
-
-        let surfaced = self.surfaced_snapshot(thread);
-        let mut candidates = Vec::new();
-        for hit in hits {
-            if surfaced.contains(&(hit.scope.clone(), hit.name.clone())) {
-                continue;
-            }
-            if hit.score.is_some_and(|score| score < RECALL_MIN_SCORE) {
-                continue;
-            }
-            let (meta, body) = snaca_memory::parse_frontmatter(&hit.content);
-            let adjusted_score = match (hit.score, meta.confidence) {
-                (Some(score), Some(confidence)) => Some(score * confidence),
-                (Some(score), None) => Some(score),
-                (None, _) => None,
-            };
-            if meta.confidence.is_some()
-                && adjusted_score.is_some_and(|score| score < self.config.recall_confidence_floor)
-            {
-                continue;
-            }
-            candidates.push((hit.scope, hit.name, body, adjusted_score));
-        }
-        if candidates.is_empty() {
-            return String::new();
-        }
-        candidates.truncate(RECALL_TOP_K);
-
-        let mut out = String::new();
-        let mut surfaced_this_call = Vec::new();
-        for (scope, name, content, score) in candidates {
-            let body_excerpt = excerpt(&content, RECALL_EXCERPT_BYTES);
-            let heading = match score {
-                Some(score) => format!("### `{scope}/{name}` (score {score:.2})\n"),
-                None => format!("### `{scope}/{name}`\n"),
-            };
-            let next = format!("{heading}{body_excerpt}\n\n");
-            if out.len() + next.len() > RECALL_MAX_BYTES {
-                break;
-            }
-            out.push_str(&next);
-            surfaced_this_call.push((scope, name));
-        }
-        if out.is_empty() {
-            return String::new();
-        }
-        self.record_surfaced(thread, &surfaced_this_call);
-        out
-    }
-
-    /// Run vector recall against the project memory and render the
-    /// `## Relevant Memories` block. Returns an empty string when no
-    /// embedder is wired, the embedding fails, or no entry hits the
-    /// minimum-score threshold. Each hit gets its name + a short
-    /// excerpt of its content; the whole block is hard-capped at
-    /// `RECALL_MAX_BYTES` so a runaway memory tree can't bloat every
-    /// system prompt.
-    async fn retrieval_block(
-        &self,
-        tenant: &TenantId,
-        project: &ProjectId,
-        thread: &ThreadId,
-        store: &snaca_memory::MemoryStore,
-        query: &str,
-    ) -> String {
-        let Some(embedder) = self.embedder.clone() else {
-            return String::new();
-        };
-        let idx = snaca_memory::IndexedMemoryStore::new(
-            store.clone(),
-            self.state.clone(),
-            embedder,
-            tenant.clone(),
-            project.clone(),
-        );
-        // `MemoryWriteTool` writes directly through the file tree
-        // without touching the vector table (it doesn't carry a
-        // Database / Embedder handle by design). Catch the index up
-        // before searching — cheap when everything's already in sync.
-        if let Err(e) = idx.ensure_indexed().await {
-            warn!(error = %e, "ensure_indexed failed before recall; some entries may be missing");
-        }
-        // Pull a wider candidate pool when a reranker is attached;
-        // otherwise stop at the final cap (saves an entire DB read).
-        // Dedup against `surfaced_memories` thins the candidate set
-        // further down — request the pool size even without a
-        // reranker so dedup has room to drop entries without
-        // emptying the recall block.
-        let pool_size = if self.reranker.is_some() || self.surfaced_has_entries(thread) {
-            RECALL_POOL_SIZE
-        } else {
-            RECALL_TOP_K
-        };
-        let hits = match idx.search(query, pool_size).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "memory vector recall failed; skipping retrieval block");
-                return String::new();
-            }
-        };
-        if hits.is_empty() {
-            return String::new();
-        }
-        // Apply the floor *before* rerank so we never ask the LLM to
-        // judge entries that even cosine thought were unrelated.
-        let mut filtered: Vec<_> = hits
-            .into_iter()
-            .filter(|h| h.score >= RECALL_MIN_SCORE)
-            .collect();
-        if filtered.is_empty() {
-            return String::new();
-        }
-        // Drop entries already surfaced through earlier turns on this
-        // thread — the model has seen them in recent context and a
-        // second copy just bloats the prompt. Falls back to the
-        // unfiltered set when dedup would empty the recall (better
-        // some repetition than zero hits).
-        let before_dedup = filtered.len();
-        let deduped: Vec<_> = {
-            let surfaced = self.surfaced_snapshot(thread);
-            filtered
-                .iter()
-                .filter(|h| !surfaced.contains(&(h.scope.as_str().to_string(), h.name.clone())))
-                .cloned()
-                .collect()
-        };
-        if !deduped.is_empty() {
-            filtered = deduped;
-            if filtered.len() != before_dedup {
-                debug!(
-                    thread_id = thread.as_str(),
-                    kept = filtered.len(),
-                    skipped = before_dedup - filtered.len(),
-                    "filtered already-surfaced memories from recall pool"
-                );
-            }
-        }
-
-        // Rerank optional. Body lookup happens here so the reranker
-        // sees full content, not just names — that's the point of
-        // running it at all. Frontmatter parsing folds in two checks:
-        //
-        // 1. The body shown to the model is the post-frontmatter body
-        //    (no YAML metadata leakage into the system prompt).
-        // 2. When an entry's frontmatter sets `confidence` explicitly,
-        //    multiply cosine by it and drop hits whose adjusted score
-        //    falls below `recall_confidence_floor`. Legacy entries
-        //    (no frontmatter, no confidence) are NOT subject to this
-        //    extra floor — `RECALL_MIN_SCORE` above is the only gate
-        //    they cross, preserving prior behaviour for user-authored
-        //    memory.
-        let floor = self.config.recall_confidence_floor;
-        let candidates: Vec<crate::reranker::RerankCandidate> = {
-            let mut out = Vec::with_capacity(filtered.len());
-            for h in filtered.drain(..) {
-                let (meta, body) = match store.read_with_meta(h.scope, &h.name).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(scope = %h.scope, name = %h.name, error = %e, "memory body read failed during recall");
-                        continue;
-                    }
-                };
-                let (adjusted, confidence_applied) = match meta.confidence {
-                    Some(c) => (h.score * c, Some(c)),
-                    None => (h.score, None),
-                };
-                if confidence_applied.is_some() && adjusted < floor {
-                    debug!(
-                        scope = %h.scope,
-                        name = %h.name,
-                        cosine = h.score,
-                        confidence = confidence_applied.unwrap_or(1.0),
-                        adjusted,
-                        floor,
-                        "recall: dropping low-confidence-adjusted hit"
-                    );
-                    continue;
-                }
-                out.push(crate::reranker::RerankCandidate {
-                    scope: h.scope,
-                    name: h.name,
-                    content: body,
-                    initial_score: adjusted,
-                });
-            }
-            out
-        };
-        if candidates.is_empty() {
-            return String::new();
-        }
-        let ranked: Vec<crate::reranker::RerankCandidate> = match &self.reranker {
-            Some(r) => r.rerank(query, candidates, RECALL_TOP_K).await,
-            None => {
-                // Sort by adjusted score; multiplying by confidence
-                // may have flipped the cosine ordering. `partial_cmp`
-                // can't fail on the floats we produce here, but fall
-                // back to `Equal` defensively.
-                let mut v = candidates;
-                v.sort_by(|a, b| {
-                    b.initial_score
-                        .partial_cmp(&a.initial_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                v.truncate(RECALL_TOP_K);
-                v
-            }
-        };
-        if ranked.is_empty() {
-            return String::new();
-        }
-
-        let mut out = String::new();
-        let mut included = 0usize;
-        let mut surfaced_this_call: Vec<SurfacedKey> = Vec::new();
-        for candidate in ranked {
-            let body_excerpt = excerpt(&candidate.content, RECALL_EXCERPT_BYTES);
-            let next = format!(
-                "### `{}/{}` (score {:.2})\n{}\n\n",
-                candidate.scope.as_str(),
-                candidate.name,
-                candidate.initial_score,
-                body_excerpt
-            );
-            if out.len() + next.len() > RECALL_MAX_BYTES {
-                break;
-            }
-            out.push_str(&next);
-            surfaced_this_call.push((candidate.scope.as_str().to_string(), candidate.name.clone()));
-            included += 1;
-        }
-        if included == 0 {
-            return String::new();
-        }
-        // Record what we actually spliced in. Future turns on this
-        // thread filter their candidate pool against this ring, so a
-        // long conversation doesn't repeatedly re-spend its recall
-        // budget on the same entries.
-        self.record_surfaced(thread, &surfaced_this_call);
-        out
-    }
-
-    /// Snapshot of memories already shown in earlier recall blocks for
-    /// this thread. Returned as `HashSet` so callers can check
-    /// membership in `O(1)` while filtering. Empty when the thread has
-    /// no prior recall (the common case for new conversations).
-    fn surfaced_snapshot(&self, thread: &ThreadId) -> std::collections::HashSet<SurfacedKey> {
-        let Ok(guard) = self.surfaced_memories.lock() else {
-            return Default::default();
-        };
-        match guard.get(thread) {
-            Some(ring) => ring.iter().cloned().collect(),
-            None => Default::default(),
         }
     }
 
-    /// Whether the dedup ring has any entry for this thread. Cheaper
-    /// than `surfaced_snapshot` when we just need a boolean (sizing
-    /// the candidate pool). Returns false when the lock is poisoned
-    /// since the conservative move is "no dedup state".
-    fn surfaced_has_entries(&self, thread: &ThreadId) -> bool {
-        let Ok(guard) = self.surfaced_memories.lock() else {
-            return false;
-        };
-        guard.get(thread).is_some_and(|r| !r.is_empty())
-    }
-
-    /// Push the entries we just surfaced into the per-thread ring.
-    /// Ring capped at `SURFACED_RING_CAP` — old entries fall off the
-    /// front and become eligible to resurface, which is the right
-    /// trade-off: if the model needed an entry 30 turns ago, surfacing
-    /// it again is fine.
-    fn record_surfaced(&self, thread: &ThreadId, entries: &[SurfacedKey]) {
-        if entries.is_empty() {
-            return;
-        }
-        let Ok(mut guard) = self.surfaced_memories.lock() else {
-            return;
-        };
-        let ring = guard.entry(thread.clone()).or_default();
-        for entry in entries {
-            // Avoid duplicate consecutive entries: if the same memory
-            // came up twice in a row (rare but possible), don't
-            // double-count it against the ring capacity.
-            if !ring.iter().any(|e| e == entry) {
-                ring.push_back(entry.clone());
-                while ring.len() > SURFACED_RING_CAP {
-                    ring.pop_front();
-                }
-            }
+    /// Drop the cached frozen snapshot for `thread`. The next turn on
+    /// that thread re-renders from disk. Call this from session-reset
+    /// flows (future `/reset` slash command, or when the session id
+    /// is rolled forward by a compaction). No-op when the lock is
+    /// poisoned — the worst case is a stale prompt for one extra
+    /// turn.
+    pub fn invalidate_memory_snapshot(&self, thread: &ThreadId) {
+        if let Ok(mut map) = self.memory_snapshots.lock() {
+            map.remove(thread);
         }
     }
 
@@ -1824,6 +1495,64 @@ impl Engine {
         last_input_tokens: u32,
         keep_recent_override: Option<usize>,
     ) -> EngineResult<()> {
+        // Memory-provider hook before we touch anything: gives the
+        // provider a chance to mine durable facts from the
+        // soon-to-be-discarded middle band. We pass a best-effort
+        // transcript excerpt rather than the raw `Message` rows so
+        // the provider doesn't have to depend on snaca-state.
+        // Errors are logged and discarded — the hook is advisory.
+        if let Some(provider) = self.memory_provider.clone() {
+            // Pull the same window we'll compact, build a short
+            // transcript excerpt. Cheap relative to the LLM
+            // summarise call that follows.
+            let preview_rows = self
+                .state
+                .recent_messages(thread_id, self.config.history_limit.saturating_mul(4))
+                .await
+                .unwrap_or_default();
+            let mut excerpt = String::new();
+            for r in &preview_rows {
+                let mut text = String::new();
+                for block in &r.content {
+                    if let ContentBlock::Text { text: t } = block {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                }
+                if text.is_empty() {
+                    continue;
+                }
+                excerpt.push_str(&format!("[{:?}] {}\n", r.role, text));
+                if excerpt.len() > 8192 {
+                    break;
+                }
+            }
+            // We don't know the active TenantId/ProjectId at this
+            // call site — `maybe_compact_thread` only carries
+            // `thread_id`. Surface them via a parsed thread_id
+            // (the dispatcher uses `chat_id::project_id`); when
+            // that fails, fall back to empty ids so the hook still
+            // fires with the transcript excerpt the provider can
+            // act on.
+            let (parsed_tenant, parsed_project) = parse_thread_id_for_hook(thread_id);
+            let ctx = snaca_agent_api::PreCompactCtx {
+                tenant_id: parsed_tenant,
+                project_id: parsed_project,
+                thread_id: thread_id.as_str().to_string(),
+                reason: if keep_recent_override.is_some() {
+                    snaca_agent_api::CompactReason::ContextOverflowRetry
+                } else {
+                    snaca_agent_api::CompactReason::InputBudgetExceeded
+                },
+                transcript_excerpt: excerpt,
+            };
+            if let Err(e) = provider.on_pre_compact(&ctx).await {
+                warn!(error = %e, "memory provider on_pre_compact hook failed");
+            }
+        }
+
         let protect_last = keep_recent_override
             .unwrap_or(self.config.compact_keep_recent)
             .max(2);
@@ -2046,61 +1775,80 @@ impl Engine {
         // no write ancestor in this turn.
         let mut barrier_hit = false;
 
+        // Per-text-block fence scrubbers. The model occasionally
+        // echoes our injected `<memory-context>` / `<attachments>`
+        // fences back in its visible output. If we let those through
+        // they hit two surfaces we care about: the user-facing stream
+        // (via `listener`) and the next-turn transcript (via `acc`,
+        // which the extractor later reads). Scrubbing the text deltas
+        // right here — the single chokepoint every provider's stream
+        // flows through — kills both at once. Keyed by block index so
+        // interleaved blocks don't corrupt each other's partial-tag
+        // state; the kind tag lets the flush re-emit the right delta
+        // variant.
+        let mut text_scrubbers: HashMap<
+            u32,
+            (crate::memory_fence::StreamingScrubber, FenceTextKind),
+        > = HashMap::new();
+
         while let Some(ev) = stream.next().await {
             let ev = ev?;
-            listener.on_event(&ev).await;
+            for ev in scrub_stream_event(&mut text_scrubbers, ev) {
+                listener.on_event(&ev).await;
 
-            if self.config.stream_tool_execution {
-                match &ev {
-                    StreamEvent::ContentBlockStart {
-                        index,
-                        block: ContentBlockStart::ToolUse { id, name },
-                    } => {
-                        partials.insert(
-                            *index,
-                            StreamToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                args: String::new(),
-                            },
-                        );
-                    }
-                    StreamEvent::ContentBlockDelta {
-                        index,
-                        delta: ContentDelta::ToolInputJson { partial_json },
-                    } => {
-                        if let Some(p) = partials.get_mut(index) {
-                            p.args.push_str(partial_json);
+                if self.config.stream_tool_execution {
+                    match &ev {
+                        StreamEvent::ContentBlockStart {
+                            index,
+                            block: ContentBlockStart::ToolUse { id, name },
+                        } => {
+                            partials.insert(
+                                *index,
+                                StreamToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    args: String::new(),
+                                },
+                            );
                         }
-                    }
-                    StreamEvent::ContentBlockStop { index } => {
-                        if let Some(p) = partials.remove(index) {
-                            // Even if the barrier is up, walk the
-                            // eligibility check so we get the same
-                            // log signal — but suppress spawning.
-                            let tool_name = p.name.clone();
-                            let eligible = is_streamable_tool(&tool_name, tools);
-                            if barrier_hit {
-                                debug!(
-                                    tool = %tool_name,
-                                    "skipping prerun: write barrier already hit this turn"
-                                );
-                            } else if !eligible {
-                                debug!(
-                                    tool = %tool_name,
-                                    "tool not eligible for prerun; setting write barrier for the rest of this turn"
-                                );
-                                barrier_hit = true;
-                            } else if let Some(h) = self.maybe_spawn_prerun(p, tools, tool_ctx) {
-                                handles.push(h);
+                        StreamEvent::ContentBlockDelta {
+                            index,
+                            delta: ContentDelta::ToolInputJson { partial_json },
+                        } => {
+                            if let Some(p) = partials.get_mut(index) {
+                                p.args.push_str(partial_json);
                             }
                         }
+                        StreamEvent::ContentBlockStop { index } => {
+                            if let Some(p) = partials.remove(index) {
+                                // Even if the barrier is up, walk the
+                                // eligibility check so we get the same
+                                // log signal — but suppress spawning.
+                                let tool_name = p.name.clone();
+                                let eligible = is_streamable_tool(&tool_name, tools);
+                                if barrier_hit {
+                                    debug!(
+                                        tool = %tool_name,
+                                        "skipping prerun: write barrier already hit this turn"
+                                    );
+                                } else if !eligible {
+                                    debug!(
+                                        tool = %tool_name,
+                                        "tool not eligible for prerun; setting write barrier for the rest of this turn"
+                                    );
+                                    barrier_hit = true;
+                                } else if let Some(h) = self.maybe_spawn_prerun(p, tools, tool_ctx)
+                                {
+                                    handles.push(h);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
 
-            acc.ingest(ev);
+                acc.ingest(ev);
+            }
         }
 
         // Drain pre-spawned tasks. By the time the model finishes
@@ -2712,34 +2460,6 @@ fn registry_schemas(tools: &ToolRegistry) -> Vec<ToolSchema> {
     tools.schemas().to_vec()
 }
 
-/// Top-k cap for vector recall. Five matches tracks Claude Code's
-/// default and keeps the prompt addition under a couple of hundred
-/// tokens for typical entry sizes.
-const RECALL_TOP_K: usize = 5;
-/// Candidate pool size when a reranker is attached. Cosine pulls
-/// `RECALL_POOL_SIZE`, the reranker filters down to `RECALL_TOP_K`.
-/// Twenty is the plan default — enough headroom to recover the right
-/// match when cosine ranks it 6th-10th, small enough that the LLM
-/// rerank prompt stays under ~1k tokens.
-const RECALL_POOL_SIZE: usize = 20;
-/// Minimum cosine similarity to include in the recall block. Below this
-/// the hit is more likely to confuse than to help — the LLM will treat
-/// off-topic excerpts as authoritative if we splice them in.
-const RECALL_MIN_SCORE: f32 = 0.10;
-/// Hard ceiling on the rendered recall block in bytes. Stops the system
-/// prompt from ballooning when a project has a few very long memories.
-const RECALL_MAX_BYTES: usize = 4 * 1024;
-/// Per-entry excerpt length. Longer entries are truncated mid-sentence
-/// with an ellipsis — the model can MemoryRead the full body if needed.
-const RECALL_EXCERPT_BYTES: usize = 400;
-/// How many recently-surfaced memory entries to keep in the per-thread
-/// dedup ring. At `RECALL_TOP_K = 5` this is ~4 turns of recall before
-/// an entry rolls off and can resurface — long enough that consecutive
-/// turns on related topics don't re-show the same hits, short enough
-/// that resuming a topic dropped 10+ turns ago still re-surfaces. The
-/// ring lives in memory only; process restart resets it.
-const SURFACED_RING_CAP: usize = 20;
-
 /// Pull a short, displayable snippet of the input that tripped the
 /// loop guard. Walks the assistant content for a `ToolUse` block whose
 /// name matches `tool`; takes the *last* match because the guard
@@ -2773,17 +2493,19 @@ fn loop_guard_input_snippet(content: &[ContentBlock], tool: &str) -> String {
 ///   invalidates this segment exactly once — the expected cost of
 ///   memory writes.
 ///
-/// - **Segment 2 (volatile)** — the `## Relevant Memories` block.
-///   Vector recall is keyed by the user's query, which changes every
-///   turn, so this segment is excluded from any cache breakpoint to
-///   avoid silently invalidating the prefix.
+/// - **Segment 2 (volatile, optional)** — a loop-guard hint when the
+///   previous turn was aborted for repeating the same tool call. Held
+///   out of the cacheable prefix because it's per-turn and only set
+///   on rare error-recovery paths.
 ///
-/// Empty sections are dropped — an absent recall block, or a project
-/// with no memory yet, just collapses the segment list.
+/// `recall` is currently unused — the parameter is kept so callers can
+/// be migrated incrementally; it will carry the future frozen-snapshot
+/// "auto-retrieved" block once that lands. An empty string is the
+/// expected production input today.
 fn compose_system_segments(
     base: &str,
     index: &str,
-    recall: &str,
+    _recall: &str,
     loop_guard_hint: Option<&LoopGuardHint>,
 ) -> Vec<SystemSegment> {
     let mut stable = current_date_preamble(chrono::Local::now());
@@ -2791,23 +2513,17 @@ fn compose_system_segments(
     if !index.trim().is_empty() {
         stable.push_str(
             "\n\n---\n\n## Project Memory\n\n\
-             The following memory entries are stored for this project. Use the \
-             `MemoryRead` tool with `scope` and `name` to read any entry's full \
-             content. Do not assume content beyond what's in the index below.\n\n",
+             A frozen snapshot of this project's memory tree. Each entry \
+             is shown verbatim under its `scope/name` heading. The \
+             snapshot was taken at the start of this thread session — \
+             writes you make through `MemoryWrite` only become visible \
+             on the next session. If a `[truncated, N more entries \
+             hidden]` marker is present, use the `MemoryRead` tool with \
+             `scope` and `name` to fetch entries that didn't fit.\n\n",
         );
         stable.push_str(index.trim());
     }
     let mut segs: Vec<SystemSegment> = vec![SystemSegment::cacheable(stable)];
-    if !recall.trim().is_empty() {
-        let mut volatile = String::from(
-            "\n\n---\n\n## Relevant Memories (auto-retrieved)\n\n\
-             The following excerpts were pulled from memory by similarity to the \
-             user's request. Treat them as hints — the full content is one \
-             `MemoryRead` call away.\n\n",
-        );
-        volatile.push_str(recall.trim());
-        segs.push(SystemSegment::volatile(volatile));
-    }
     if let Some(hint) = loop_guard_hint {
         let snippet = if hint.input_snippet.is_empty() {
             "(input not captured)".to_string()
@@ -2842,6 +2558,26 @@ fn compose_system_prompt(base: &str, index: &str, recall: &str) -> String {
         out.push_str(&s.text);
     }
     out
+}
+
+/// Best-effort recovery of `(tenant_id, project_id)` from a thread
+/// id for the `on_pre_compact` / `on_session_switch` hook context.
+/// The dispatcher constructs thread ids as `<chat_id>::<project_id>`
+/// — see `crates/snaca-server/src/dispatch.rs::thread_id_for`. When
+/// the format diverges we fall back to empty ids; the provider
+/// still gets the rest of the context (thread id + transcript)
+/// which is the high-leverage payload.
+fn parse_thread_id_for_hook(thread: &ThreadId) -> (TenantId, ProjectId) {
+    // Tenant routing isn't encoded in the thread id today, so we
+    // surface the empty tenant — providers that care can derive it
+    // from their own session bookkeeping. Project, on the other
+    // hand, IS encoded as the suffix after `::`.
+    let raw = thread.as_str();
+    let project = raw
+        .rsplit_once("::")
+        .map(|(_, project)| project.to_string())
+        .unwrap_or_default();
+    (TenantId::new(""), ProjectId::from_raw(project))
 }
 
 /// Emit the dated preamble the model sees at the very top of every
@@ -2902,6 +2638,101 @@ struct StreamToolUse {
     id: String,
     name: String,
     args: String,
+}
+
+/// Which text-bearing delta variant a scrubbed block emits. Tracked
+/// per block index so [`scrub_stream_event`]'s flush re-emits the
+/// matching delta on `ContentBlockStop`.
+#[derive(Debug, Clone, Copy)]
+enum FenceTextKind {
+    Text,
+    Thinking,
+}
+
+/// Rewrite one streaming event so any echoed `<memory-context>` /
+/// `<attachments>` fence in a text or thinking delta is stripped
+/// before it reaches the user (listener) or the next-turn transcript
+/// (accumulator). Returns the events to actually process — usually
+/// one, but a `ContentBlockStop` may be preceded by a synthetic
+/// flush delta carrying the scrubber's held-back tail. Non-text
+/// events pass through untouched.
+fn scrub_stream_event(
+    scrubbers: &mut HashMap<u32, (crate::memory_fence::StreamingScrubber, FenceTextKind)>,
+    ev: StreamEvent,
+) -> Vec<StreamEvent> {
+    use crate::memory_fence::StreamingScrubber;
+    match ev {
+        StreamEvent::ContentBlockStart {
+            index,
+            block: ContentBlockStart::Text,
+        } => {
+            scrubbers.insert(index, (StreamingScrubber::new(), FenceTextKind::Text));
+            vec![StreamEvent::ContentBlockStart {
+                index,
+                block: ContentBlockStart::Text,
+            }]
+        }
+        StreamEvent::ContentBlockStart {
+            index,
+            block: ContentBlockStart::Thinking,
+        } => {
+            scrubbers.insert(index, (StreamingScrubber::new(), FenceTextKind::Thinking));
+            vec![StreamEvent::ContentBlockStart {
+                index,
+                block: ContentBlockStart::Thinking,
+            }]
+        }
+        StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentDelta::Text { text },
+        } => {
+            let cleaned = scrubbers
+                .get_mut(&index)
+                .map(|(s, _)| s.push(&text))
+                .unwrap_or(text);
+            if cleaned.is_empty() {
+                vec![]
+            } else {
+                vec![StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: ContentDelta::Text { text: cleaned },
+                }]
+            }
+        }
+        StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentDelta::Thinking { text },
+        } => {
+            let cleaned = scrubbers
+                .get_mut(&index)
+                .map(|(s, _)| s.push(&text))
+                .unwrap_or(text);
+            if cleaned.is_empty() {
+                vec![]
+            } else {
+                vec![StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: ContentDelta::Thinking { text: cleaned },
+                }]
+            }
+        }
+        StreamEvent::ContentBlockStop { index } => {
+            let mut out = Vec::new();
+            if let Some((mut scrubber, kind)) = scrubbers.remove(&index) {
+                let tail = scrubber.flush();
+                if !tail.is_empty() {
+                    let delta = match kind {
+                        FenceTextKind::Text => ContentDelta::Text { text: tail },
+                        FenceTextKind::Thinking => ContentDelta::Thinking { text: tail },
+                    };
+                    out.push(StreamEvent::ContentBlockDelta { index, delta });
+                }
+            }
+            out.push(StreamEvent::ContentBlockStop { index });
+            out
+        }
+        other => vec![other],
+    }
 }
 
 fn stream_retry_delay(attempt: u8) -> Duration {
@@ -3430,31 +3261,36 @@ mod system_prompt_tests {
     }
 
     #[test]
-    fn compose_keeps_memory_and_recall_sections() {
+    fn compose_keeps_memory_section_and_drops_recall_input() {
+        // The recall slot is a forward-compat placeholder while the
+        // frozen-snapshot rework lands; today it must be ignored so
+        // the cacheable prefix stays byte-stable across turns.
         let out = compose_system_prompt("BASE", "  user/foo — bar  ", "  hit one  ");
         assert!(out.contains("Today's date is "));
         assert!(out.contains("BASE"));
         assert!(out.contains("## Project Memory"));
         assert!(out.contains("user/foo — bar"));
-        assert!(out.contains("## Relevant Memories"));
-        assert!(out.contains("hit one"));
+        assert!(!out.contains("## Relevant Memories"));
+        assert!(!out.contains("hit one"));
     }
 
     #[test]
-    fn segments_split_stable_prefix_from_volatile_recall() {
-        // The whole point of the segmentation: base + memory go in one
-        // cacheable segment, recall lives in its own volatile segment.
-        // If anyone collapses these the prompt cache silently breaks.
+    fn segments_collapse_into_single_cacheable_prefix() {
+        // No more vector-recall second segment — base + memory live in
+        // one cacheable segment. Loop-guard hints (tested separately)
+        // are the only thing that can ever push a volatile second
+        // segment into the prompt now.
         let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", None);
-        assert_eq!(segs.len(), 2, "expected stable + volatile, got {segs:?}");
-        assert!(segs[0].cacheable, "first segment must be cacheable");
+        assert_eq!(
+            segs.len(),
+            1,
+            "expected one cacheable segment, got {segs:?}"
+        );
+        assert!(segs[0].cacheable, "the only segment must be cacheable");
         assert!(segs[0].text.contains("BASE"));
         assert!(segs[0].text.contains("## Project Memory"));
         assert!(segs[0].text.contains("user/foo — bar"));
         assert!(!segs[0].text.contains("Relevant Memories"));
-        assert!(!segs[1].cacheable, "second segment must be volatile");
-        assert!(segs[1].text.contains("## Relevant Memories"));
-        assert!(segs[1].text.contains("hit one"));
     }
 
     #[test]

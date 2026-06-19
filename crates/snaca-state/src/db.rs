@@ -2,8 +2,8 @@
 
 use crate::error::{StateError, StateResult};
 use crate::models::{
-    ChatBinding, MemoryVector, MessageRow, NewMessage, NewOutboxEntry, NewScheduledTask, NewThread,
-    OutboxKind, OutboxRow, OutboxStatus, PersistedDecision, ScheduledTask, StoredApprovalDecision,
+    ChatBinding, MessageRow, NewMessage, NewOutboxEntry, NewScheduledTask, NewThread, OutboxKind,
+    OutboxRow, OutboxStatus, PersistedDecision, ScheduledTask, StoredApprovalDecision,
     ThreadCompaction, ThreadRow, ToolCallRow,
 };
 use chrono::{DateTime, Utc};
@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
+const MIGRATION_MESSAGES_FTS_BACKFILLED: &str = "messages_fts_backfilled_v1";
 
 /// Owns a `SqlitePool` and exposes typed CRUD helpers. Cheap to clone.
 #[derive(Clone)]
@@ -71,6 +72,61 @@ impl Database {
         self.migrate_approval_decisions_add_input_signature()
             .await?;
         self.migrate_thread_compactions_add_summary_from().await?;
+        self.migrate_messages_fts_backfill().await?;
+        Ok(())
+    }
+
+    /// Backfill the `messages_fts` virtual table for legacy databases
+    /// that pre-date FTS5. Fresh DBs get an empty index alongside an
+    /// empty `messages` table, and from then on the AFTER triggers
+    /// keep them in sync. Legacy DBs need a one-shot FTS5 `rebuild`
+    /// command to populate the index from existing rows.
+    ///
+    /// We use an explicit migration marker instead of comparing
+    /// `COUNT(*)` on `messages_fts`: external-content FTS tables can
+    /// report content-table rows even when the index is empty, so that
+    /// probe would falsely skip the rebuild.
+    async fn migrate_messages_fts_backfill(&self) -> StateResult<()> {
+        if self
+            .migration_applied(MIGRATION_MESSAGES_FTS_BACKFILLED)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let msg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&self.pool)
+            .await?;
+        if msg_count > 0 {
+            // Rebuild from scratch — `'rebuild'` is the FTS5 idiom
+            // for "re-derive the index from the external content
+            // table".
+            sqlx::query("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+                .execute(&self.pool)
+                .await?;
+        }
+        self.mark_migration_applied(MIGRATION_MESSAGES_FTS_BACKFILLED)
+            .await?;
+        Ok(())
+    }
+
+    async fn migration_applied(&self, name: &str) -> StateResult<bool> {
+        let hit: Option<i64> = sqlx::query_scalar("SELECT 1 FROM schema_migrations WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(hit.is_some())
+    }
+
+    async fn mark_migration_applied(&self, name: &str) -> StateResult<()> {
+        sqlx::query(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?) \
+             ON CONFLICT(name) DO UPDATE SET applied_at = excluded.applied_at",
+        )
+        .bind(name)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -296,6 +352,134 @@ impl Database {
             .collect::<StateResult<_>>()?;
         msgs.reverse();
         Ok(msgs)
+    }
+
+    /// Same as [`Self::recent_messages`], but only returns rows when
+    /// the thread belongs to `tenant` + `project`. Tool surfaces that
+    /// accept an arbitrary thread id must use this scoped variant so a
+    /// caller cannot dump another project's transcript by guessing or
+    /// reusing a thread id.
+    pub async fn recent_messages_for_project(
+        &self,
+        tenant: &TenantId,
+        project: &ProjectId,
+        thread: &ThreadId,
+        limit: u32,
+    ) -> StateResult<Vec<MessageRow>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+             FROM messages m \
+             JOIN threads t ON t.id = m.thread_id \
+             WHERE m.thread_id = ? AND t.tenant_id = ? AND t.project_id = ? \
+             ORDER BY m.created_at DESC LIMIT ?",
+        )
+        .bind(thread.as_str())
+        .bind(tenant.as_str())
+        .bind(project.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut msgs: Vec<MessageRow> = rows
+            .into_iter()
+            .map(message_from_row)
+            .collect::<StateResult<_>>()?;
+        msgs.reverse();
+        Ok(msgs)
+    }
+
+    /// FTS5-backed full-text search over the `messages` table,
+    /// ranked by BM25. Used by the `session_search` tool to let
+    /// the LLM dig up "did we discuss X earlier?" without burning
+    /// retrieval budget on every turn. Scope is tenant + project
+    /// — we walk every thread that belongs to the requested
+    /// `project_id` so a cross-thread quote ("when we were
+    /// debugging deploy yesterday…") can be recovered.
+    ///
+    /// `query` is passed through to FTS5 verbatim — operators can
+    /// use the full FTS5 query syntax (phrase searches, NEAR,
+    /// boolean ops, column filters). Returns `[]` on parse errors
+    /// rather than bubbling up — the model retries with a simpler
+    /// query, which is the expected UX.
+    pub async fn search_messages_fts(
+        &self,
+        tenant: &TenantId,
+        project: &ProjectId,
+        query: &str,
+        limit: u32,
+    ) -> StateResult<Vec<MessageRow>> {
+        // Project scoping joins through `threads.project_id`. The
+        // FTS5 `MATCH` clause runs against the virtual table; the
+        // join filters to messages whose thread belongs to the
+        // caller's project. `bm25(messages_fts)` returns ascending
+        // (lower = better match) so we ORDER BY it directly.
+        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+                   FROM messages_fts \
+                   JOIN messages m ON m.rowid = messages_fts.rowid \
+                   JOIN threads t ON t.id = m.thread_id \
+                   WHERE messages_fts MATCH ? \
+                     AND t.tenant_id = ? AND t.project_id = ? \
+                   ORDER BY bm25(messages_fts) ASC \
+                   LIMIT ?";
+        let rows = match sqlx::query(sql)
+            .bind(query)
+            .bind(tenant.as_str())
+            .bind(project.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // FTS5 surfaces a `SQL logic error: malformed
+                // MATCH expression` for invalid queries. Surface
+                // an empty hit list — callers retry with a
+                // sanitised query.
+                tracing::debug!(error = %e, "fts5 search failed; returning empty");
+                return Ok(Vec::new());
+            }
+        };
+        rows.into_iter().map(message_from_row).collect()
+    }
+
+    /// Same as [`Self::search_messages_fts`], but constrained to one
+    /// thread before ranking/limiting. Callers that expose a
+    /// `thread_id` filter must use this variant; filtering after
+    /// the project-level top-N would let matches from other threads
+    /// consume the limit and hide valid hits from the requested
+    /// thread.
+    pub async fn search_messages_fts_for_thread(
+        &self,
+        tenant: &TenantId,
+        project: &ProjectId,
+        thread: &ThreadId,
+        query: &str,
+        limit: u32,
+    ) -> StateResult<Vec<MessageRow>> {
+        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+                   FROM messages_fts \
+                   JOIN messages m ON m.rowid = messages_fts.rowid \
+                   JOIN threads t ON t.id = m.thread_id \
+                   WHERE messages_fts MATCH ? \
+                     AND t.tenant_id = ? AND t.project_id = ? \
+                     AND m.thread_id = ? \
+                   ORDER BY bm25(messages_fts) ASC \
+                   LIMIT ?";
+        let rows = match sqlx::query(sql)
+            .bind(query)
+            .bind(tenant.as_str())
+            .bind(project.as_str())
+            .bind(thread.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "thread-scoped fts5 search failed; returning empty");
+                return Ok(Vec::new());
+            }
+        };
+        rows.into_iter().map(message_from_row).collect()
     }
 
     /// Symmetric counterpart to `messages_after`: return the messages
@@ -661,96 +845,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    // -------- memory_vectors --------
-
-    /// Upsert an embedding for one memory entry. Replaces any existing
-    /// row with the same `(tenant, project, scope, name)`. The embedding
-    /// is serialised as little-endian f32 bytes for compact storage and
-    /// portable reads from any platform we run on.
-    pub async fn upsert_memory_vector(
-        &self,
-        tenant: &TenantId,
-        project: &ProjectId,
-        scope: &str,
-        name: &str,
-        model_id: &str,
-        embedding: &[f32],
-    ) -> StateResult<MemoryVector> {
-        let now = Utc::now();
-        let bytes = embedding_to_bytes(embedding);
-        sqlx::query(
-            "INSERT INTO memory_vectors \
-                 (tenant_id, project_id, scope, name, model_id, dim, embedding, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(tenant_id, project_id, scope, name) DO UPDATE SET \
-                 model_id = excluded.model_id, \
-                 dim = excluded.dim, \
-                 embedding = excluded.embedding, \
-                 updated_at = excluded.updated_at",
-        )
-        .bind(tenant.as_str())
-        .bind(project.as_str())
-        .bind(scope)
-        .bind(name)
-        .bind(model_id)
-        .bind(embedding.len() as i64)
-        .bind(&bytes)
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-        Ok(MemoryVector {
-            tenant_id: tenant.clone(),
-            project_id: project.clone(),
-            scope: scope.to_string(),
-            name: name.to_string(),
-            model_id: model_id.to_string(),
-            embedding: embedding.to_vec(),
-            updated_at: now,
-        })
-    }
-
-    /// Drop the embedding for a single entry. No-op when absent so
-    /// callers can call this from a delete path without first checking.
-    pub async fn delete_memory_vector(
-        &self,
-        tenant: &TenantId,
-        project: &ProjectId,
-        scope: &str,
-        name: &str,
-    ) -> StateResult<()> {
-        sqlx::query(
-            "DELETE FROM memory_vectors \
-             WHERE tenant_id = ? AND project_id = ? AND scope = ? AND name = ?",
-        )
-        .bind(tenant.as_str())
-        .bind(project.as_str())
-        .bind(scope)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Every embedding under one project. Brute-force search lives on
-    /// top of this — load → cosine → sort → top-k. Fine for the
-    /// hundred-or-so entries a typical project ever holds; swap to
-    /// sqlite-vec when somebody actually exercises that scale.
-    pub async fn list_memory_vectors(
-        &self,
-        tenant: &TenantId,
-        project: &ProjectId,
-    ) -> StateResult<Vec<MemoryVector>> {
-        let rows = sqlx::query(
-            "SELECT tenant_id, project_id, scope, name, model_id, dim, embedding, updated_at \
-             FROM memory_vectors WHERE tenant_id = ? AND project_id = ?",
-        )
-        .bind(tenant.as_str())
-        .bind(project.as_str())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(memory_vector_from_row).collect()
     }
 
     // -------- scheduled_tasks --------
@@ -1185,6 +1279,10 @@ impl Database {
 /// Strip line comments (`-- ...`) before splitting on `;`. SQLite's parser
 /// understands inline comments but our manual splitter does not — without
 /// this, semicolons in comments would chop statements in half.
+///
+/// Also recognises `BEGIN ... END;` blocks (as used by `CREATE
+/// TRIGGER ... BEGIN ... END;`) and treats every `;` inside such a
+/// block as part of the enclosing statement, not a delimiter.
 fn split_statements(sql: &str) -> impl Iterator<Item = String> {
     let cleaned: String = sql
         .lines()
@@ -1197,12 +1295,60 @@ fn split_statements(sql: &str) -> impl Iterator<Item = String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    cleaned
-        .split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    // Walk word-by-word so we can detect `BEGIN` / `END` tokens
+    // case-insensitively without re-implementing a full SQL lexer.
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if depth == 0 && c == b';' {
+            let stmt = current.trim().to_string();
+            if !stmt.is_empty() {
+                out.push(stmt);
+            }
+            current.clear();
+            i += 1;
+            continue;
+        }
+        // Detect BEGIN / END as standalone tokens. Keep this cheap:
+        // only check on ascii-alpha boundaries.
+        if c.is_ascii_alphabetic() {
+            let prev_is_word =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !prev_is_word {
+                let rest = &cleaned[i..];
+                if matches_keyword(rest, "BEGIN") {
+                    depth += 1;
+                } else if depth > 0 && matches_keyword(rest, "END") {
+                    depth -= 1;
+                }
+            }
+        }
+        current.push(c as char);
+        i += 1;
+    }
+    let stmt = current.trim().to_string();
+    if !stmt.is_empty() {
+        out.push(stmt);
+    }
+    out.into_iter()
+}
+
+fn matches_keyword(rest: &str, keyword: &str) -> bool {
+    if rest.len() < keyword.len() {
+        return false;
+    }
+    if !rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
+        return false;
+    }
+    match rest.as_bytes().get(keyword.len()) {
+        None => true,
+        Some(&b) => !(b.is_ascii_alphanumeric() || b == b'_'),
+    }
 }
 
 fn role_to_str(role: Role) -> &'static str {
@@ -1280,45 +1426,6 @@ fn binding_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<ChatBinding> {
         user_id: row.try_get("user_id")?,
         project_id: ProjectId::from_raw(row.try_get::<String, _>("project_id")?),
         bound_at: parse_dt(&row.try_get::<String, _>("bound_at")?)?,
-    })
-}
-
-fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(v.len() * 4);
-    for f in v {
-        bytes.extend_from_slice(&f.to_le_bytes());
-    }
-    bytes
-}
-
-fn bytes_to_embedding(bytes: &[u8], dim: usize) -> StateResult<Vec<f32>> {
-    if bytes.len() != dim * 4 {
-        return Err(StateError::Migration(format!(
-            "memory_vectors blob length {} does not match dim {} (expected {} bytes)",
-            bytes.len(),
-            dim,
-            dim * 4
-        )));
-    }
-    let mut out = Vec::with_capacity(dim);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(out)
-}
-
-fn memory_vector_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<MemoryVector> {
-    let dim: i64 = row.try_get("dim")?;
-    let bytes: Vec<u8> = row.try_get("embedding")?;
-    let embedding = bytes_to_embedding(&bytes, dim.max(0) as usize)?;
-    Ok(MemoryVector {
-        tenant_id: TenantId::new(row.try_get::<String, _>("tenant_id")?),
-        project_id: ProjectId::from_raw(row.try_get::<String, _>("project_id")?),
-        scope: row.try_get::<String, _>("scope")?,
-        name: row.try_get::<String, _>("name")?,
-        model_id: row.try_get::<String, _>("model_id")?,
-        embedding,
-        updated_at: parse_dt(&row.try_get::<String, _>("updated_at")?)?,
     })
 }
 
@@ -1433,6 +1540,77 @@ mod tests {
         let db = db().await;
         // Re-run; must not error.
         db.run_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fts_backfill_rebuilds_legacy_external_content_index() {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, thread_id, session_id, role, content, created_at)
+             VALUES ('m1', 't1', 's1', 'user', ?, '2026-06-19T00:00:00Z')",
+        )
+        .bind(serde_json::to_string(&vec![ContentBlock::text("legacy backfill needle")]).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content,
+                content='messages',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2 tokenchars _'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'needle'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 0, "fixture should start with an empty FTS index");
+
+        let db = Database { pool };
+        db.run_migrations().await.unwrap();
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'needle'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(after, 1);
+        let marked: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM schema_migrations WHERE name = ?")
+                .bind(MIGRATION_MESSAGES_FTS_BACKFILLED)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(marked, Some(1));
     }
 
     #[tokio::test]
@@ -1681,87 +1859,6 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn memory_vector_round_trips() {
-        let db = db().await;
-        let tenant = TenantId::new("t");
-        let project = ProjectId::from_raw("p");
-        let v: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-
-        db.upsert_memory_vector(&tenant, &project, "user", "prefs", "hash/v1", &v)
-            .await
-            .unwrap();
-        let stored = db.list_memory_vectors(&tenant, &project).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        let row = &stored[0];
-        assert_eq!(row.scope, "user");
-        assert_eq!(row.name, "prefs");
-        assert_eq!(row.model_id, "hash/v1");
-        assert_eq!(row.embedding.len(), 32);
-        // f32 round-trip is exact for our inputs (i*0.1 fits cleanly).
-        for (i, x) in row.embedding.iter().enumerate() {
-            let expected = i as f32 * 0.1;
-            assert!((x - expected).abs() < 1e-6);
-        }
-    }
-
-    #[tokio::test]
-    async fn memory_vector_upsert_replaces_existing() {
-        let db = db().await;
-        let tenant = TenantId::new("t");
-        let project = ProjectId::from_raw("p");
-        db.upsert_memory_vector(&tenant, &project, "user", "x", "v1", &[1.0, 2.0])
-            .await
-            .unwrap();
-        db.upsert_memory_vector(&tenant, &project, "user", "x", "v2", &[3.0, 4.0, 5.0])
-            .await
-            .unwrap();
-        let stored = db.list_memory_vectors(&tenant, &project).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].model_id, "v2");
-        assert_eq!(stored[0].embedding, vec![3.0, 4.0, 5.0]);
-    }
-
-    #[tokio::test]
-    async fn memory_vectors_isolated_across_projects() {
-        let db = db().await;
-        let tenant = TenantId::new("t");
-        let p1 = ProjectId::from_raw("p1");
-        let p2 = ProjectId::from_raw("p2");
-        db.upsert_memory_vector(&tenant, &p1, "user", "shared", "h", &[1.0])
-            .await
-            .unwrap();
-        db.upsert_memory_vector(&tenant, &p2, "user", "shared", "h", &[2.0])
-            .await
-            .unwrap();
-        let p1_rows = db.list_memory_vectors(&tenant, &p1).await.unwrap();
-        let p2_rows = db.list_memory_vectors(&tenant, &p2).await.unwrap();
-        assert_eq!(p1_rows[0].embedding, vec![1.0]);
-        assert_eq!(p2_rows[0].embedding, vec![2.0]);
-    }
-
-    #[tokio::test]
-    async fn delete_memory_vector_removes_row_and_is_idempotent() {
-        let db = db().await;
-        let tenant = TenantId::new("t");
-        let project = ProjectId::from_raw("p");
-        db.upsert_memory_vector(&tenant, &project, "user", "tmp", "h", &[1.0])
-            .await
-            .unwrap();
-        db.delete_memory_vector(&tenant, &project, "user", "tmp")
-            .await
-            .unwrap();
-        assert!(db
-            .list_memory_vectors(&tenant, &project)
-            .await
-            .unwrap()
-            .is_empty());
-        // No-op when absent.
-        db.delete_memory_vector(&tenant, &project, "user", "tmp")
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

@@ -39,11 +39,11 @@ use tracing::{debug, warn};
 /// plan calls out for automatic mining.
 ///
 /// `confidence` is the extractor LLM's self-rating in `[0.0, 1.0]`.
-/// Recall-time scoring multiplies the cosine score by this value
-/// (defaulting to `extractor_default_confidence` when absent), so a
-/// hedged proposal is less likely to push a stronger memory off the
-/// recall list. Missing field deserialises to `None` so legacy
-/// transcripts / stub extractors stay compatible.
+/// The frozen-snapshot memory model no longer consumes it for
+/// ranking, but the engine still preserves the field in logs so
+/// operators can audit how certain the extractor was. Missing field
+/// deserialises to `None` so legacy transcripts / stub extractors
+/// stay compatible.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryProposal {
     pub scope: MemoryScope,
@@ -265,9 +265,22 @@ impl LlmMemoryExtractor {
                 #[allow(clippy::single_match)]
                 match block {
                     ContentBlock::Text { text } => {
+                        // Strip protected fences (`<memory-context>`,
+                        // `<attachments>`) before the extractor sees
+                        // them. Without this, we'd round-trip our
+                        // own injected snapshot and attachment
+                        // previews back into the extractor — and the
+                        // extractor would happily mine "user said:
+                        // here is some memory content" as a brand
+                        // new entry. That's the recursive memory
+                        // pollution attack hermes calls out.
+                        let cleaned = crate::memory_fence::sanitize_context(text);
+                        if cleaned.trim().is_empty() {
+                            continue;
+                        }
                         out.push_str(label);
                         out.push_str(": ");
-                        out.push_str(text);
+                        out.push_str(&cleaned);
                         out.push('\n');
                     }
                     _ => {}
@@ -639,6 +652,47 @@ mod tests {
         assert!(out.contains("ASSISTANT: noted"));
         // Tool-use block has no Text variant — dropped from transcript.
         assert!(!out.contains("Read"));
+    }
+
+    #[test]
+    fn render_transcript_strips_protected_fences() {
+        use chrono::Utc;
+        // Simulate the model echoing back our injected fences.
+        // Without sanitisation, the extractor would see "USER: ...
+        // <memory-context>...</memory-context>" and happily mine
+        // the recall content as if the user typed it.
+        let messages = vec![
+            Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: vec![ContentBlock::text(
+                    "real user input\n\n<attachments do-not-echo=\"true\">\n- file.md (10 bytes)\n  <preview>secret leaked</preview>\n</attachments>",
+                )],
+                created_at: Utc::now(),
+            },
+            Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: vec![ContentBlock::text(
+                    "fine — also <memory-context>poison</memory-context> ok",
+                )],
+                created_at: Utc::now(),
+            },
+        ];
+        let out = LlmMemoryExtractor::render_transcript(&messages);
+        assert!(out.contains("USER: real user input"));
+        assert!(out.contains("ASSISTANT: fine —"));
+        assert!(out.contains(" ok"));
+        assert!(
+            !out.contains("secret leaked"),
+            "attachments preview leaked into transcript: {out}"
+        );
+        assert!(
+            !out.contains("poison"),
+            "memory-context body leaked into transcript: {out}"
+        );
+        assert!(!out.contains("<memory-context"));
+        assert!(!out.contains("<attachments"));
     }
 
     #[test]

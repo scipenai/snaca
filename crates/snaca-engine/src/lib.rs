@@ -21,8 +21,8 @@ pub mod error;
 pub mod listener;
 pub mod loop_guard;
 pub mod memory_extractor;
+pub mod memory_fence;
 pub mod question_gate;
-pub mod reranker;
 pub mod tools_factory;
 
 pub use approval::{
@@ -42,5 +42,4 @@ pub use question_gate::{
     FixedQuestionGate, NoopQuestionGate, QuestionAnswer, QuestionAnswers, QuestionError,
     QuestionGate, QuestionGateSlot, QuestionOption, QuestionRequest, QuestionSpec,
 };
-pub use reranker::{IdentityReranker, LlmReranker, RerankCandidate, Reranker, SharedReranker};
 pub use tools_factory::RuntimeToolFactory;

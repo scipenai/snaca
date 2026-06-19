@@ -2,9 +2,8 @@
 
 use crate::{Result, SdkError};
 use snaca_agent_api::MemoryProvider;
-use snaca_engine::{Engine, EngineConfig, RuntimeToolFactory, SharedExtractor, SharedReranker};
+use snaca_engine::{Engine, EngineConfig, RuntimeToolFactory, SharedExtractor};
 use snaca_llm::LlmClient;
-use snaca_memory::Embedder;
 use snaca_state::Database;
 use snaca_tools_api::ToolRegistry;
 use snaca_workspace::WorkspaceLayout;
@@ -20,10 +19,8 @@ pub struct EngineRuntimeBuilder {
     config: Option<EngineConfig>,
     tool_factory: Option<Arc<dyn RuntimeToolFactory>>,
     task_registry: Option<Arc<dyn Any + Send + Sync>>,
-    embedder: Option<Arc<dyn Embedder>>,
     extractor: Option<SharedExtractor>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
-    reranker: Option<SharedReranker>,
 }
 
 impl EngineRuntimeBuilder {
@@ -71,11 +68,6 @@ impl EngineRuntimeBuilder {
         self
     }
 
-    pub fn embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
-        self.embedder = Some(embedder);
-        self
-    }
-
     pub fn memory_extractor(mut self, extractor: SharedExtractor) -> Self {
         self.extractor = Some(extractor);
         self
@@ -83,11 +75,6 @@ impl EngineRuntimeBuilder {
 
     pub fn memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
         self.memory_provider = Some(provider);
-        self
-    }
-
-    pub fn reranker(mut self, reranker: SharedReranker) -> Self {
-        self.reranker = Some(reranker);
         self
     }
 
@@ -108,17 +95,11 @@ impl EngineRuntimeBuilder {
         if let Some(registry) = self.task_registry {
             engine = engine.with_task_registry(registry);
         }
-        if let Some(embedder) = self.embedder {
-            engine = engine.with_embedder(embedder);
-        }
         if let Some(extractor) = self.extractor {
             engine = engine.with_memory_extractor(extractor);
         }
         if let Some(provider) = self.memory_provider {
             engine = engine.with_memory_provider(provider);
-        }
-        if let Some(reranker) = self.reranker {
-            engine = engine.with_reranker(reranker);
         }
         Ok(engine)
     }

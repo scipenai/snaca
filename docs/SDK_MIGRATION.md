@@ -103,7 +103,7 @@ Current limitation: `AgentBuilder` still wraps `snaca-engine`, whose turn loop
 uses `snaca_state::Database` and `snaca_workspace::WorkspaceLayout`
 internally. Full arbitrary store/workspace injection into engine execution is
 a later refactor because the engine also needs summary, approval, audit,
-memory-vector, and attachment-import operations.
+transcript-search, and attachment-import operations.
 
 ## Configuration
 

@@ -1,56 +1,32 @@
 //! `snaca-agent-api::MemoryProvider` adapter for the file-tree memory store.
+//!
+//! This is the only built-in implementation. It maps the
+//! `MemoryProvider` trait directly onto a project's `MemoryStore`
+//! under `<workspace>/<tenant>/projects/<project>/memory/`. The vector
+//! recall layer that previously sat on top has been removed; recall
+//! is no longer part of the trait.
 
-use crate::{HashEmbedder, IndexedMemoryStore, MemoryError, MemoryScope, MemoryStore};
+use crate::{MemoryError, MemoryScope, MemoryStore};
 use async_trait::async_trait;
 use snaca_agent_api::{
     MemoryEntryData, MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError,
-    MemoryReadRequest, MemoryRecallHit, MemoryRecallRequest, MemoryWriteRequest,
+    MemoryReadRequest, MemoryWriteRequest,
 };
 use snaca_core::{ProjectId, TenantId};
-use snaca_state::Database;
 use snaca_workspace::WorkspaceLayout;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct FileTreeMemoryProvider {
     workspace: WorkspaceLayout,
-    state: Option<Database>,
-    embedder: Option<Arc<dyn crate::Embedder>>,
 }
 
 impl FileTreeMemoryProvider {
     pub fn new(workspace: WorkspaceLayout) -> Self {
-        Self {
-            workspace,
-            state: None,
-            embedder: None,
-        }
-    }
-
-    pub fn with_index(mut self, state: Database, embedder: Arc<dyn crate::Embedder>) -> Self {
-        self.state = Some(state);
-        self.embedder = Some(embedder);
-        self
-    }
-
-    pub fn with_hash_index(mut self, state: Database) -> Self {
-        self.state = Some(state);
-        self.embedder = Some(Arc::new(HashEmbedder::default()));
-        self
+        Self { workspace }
     }
 
     fn store(&self, tenant: &TenantId, project: &ProjectId) -> MemoryStore {
         MemoryStore::new(self.workspace.memory_dir(tenant, project))
-    }
-
-    fn indexed(&self, tenant: &TenantId, project: &ProjectId) -> Option<IndexedMemoryStore> {
-        Some(IndexedMemoryStore::new(
-            self.store(tenant, project),
-            self.state.clone()?,
-            self.embedder.clone()?,
-            tenant.clone(),
-            project.clone(),
-        ))
     }
 }
 
@@ -60,10 +36,11 @@ impl MemoryProvider for FileTreeMemoryProvider {
         self.workspace
             .ensure_project(&request.tenant_id, &request.project_id)
             .map_err(map_workspace_error)?;
-        self.store(&request.tenant_id, &request.project_id)
-            .index_text()
+        let store = self.store(&request.tenant_id, &request.project_id);
+        crate::render_snapshot(&store, &crate::RenderConfig::default())
             .await
-            .map_err(map_memory_error)
+            .map(|snap| snap.text)
+            .map_err(MemoryProviderError::Io)
     }
 
     async fn list(&self, request: MemoryListRequest) -> Result<Vec<String>, MemoryProviderError> {
@@ -85,17 +62,11 @@ impl MemoryProvider for FileTreeMemoryProvider {
         self.workspace
             .ensure_project(&request.tenant_id, &request.project_id)
             .map_err(map_workspace_error)?;
-        let entry = match self.indexed(&request.tenant_id, &request.project_id) {
-            Some(indexed) => indexed
-                .write(scope, &request.name, &request.content)
-                .await
-                .map_err(map_memory_error)?,
-            None => self
-                .store(&request.tenant_id, &request.project_id)
-                .write(scope, &request.name, &request.content)
-                .await
-                .map_err(map_memory_error)?,
-        };
+        let entry = self
+            .store(&request.tenant_id, &request.project_id)
+            .write(scope, &request.name, &request.content)
+            .await
+            .map_err(map_memory_error)?;
         Ok(entry.into())
     }
 
@@ -113,52 +84,6 @@ impl MemoryProvider for FileTreeMemoryProvider {
             .await
             .map_err(map_memory_error)?;
         Ok(entry.into())
-    }
-
-    async fn recall(
-        &self,
-        request: MemoryRecallRequest,
-    ) -> Result<Vec<MemoryRecallHit>, MemoryProviderError> {
-        self.workspace
-            .ensure_project(&request.tenant_id, &request.project_id)
-            .map_err(map_workspace_error)?;
-        let store = self.store(&request.tenant_id, &request.project_id);
-        if let Some(indexed) = self.indexed(&request.tenant_id, &request.project_id) {
-            indexed.ensure_indexed().await.map_err(map_memory_error)?;
-            let hits = indexed
-                .search(&request.query, request.limit)
-                .await
-                .map_err(map_memory_error)?;
-            let mut out = Vec::with_capacity(hits.len());
-            for hit in hits {
-                let entry = store
-                    .read(hit.scope, &hit.name)
-                    .await
-                    .map_err(map_memory_error)?;
-                out.push(MemoryRecallHit {
-                    scope: entry.scope.as_str().to_string(),
-                    name: entry.name,
-                    content: entry.content,
-                    score: Some(hit.score),
-                });
-            }
-            return Ok(out);
-        }
-
-        let mut out = Vec::new();
-        for (scope, name) in store.list_all().await.map_err(map_memory_error)? {
-            if out.len() >= request.limit {
-                break;
-            }
-            let entry = store.read(scope, &name).await.map_err(map_memory_error)?;
-            out.push(MemoryRecallHit {
-                scope: entry.scope.as_str().to_string(),
-                name: entry.name,
-                content: entry.content,
-                score: None,
-            });
-        }
-        Ok(out)
     }
 }
 
@@ -190,6 +115,22 @@ fn map_memory_error(error: MemoryError) -> MemoryProviderError {
         MemoryError::ExternalExtractorRequired { kind, filename } => MemoryProviderError::Other(
             format!("external extractor required for {kind} file {filename:?}"),
         ),
+        MemoryError::EntryTooLarge {
+            filename,
+            bytes,
+            limit,
+        } => MemoryProviderError::Other(format!(
+            "memory entry too large for {filename:?}: {bytes} bytes (limit {limit})"
+        )),
+        MemoryError::ImportScopeBlocked { scope } => MemoryProviderError::Other(format!(
+            "memory scope {scope} is not allowed as an import target"
+        )),
+        MemoryError::ThreatBlocked { kind, description } => MemoryProviderError::Other(format!(
+            "memory write blocked by threat scanner: {kind} ({description})"
+        )),
+        MemoryError::ExternalDrift { path, backup_path } => MemoryProviderError::Other(format!(
+            "memory entry {path:?} was modified externally; backed up to {backup_path:?} — re-read and retry"
+        )),
     }
 }
 
@@ -205,11 +146,11 @@ mod tests {
     use super::*;
     use snaca_agent_api::{
         MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryReadRequest,
-        MemoryRecallRequest, MemoryWriteRequest,
+        MemoryWriteRequest,
     };
 
     #[tokio::test]
-    async fn file_tree_memory_provider_roundtrips_and_recalls() {
+    async fn file_tree_memory_provider_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let provider = FileTreeMemoryProvider::new(WorkspaceLayout::new(dir.path()).unwrap());
         let tenant_id = TenantId::new("tenant");
@@ -251,24 +192,15 @@ mod tests {
 
         let index = provider
             .index(MemoryIndexRequest {
-                tenant_id: tenant_id.clone(),
-                project_id: project_id.clone(),
+                tenant_id,
+                project_id,
             })
             .await
             .unwrap();
         assert!(index.contains("project/conventions"));
-
-        let hits = provider
-            .recall(MemoryRecallRequest {
-                tenant_id,
-                project_id,
-                query: "rust".into(),
-                limit: 10,
-            })
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name, "conventions");
-        assert_eq!(hits[0].score, None);
+        assert!(
+            index.contains("Use Rust 2021."),
+            "provider index should render the frozen snapshot body, got: {index}"
+        );
     }
 }

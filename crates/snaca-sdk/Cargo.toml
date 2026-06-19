@@ -32,6 +32,10 @@ path = "../../examples/sdk/with_memory.rs"
 name = "custom_store"
 path = "../../examples/sdk/custom_store.rs"
 
+[[example]]
+name = "memory_live_demo"
+path = "../../examples/sdk/memory_live_demo.rs"
+
 [dependencies]
 snaca-core.workspace = true
 snaca-agent-api.workspace = true
@@ -57,3 +61,4 @@ channel-host = ["channel-protocol", "dep:snaca-channel-host"]
 async-trait.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+tracing-subscriber.workspace = true

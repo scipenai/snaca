@@ -1,18 +1,22 @@
-//! End-to-end test for the IM-attachment-import flow.
+//! End-to-end test for the IM-attachment-staging flow.
 //!
 //! Boots a real `Runtime` with a single mock plugin that:
 //!   - auto-injects one `event.message_received` carrying an `Attachment`
 //!   - serves that attachment's bytes when the host calls `file.download`
 //!
-//! The dispatcher should pull the attachment, run it through
-//! `engine.import_attachment`, and write a memory entry under the
-//! project's reference scope. We assert by reading the on-disk memory
-//! tree once the round trip completes.
+//! The dispatcher should pull the attachment and drop it into the
+//! project's workspace dir as a regular file. We assert by reading
+//! the file off disk after the round trip completes.
+//!
+//! Note: the dispatcher used to also chunk + embed each attachment
+//! into the memory vector store. That pipeline was removed when the
+//! engine adopted the frozen-snapshot memory model — attachments now
+//! live only as workspace files; the LLM decides whether to persist
+//! anything via `MemoryWrite`.
 
 use async_trait::async_trait;
 use snaca_core::{Message, MessageId, ProjectId, Role, TenantId, Usage};
 use snaca_llm::{LlmClient, LlmResult, MessageRequest, MessageResponse, ProviderCaps, StopReason};
-use snaca_memory::{MemoryScope, MemoryStore};
 use snaca_server::{Config, Runtime};
 use snaca_workspace::WorkspaceLayout;
 use std::path::PathBuf;
@@ -106,7 +110,7 @@ impl LlmClient for ConstantLlm {
 }
 
 #[tokio::test]
-async fn attachment_lands_as_memory_entry_before_turn() {
+async fn attachment_lands_in_workspace_dir() {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp = tempfile::tempdir().unwrap();
     let data_root = tmp.path().join("data");
@@ -114,7 +118,7 @@ async fn attachment_lands_as_memory_entry_before_turn() {
     let cli_bin = snaca_cli_binary();
 
     // Inject one user message + one attachment. The dispatcher should
-    // import the attachment first, then run the turn.
+    // stage the attachment into the workspace dir, then run the turn.
     let cfg = format!(
         r#"
 [server]
@@ -153,358 +157,40 @@ args = [
         .await
         .expect("runtime starts");
 
-    // The mock plugin's `inject_tenant_id`/`inject_chat_id` defaults
-    // give us deterministic routing. Project is the chat-id-derived
-    // auto slug.
     let tenant = TenantId::new("mock-tenant");
     let project = ProjectId::auto_from_chat("mock-chat");
 
-    // Wait up to 10s for the attachment to land in the memory tree.
-    // The dispatcher imports synchronously *before* the LLM turn, so
-    // an entry under `reference/` is the success signal.
+    // Wait up to 10s for the attachment to land in the workspace dir.
+    // The dispatcher stages synchronously *before* the LLM turn, so
+    // the file appearing under `<workspace>/spec.md` is the success
+    // signal.
     let layout = WorkspaceLayout::new(std::fs::canonicalize(&data_root).unwrap()).unwrap();
-    let store = MemoryStore::new(layout.memory_dir(&tenant, &project));
+    let workspace_dir = layout.workspace_dir(&tenant, &project);
+    let target = workspace_dir.join("spec.md");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut names = Vec::new();
     while Instant::now() < deadline {
-        names = store.list(MemoryScope::Reference).await.unwrap_or_default();
-        if !names.is_empty() {
+        if target.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        !names.is_empty(),
-        "expected an attachment-derived memory entry; got: {names:?}"
+        target.exists(),
+        "expected attachment to land in workspace dir at {}",
+        target.display()
     );
-    let landed = names.iter().any(|n| n.contains("spec"));
+    let body = std::fs::read_to_string(&target).expect("read staged attachment");
     assert!(
-        landed,
-        "expected `spec`-derived entry; got names: {names:?}"
+        body.contains("kebab-case"),
+        "staged attachment lost its content; got: {body:?}"
     );
 
-    // Read the entry and confirm the inlined content actually made
-    // it through file.download → import_one.
-    let stem = names.iter().find(|n| n.contains("spec")).unwrap().clone();
-    let entry = store.read(MemoryScope::Reference, &stem).await.unwrap();
-    assert!(
-        entry.content.contains("kebab-case"),
-        "import did not preserve content; got: {:?}",
-        entry.content
-    );
-
-    // The LLM was eventually invoked too — attachment import must
+    // The LLM was eventually invoked too — attachment staging must
     // not block the turn from running.
     wait_for_llm_calls(&llm, 1).await;
 
     runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn file_then_text_is_assembled_before_attachment_import() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp = tempfile::tempdir().unwrap();
-    let data_root = tmp.path().join("data");
-    let cfg_path = tmp.path().join("snaca.toml");
-    let cli_bin = snaca_cli_binary();
-
-    let cfg = format!(
-        r#"
-[server]
-http_listen = "127.0.0.1:0"
-data_root = {data_root:?}
-
-[tenant]
-id = "default"
-
-[llm]
-api_key = "ignored"
-model = "constant"
-
-[engine]
-memory_extractor = false
-
-[im_input]
-text_debounce_ms = 50
-attachment_wait_secs = 5
-referential_text_wait_secs = 5
-pending_expire_secs = 5
-
-[[plugins]]
-name = "mock"
-command = {cli_bin:?}
-args = [
-    "mock-plugin",
-    "--auto-inject",
-    "[uploaded file: spec.md]",
-    "--inject-attachment",
-    "att-1:spec.md:project conventions: kebab-case file names",
-    "--inject-extra",
-    "mock-chat:请总结重点",
-]
-"#,
-        data_root = data_root.to_string_lossy(),
-        cli_bin = cli_bin.to_string_lossy(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-
-    let config = Config::load(&cfg_path).expect("config loads");
-    let llm = Arc::new(ConstantLlm::new("noted"));
-    let runtime = Runtime::build_with_llm(config, llm.clone())
-        .await
-        .expect("runtime starts");
-
-    let tenant = TenantId::new("mock-tenant");
-    let project = ProjectId::auto_from_chat("mock-chat");
-    wait_for_spec_memory(&data_root, &tenant, &project).await;
-    wait_for_llm_calls(&llm, 1).await;
-
-    let user_text = llm
-        .last_user_text
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("LLM saw a user message");
-    assert_eq!(user_text, "请总结重点");
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn text_then_file_is_assembled_before_attachment_import() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp = tempfile::tempdir().unwrap();
-    let data_root = tmp.path().join("data");
-    let cfg_path = tmp.path().join("snaca.toml");
-    let cli_bin = snaca_cli_binary();
-
-    let cfg = format!(
-        r#"
-[server]
-http_listen = "127.0.0.1:0"
-data_root = {data_root:?}
-
-[tenant]
-id = "default"
-
-[llm]
-api_key = "ignored"
-model = "constant"
-
-[engine]
-memory_extractor = false
-
-[im_input]
-text_debounce_ms = 50
-attachment_wait_secs = 5
-referential_text_wait_secs = 5
-pending_expire_secs = 5
-
-[[plugins]]
-name = "mock"
-command = {cli_bin:?}
-args = [
-    "mock-plugin",
-    "--auto-inject",
-    "帮我总结这个文件",
-    "--inject-attachment",
-    "att-1:spec.md:project conventions: kebab-case file names",
-    "--inject-extra",
-    "mock-chat:attachment:[uploaded file: spec.md]",
-]
-"#,
-        data_root = data_root.to_string_lossy(),
-        cli_bin = cli_bin.to_string_lossy(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-
-    let config = Config::load(&cfg_path).expect("config loads");
-    let llm = Arc::new(ConstantLlm::new("noted"));
-    let runtime = Runtime::build_with_llm(config, llm.clone())
-        .await
-        .expect("runtime starts");
-
-    let tenant = TenantId::new("mock-tenant");
-    let project = ProjectId::auto_from_chat("mock-chat");
-    wait_for_spec_memory(&data_root, &tenant, &project).await;
-    wait_for_llm_calls(&llm, 1).await;
-
-    let user_text = llm
-        .last_user_text
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("LLM saw a user message");
-    assert_eq!(user_text, "帮我总结这个文件");
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn file_only_waits_for_instruction_without_autorun() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp = tempfile::tempdir().unwrap();
-    let data_root = tmp.path().join("data");
-    let cfg_path = tmp.path().join("snaca.toml");
-    let cli_bin = snaca_cli_binary();
-
-    let cfg = format!(
-        r#"
-[server]
-http_listen = "127.0.0.1:0"
-data_root = {data_root:?}
-
-[tenant]
-id = "default"
-
-[llm]
-api_key = "ignored"
-model = "constant"
-
-[engine]
-memory_extractor = false
-
-[im_input]
-text_debounce_ms = 20
-attachment_wait_secs = 1
-referential_text_wait_secs = 1
-pending_expire_secs = 5
-file_only_autorun = false
-
-[[plugins]]
-name = "mock"
-command = {cli_bin:?}
-args = [
-    "mock-plugin",
-    "--auto-inject",
-    "[uploaded file: spec.md]",
-    "--inject-attachment",
-    "att-1:spec.md:project conventions: kebab-case file names",
-]
-"#,
-        data_root = data_root.to_string_lossy(),
-        cli_bin = cli_bin.to_string_lossy(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-
-    let config = Config::load(&cfg_path).expect("config loads");
-    let llm = Arc::new(ConstantLlm::new("noted"));
-    let runtime = Runtime::build_with_llm(config, llm.clone())
-        .await
-        .expect("runtime starts");
-
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    assert_eq!(
-        llm.calls.load(Ordering::Relaxed),
-        0,
-        "file-only pending input should not invoke the LLM without instructions"
-    );
-
-    let tenant = TenantId::new("mock-tenant");
-    let project = ProjectId::auto_from_chat("mock-chat");
-    let layout = WorkspaceLayout::new(std::fs::canonicalize(&data_root).unwrap()).unwrap();
-    let store = MemoryStore::new(layout.memory_dir(&tenant, &project));
-    let names = store.list(MemoryScope::Reference).await.unwrap_or_default();
-    assert!(
-        names.is_empty(),
-        "file-only pending input should not import before submission; got {names:?}"
-    );
-
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn file_only_start_command_submits_pending_file() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let tmp = tempfile::tempdir().unwrap();
-    let data_root = tmp.path().join("data");
-    let cfg_path = tmp.path().join("snaca.toml");
-    let cli_bin = snaca_cli_binary();
-
-    let cfg = format!(
-        r#"
-[server]
-http_listen = "127.0.0.1:0"
-data_root = {data_root:?}
-
-[tenant]
-id = "default"
-
-[llm]
-api_key = "ignored"
-model = "constant"
-
-[engine]
-memory_extractor = false
-
-[im_input]
-text_debounce_ms = 20
-attachment_wait_secs = 5
-referential_text_wait_secs = 5
-pending_expire_secs = 5
-file_only_autorun = false
-
-[[plugins]]
-name = "mock"
-command = {cli_bin:?}
-args = [
-    "mock-plugin",
-    "--auto-inject",
-    "[uploaded file: spec.md]",
-    "--inject-attachment",
-    "att-1:spec.md:project conventions: kebab-case file names",
-    "--inject-extra",
-    "mock-chat:开始处理",
-]
-"#,
-        data_root = data_root.to_string_lossy(),
-        cli_bin = cli_bin.to_string_lossy(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-
-    let config = Config::load(&cfg_path).expect("config loads");
-    let llm = Arc::new(ConstantLlm::new("noted"));
-    let runtime = Runtime::build_with_llm(config, llm.clone())
-        .await
-        .expect("runtime starts");
-
-    let tenant = TenantId::new("mock-tenant");
-    let project = ProjectId::auto_from_chat("mock-chat");
-    wait_for_spec_memory(&data_root, &tenant, &project).await;
-    wait_for_llm_calls(&llm, 1).await;
-
-    let user_text = llm
-        .last_user_text
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("LLM saw a user message");
-    assert!(
-        user_text.contains("用户上传了以下文件"),
-        "default file-only submit should produce attachment summary; got {user_text:?}"
-    );
-    runtime.shutdown().await;
-}
-
-async fn wait_for_spec_memory(data_root: &std::path::Path, tenant: &TenantId, project: &ProjectId) {
-    let layout = WorkspaceLayout::new(std::fs::canonicalize(data_root).unwrap()).unwrap();
-    let store = MemoryStore::new(layout.memory_dir(tenant, project));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut names = Vec::new();
-    while Instant::now() < deadline {
-        names = store.list(MemoryScope::Reference).await.unwrap_or_default();
-        if names.iter().any(|n| n.contains("spec")) {
-            let stem = names.iter().find(|n| n.contains("spec")).unwrap().clone();
-            let entry = store.read(MemoryScope::Reference, &stem).await.unwrap();
-            assert!(
-                entry.content.contains("kebab-case"),
-                "import did not preserve content; got: {:?}",
-                entry.content
-            );
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("expected `spec`-derived memory entry; got names: {names:?}");
 }
 
 async fn wait_for_llm_calls(llm: &ConstantLlm, expected: usize) {

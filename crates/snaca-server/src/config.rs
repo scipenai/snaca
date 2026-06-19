@@ -359,20 +359,6 @@ pub struct EngineSection {
     #[serde(default)]
     pub repeated_tool_failure_feedback: Option<bool>,
 
-    /// Memory embedder backend for vector recall. Recognised values:
-    /// - `"none"` / unset → no recall, only the static MEMORY.md index
-    /// - `"hash"` → deterministic stub (good for dev / smoke tests)
-    /// - `"fastembed"` → real ONNX embedder (requires `--features fastembed`)
-    ///
-    /// Unknown values fall back to `none` with a startup warning.
-    #[serde(default)]
-    pub memory_embedder: Option<String>,
-
-    /// Hash embedder dimensionality. Only consulted when
-    /// `memory_embedder = "hash"`. Default 128.
-    #[serde(default)]
-    pub memory_embedder_dim: Option<usize>,
-
     /// Enable the post-turn memory extractor. When true, every
     /// successful terminal turn fires an LLM call (`memory_extractor_model`
     /// or the engine's default model) to mine `user`/`feedback`
@@ -394,20 +380,6 @@ pub struct EngineSection {
     /// the pipeline.
     #[serde(default)]
     pub memory_extractor_no_filter: Option<bool>,
-
-    /// Enable the LLM rerank pass between cosine recall and the
-    /// system-prompt splice. Without it, the engine truncates the
-    /// cosine top-k inline. With it, the engine pulls a wider pool
-    /// and asks the LLM to pick the best 5. Default off — adds an
-    /// LLM call per turn.
-    #[serde(default)]
-    pub memory_reranker: Option<bool>,
-
-    /// Override the model used for memory rerank. Useful when the
-    /// rerank step should run on a smaller / faster model than the
-    /// main turn. Defaults to `llm.model` from the parent section.
-    #[serde(default)]
-    pub memory_reranker_model: Option<String>,
 
     /// Last-resort byte cap on the history loaded into each LLM call.
     /// Compaction handles the steady-state case but only fires after
@@ -470,18 +442,16 @@ pub struct EngineSection {
     #[serde(default)]
     pub max_output_token_ceiling: Option<u32>,
 
-    /// Recall-time floor on `cosine * frontmatter.confidence`. When
-    /// an entry's frontmatter declares a `confidence`, the cosine
-    /// score is multiplied by it and the hit is dropped if the
-    /// adjusted value is below this floor. Legacy entries (no
-    /// frontmatter) are unaffected. Default 0.30.
+    /// When true, every `MemoryWrite` tool call is staged into
+    /// `<project>/memory/pending/<id>.json` instead of writing
+    /// directly to the project's memory tree. An operator runs
+    /// `snaca-cli memory pending` to inspect and `... approve|reject`
+    /// to action. Useful for IM/gateway deployments where a
+    /// background turn could otherwise plant entries in the
+    /// `user/` profile space the human owner had no chance to
+    /// veto. Default `false`.
     #[serde(default)]
-    pub recall_confidence_floor: Option<f32>,
-
-    /// Fallback confidence applied to extractor proposals that omit
-    /// the `confidence` field. Default 0.6.
-    #[serde(default)]
-    pub extractor_default_confidence: Option<f32>,
+    pub memory_write_approval: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

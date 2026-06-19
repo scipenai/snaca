@@ -101,6 +101,12 @@ struct Inner {
     /// embedder wires a custom memory backend; if absent they keep the
     /// historical file-tree sibling of `workspace_root`.
     memory_provider: Option<Arc<dyn Any + Send + Sync>>,
+    /// Opaque handle to the built-in `snaca_memory::MemoryStore`.
+    /// Stored type-erased so this API crate stays leaf. The engine
+    /// injects one shared store per project/thread tool context so
+    /// MemoryRead can record last-seen hashes that a later MemoryWrite
+    /// uses for drift detection.
+    memory_store: Option<Arc<dyn Any + Send + Sync>>,
     /// Cooperative cancellation signal for the current turn. The
     /// engine creates one token per `handle_turn_full` invocation and
     /// fires it on abort / timeout. Tools don't have to inspect this
@@ -110,6 +116,18 @@ struct Inner {
     /// CPU-bound tools that want to exit cleanly mid-loop can call
     /// `is_cancelled()` between iterations.
     cancellation_token: Option<CancellationToken>,
+    /// Opaque handle to the SQLite `Database`. Stored as
+    /// `Arc<dyn Any>` so this crate stays leaf — concrete type
+    /// lives in `snaca-state` and `snaca-tools` downcasts on read.
+    /// `None` for unit tests that don't need DB access.
+    db_handle: Option<Arc<dyn Any + Send + Sync>>,
+    /// When true, `MemoryWrite` tool calls don't hit the project
+    /// memory tree directly — they stage a pending JSON file
+    /// under `<project>/memory/pending/` and return a placeholder
+    /// to the LLM. An operator approves / rejects via
+    /// `snaca-cli memory approve|reject`. Default `false` (write
+    /// directly). Mirrors hermes's `write_approval` switch.
+    memory_write_approval: bool,
 }
 
 impl ToolContext {
@@ -130,7 +148,10 @@ impl ToolContext {
                 task_registry: None,
                 question_gate: None,
                 memory_provider: None,
+                memory_store: None,
                 cancellation_token: None,
+                db_handle: None,
+                memory_write_approval: false,
             }),
         }
     }
@@ -149,7 +170,10 @@ impl ToolContext {
             task_registry: self.inner.task_registry.clone(),
             question_gate: self.inner.question_gate.clone(),
             memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
@@ -171,7 +195,10 @@ impl ToolContext {
             task_registry: self.inner.task_registry.clone(),
             question_gate: self.inner.question_gate.clone(),
             memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
@@ -193,7 +220,10 @@ impl ToolContext {
             task_registry: Some(registry),
             question_gate: self.inner.question_gate.clone(),
             memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
@@ -217,7 +247,10 @@ impl ToolContext {
             task_registry: self.inner.task_registry.clone(),
             question_gate: Some(gate),
             memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
@@ -237,7 +270,34 @@ impl ToolContext {
             task_registry: self.inner.task_registry.clone(),
             question_gate: self.inner.question_gate.clone(),
             memory_provider: Some(provider),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
+        };
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// Attach the built-in file-tree memory store (opaque). Memory
+    /// tools downcast this to `snaca_memory::MemoryStore` and clone it
+    /// so drift detection survives across multiple MemoryRead /
+    /// MemoryWrite calls in the same tool context.
+    pub fn with_memory_store(mut self, store: Arc<dyn Any + Send + Sync>) -> Self {
+        let inner = Inner {
+            tenant_id: self.inner.tenant_id.clone(),
+            project_id: self.inner.project_id.clone(),
+            session_id: self.inner.session_id,
+            workspace_root: self.inner.workspace_root.clone(),
+            outbound_files: self.inner.outbound_files.clone(),
+            read_tracker: self.inner.read_tracker.clone(),
+            task_registry: self.inner.task_registry.clone(),
+            question_gate: self.inner.question_gate.clone(),
+            memory_provider: self.inner.memory_provider.clone(),
+            memory_store: Some(store),
+            cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
@@ -261,10 +321,79 @@ impl ToolContext {
             task_registry: self.inner.task_registry.clone(),
             question_gate: self.inner.question_gate.clone(),
             memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
             cancellation_token: Some(token),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: self.inner.memory_write_approval,
         };
         self.inner = Arc::new(inner);
         self
+    }
+
+    /// Attach an opaque SQLite database handle. The concrete type
+    /// is `snaca_state::Database`; this crate stays leaf so the
+    /// slot is `Arc<dyn Any>` and callers downcast on read. The
+    /// `session_search` tool reads through this to run BM25 over
+    /// the message FTS5 index.
+    pub fn with_db_handle(mut self, db: Arc<dyn Any + Send + Sync>) -> Self {
+        let inner = Inner {
+            tenant_id: self.inner.tenant_id.clone(),
+            project_id: self.inner.project_id.clone(),
+            session_id: self.inner.session_id,
+            workspace_root: self.inner.workspace_root.clone(),
+            outbound_files: self.inner.outbound_files.clone(),
+            read_tracker: self.inner.read_tracker.clone(),
+            task_registry: self.inner.task_registry.clone(),
+            question_gate: self.inner.question_gate.clone(),
+            memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
+            cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: Some(db),
+            memory_write_approval: self.inner.memory_write_approval,
+        };
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// Opaque getter for the attached database handle. Caller
+    /// downcasts to `snaca_state::Database`. `None` for unit tests
+    /// without DB access — the `session_search` tool surfaces a
+    /// clear "no db handle attached" error in that case.
+    pub fn db_handle_opaque(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.inner.db_handle.clone()
+    }
+
+    /// Toggle memory-write approval gating for this turn. With
+    /// `true`, `MemoryWrite` tool calls don't write to the
+    /// project's memory tree — they stage a pending JSON file
+    /// under `<project>/memory/pending/<id>.json` and return a
+    /// placeholder so the LLM can keep going. An operator
+    /// approves with `snaca-cli memory approve <id>`.
+    pub fn with_memory_write_approval(mut self, on: bool) -> Self {
+        let inner = Inner {
+            tenant_id: self.inner.tenant_id.clone(),
+            project_id: self.inner.project_id.clone(),
+            session_id: self.inner.session_id,
+            workspace_root: self.inner.workspace_root.clone(),
+            outbound_files: self.inner.outbound_files.clone(),
+            read_tracker: self.inner.read_tracker.clone(),
+            task_registry: self.inner.task_registry.clone(),
+            question_gate: self.inner.question_gate.clone(),
+            memory_provider: self.inner.memory_provider.clone(),
+            memory_store: self.inner.memory_store.clone(),
+            cancellation_token: self.inner.cancellation_token.clone(),
+            db_handle: self.inner.db_handle.clone(),
+            memory_write_approval: on,
+        };
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// Whether the engine wants `MemoryWrite` calls staged for
+    /// human approval. The tool consults this — there's no other
+    /// caller of this getter.
+    pub fn memory_write_approval(&self) -> bool {
+        self.inner.memory_write_approval
     }
 
     /// Opaque getter for the attached task registry. Caller downcasts
@@ -287,6 +416,14 @@ impl ToolContext {
     /// keeps the historical file-tree memory behavior.
     pub fn memory_provider_opaque(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.inner.memory_provider.clone()
+    }
+
+    /// Opaque getter for the attached built-in memory store. Caller
+    /// downcasts to `snaca_memory::MemoryStore`. `None` is fine for
+    /// unit tests and direct embeddings; tools fall back to deriving a
+    /// fresh store from `workspace_root`.
+    pub fn memory_store_opaque(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.inner.memory_store.clone()
     }
 
     pub fn tenant_id(&self) -> &TenantId {

@@ -152,6 +152,15 @@ model = "deepseek-chat"
 # rejection happens elsewhere in your pipeline.
 # memory_extractor_no_filter = false
 
+# Stage every MemoryWrite tool call into
+# `<project>/memory/pending/<id>.json` instead of writing it to the
+# memory tree. Useful for IM/gateway deployments where a background
+# turn could otherwise plant entries in the `user/` profile space
+# without the human owner getting a chance to veto. Operators
+# approve with `snaca-cli memory approve <id>` (or `reject <id>`).
+# Default false.
+# memory_write_approval = false
+
 [im_input]
 # IM platforms often split files and text into separate messages. The
 # assembler merges short bursts from the same `(chat_id, user_id, reply_to)`

@@ -182,21 +182,15 @@ pub struct EngineConfig {
     /// 32768 is safe across most providers.
     pub max_output_token_ceiling: u32,
 
-    /// Recall-time confidence floor. After multiplying the cosine
-    /// score by the entry's frontmatter `confidence` (defaulting to
-    /// 1.0 when absent), hits whose adjusted score falls below this
-    /// value are dropped from the `## Relevant Memories` block.
-    /// Entries written by the extractor with low self-reported
-    /// confidence (typically `feedback` scope) are filtered here
-    /// before the model ever sees them. Default 0.30 — keep entries
-    /// with confidence ≥ 0.5 that cosine ranks 0.6+, drop the rest.
-    pub recall_confidence_floor: f32,
-
-    /// Fallback confidence applied to extractor proposals that omit
-    /// the `confidence` field. Conservative middle-ground so an
-    /// extractor that doesn't comply with the schema doesn't get
-    /// auto-promoted to "trusted". Default 0.6.
-    pub extractor_default_confidence: f32,
+    /// When true, every `MemoryWrite` tool call is staged into
+    /// `<project>/memory/pending/` instead of writing to the
+    /// memory tree directly. An operator approves with
+    /// `snaca-cli memory approve <id>` (or `reject <id>`). Mirrors
+    /// hermes's `write_approval` switch — useful for IM/gateway
+    /// deployments where a background turn could otherwise plant
+    /// entries in `user/` profile space the human owner had no
+    /// chance to veto. Default `false`.
+    pub memory_write_approval: bool,
 }
 
 impl EngineConfig {
@@ -224,8 +218,7 @@ impl EngineConfig {
             stream_interrupted_max_retries: 2,
             max_output_token_escalation_attempts: 2,
             max_output_token_ceiling: 32_768,
-            recall_confidence_floor: 0.30,
-            extractor_default_confidence: 0.6,
+            memory_write_approval: false,
         }
     }
 }

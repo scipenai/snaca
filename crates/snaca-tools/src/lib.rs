@@ -33,6 +33,8 @@ pub mod multi_edit;
 pub mod read;
 #[cfg(feature = "send-file")]
 pub mod send_file;
+#[cfg(feature = "session-search")]
+pub mod session_search;
 #[cfg(feature = "skills")]
 pub mod skill_tool;
 #[cfg(feature = "tasks")]
@@ -70,6 +72,8 @@ pub use multi_edit::MultiEditTool;
 pub use read::ReadTool;
 #[cfg(feature = "send-file")]
 pub use send_file::SendFileTool;
+#[cfg(feature = "session-search")]
+pub use session_search::SessionSearchTool;
 #[cfg(feature = "skills")]
 pub use skill_tool::SkillTool;
 #[cfg(feature = "tasks")]
@@ -145,6 +149,7 @@ fn base_tool_registry_builder() -> ToolRegistryBuilder {
     let b = add_shell_tools(b);
     let b = add_todo_tools(b);
     let b = add_memory_tools(b);
+    let b = add_session_search_tools(b);
     let b = add_send_file_tools(b);
     let b = add_task_tools(b);
     let b = add_web_tools(b);
@@ -216,6 +221,16 @@ fn add_memory_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
 
 #[cfg(not(feature = "memory"))]
 fn add_memory_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
+    b
+}
+
+#[cfg(feature = "session-search")]
+fn add_session_search_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
+    b.add(SessionSearchTool)
+}
+
+#[cfg(not(feature = "session-search"))]
+fn add_session_search_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
     b
 }
 

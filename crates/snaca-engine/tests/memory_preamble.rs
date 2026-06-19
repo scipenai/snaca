@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use snaca_agent_api::{
     MemoryEntryData, MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError,
-    MemoryReadRequest, MemoryRecallHit, MemoryRecallRequest, MemoryWriteRequest,
+    MemoryReadRequest, MemoryWriteRequest,
 };
 use snaca_core::{ProjectId, TenantId, ThreadId};
 use snaca_engine::{Engine, EngineConfig, TurnRequest};
@@ -55,18 +55,6 @@ impl MemoryProvider for StaticMemoryProvider {
             name: request.name,
             content: "provider body".into(),
         })
-    }
-
-    async fn recall(
-        &self,
-        request: MemoryRecallRequest,
-    ) -> Result<Vec<MemoryRecallHit>, MemoryProviderError> {
-        Ok(vec![MemoryRecallHit {
-            scope: "user".into(),
-            name: "provider-pref".into(),
-            content: format!("provider recall for {}", request.query),
-            score: Some(0.92),
-        }])
     }
 }
 
@@ -128,7 +116,11 @@ async fn fresh_project_has_no_memory_preamble_in_system_prompt() {
 }
 
 #[tokio::test]
-async fn written_memory_appears_in_next_turn_system_prompt() {
+async fn frozen_snapshot_keeps_in_session_writes_out_of_prompt() {
+    // The frozen-snapshot model: a `MemoryWrite` mid-thread lands on
+    // disk but the in-prompt copy stays byte-stable for the lifetime
+    // of the thread session. The model only sees the new entry on
+    // the next thread (or after `invalidate_memory_snapshot`).
     let fix = fixture().await;
 
     // Turn 1: model invokes MemoryWrite, then a terminal text response.
@@ -148,8 +140,8 @@ async fn written_memory_appears_in_next_turn_system_prompt() {
         .await
         .unwrap();
 
-    // Turn 2: any user message — we just need to inspect what the
-    // engine's system prompt looks like *now* that memory exists.
+    // Turn 2 on the same thread: we expect the snapshot to be empty
+    // (no preamble), since the snapshot was frozen before the write.
     fix.llm.enqueue(assistant_text("ok"));
     fix.engine
         .handle_turn(turn_request("any follow-up"))
@@ -157,18 +149,34 @@ async fn written_memory_appears_in_next_turn_system_prompt() {
         .unwrap();
 
     let reqs = observed(fix.llm.as_ref());
-    // Turn 1 had two LLM calls (tool_use + terminal); turn 2 had one.
     let turn2_first = &reqs[2];
     let sys = turn2_first.flat_system().unwrap_or_default();
     assert!(
+        !sys.contains("## Project Memory"),
+        "frozen snapshot should not have surfaced the in-session write yet; got: {sys}"
+    );
+
+    // After invalidating the cache (the future `on_session_switch`
+    // hook will fire this; we call it by hand here to simulate a
+    // fresh session), the next turn picks up the new entry.
+    fix.engine
+        .invalidate_memory_snapshot(&snaca_core::ThreadId::new("thr-mem-1"));
+    fix.llm.enqueue(assistant_text("ok"));
+    fix.engine
+        .handle_turn(turn_request("after reset"))
+        .await
+        .unwrap();
+    let reqs = observed(fix.llm.as_ref());
+    let turn3 = &reqs[3];
+    let sys = turn3.flat_system().unwrap_or_default();
+    assert!(
         sys.contains("## Project Memory"),
-        "expected memory preamble in turn-2 system prompt; got: {sys}"
+        "post-invalidation snapshot should include the entry; got: {sys}"
     );
     assert!(
         sys.contains("user/tone-preference"),
-        "memory index should list the new entry; got: {sys}"
+        "snapshot should list the new entry; got: {sys}"
     );
-    // The base prompt is still in front — splice, don't replace.
     assert!(
         sys.contains("SNACA"),
         "base system prompt should still be present; got: {sys}"
@@ -176,7 +184,7 @@ async fn written_memory_appears_in_next_turn_system_prompt() {
 }
 
 #[tokio::test]
-async fn injected_memory_provider_feeds_system_prompt_index_and_recall() {
+async fn injected_memory_provider_feeds_system_prompt_index() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = WorkspaceLayout::new(tmp.path()).unwrap();
     let db = Database::open_in_memory().await.unwrap();
@@ -201,6 +209,7 @@ async fn injected_memory_provider_feeds_system_prompt_index_and_recall() {
     let sys = observed(llm.as_ref())[0].flat_system().unwrap_or_default();
     assert!(sys.contains("## Project Memory"));
     assert!(sys.contains("user/provider-pref"));
-    assert!(sys.contains("## Relevant Memories"));
-    assert!(sys.contains("provider recall for provider query"));
+    // Vector recall is gone; provider's `index` is the only memory hook
+    // into the system prompt now. No `## Relevant Memories` section.
+    assert!(!sys.contains("## Relevant Memories"));
 }

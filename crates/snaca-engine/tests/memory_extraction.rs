@@ -122,7 +122,12 @@ async fn extractor_writes_proposals_after_terminal_turn() {
         .unwrap();
     assert_eq!(body, "user said: stop using emojis");
     assert_eq!(meta.source.as_deref(), Some("extractor"));
-    assert_eq!(meta.confidence, Some(0.85));
+    // The vector recall layer used to consume `confidence` to weight
+    // hits; the extractor no longer writes it (the recall layer is
+    // gone and the value would just be noise on disk). The proposal
+    // still carries a confidence — it's logged by the engine but
+    // doesn't make it into frontmatter.
+    assert_eq!(meta.confidence, None);
     assert!(meta.created_at.is_some());
 }
 

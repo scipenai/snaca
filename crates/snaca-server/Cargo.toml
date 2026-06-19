@@ -54,9 +54,6 @@ rand = { workspace = true }
 
 [features]
 default = []
-# Enable the production memory embedder (downloads ONNX models on first
-# use). Forwards to `snaca-memory`'s feature.
-fastembed = ["snaca-memory/fastembed"]
 # Enable PDF / ZIP-bundle extraction in the bulk import pipeline.
 # Forwards to `snaca-memory`. Each pulls extra deps; opt in only when
 # needed. DOCX/XLSX/PPTX are handled out-of-process via the

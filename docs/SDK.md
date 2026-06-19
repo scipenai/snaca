@@ -214,8 +214,8 @@ These helpers return concrete adapters that implement:
 
 `AgentBuilder::memory_provider_arc(...)` lets an embedder replace SNACA's
 file-tree memory with an application-owned backend. When attached, built-in
-`MemoryRead` / `MemoryWrite` tools, the `## Project Memory` index, auto-recall
-for `## Relevant Memories`, and extractor writes all go through that provider.
+`MemoryRead` / `MemoryWrite` tools, the frozen prompt memory snapshot, and
+extractor writes all go through that provider.
 Without a provider, the current file-tree behavior remains unchanged.
 
 See `examples/sdk/with_memory.rs` for a file-tree provider example:
@@ -262,9 +262,9 @@ let engine = snaca_sdk::EngineRuntimeBuilder::new()
 ```
 
 Advanced applications can also attach a `RuntimeToolFactory`, task registry,
-memory embedder, memory extractor, or reranker. Server-only wiring such as IM
-plugins, MCP lifecycle, outbox workers, admin HTTP, and input assembly remains
-in `snaca-server`.
+memory provider, or memory extractor. Server-only wiring such as IM plugins,
+MCP lifecycle, outbox workers, admin HTTP, and input assembly remains in
+`snaca-server`.
 
 ## Optional Channel Feature
 

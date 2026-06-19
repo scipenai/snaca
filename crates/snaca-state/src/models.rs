@@ -62,20 +62,6 @@ pub struct ChatBinding {
     pub bound_at: DateTime<Utc>,
 }
 
-/// One row of `memory_vectors` — an embedding for one memory entry.
-/// `(tenant_id, project_id, scope, name)` is the natural primary key.
-#[derive(Debug, Clone)]
-pub struct MemoryVector {
-    pub tenant_id: TenantId,
-    pub project_id: ProjectId,
-    /// Stored as the lowercase scope name (`user` / `project` / `reference` / `feedback`).
-    pub scope: String,
-    pub name: String,
-    pub model_id: String,
-    pub embedding: Vec<f32>,
-    pub updated_at: DateTime<Utc>,
-}
-
 /// Latest compaction record for a thread. The engine consults this on
 /// `load_history` to decide whether to splice in a "earlier conversation
 /// summary" preamble in place of the messages it covers.

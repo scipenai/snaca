@@ -49,12 +49,7 @@ type FormState = {
   memoryExtractor: boolean;
   memoryExtractorModel: string;
   memoryExtractorNoFilter: boolean;
-  memoryReranker: boolean;
-  memoryRerankerModel: string;
-  memoryEmbedder: string;
-  memoryEmbedderDim: string;
-  recallConfidenceFloor: string;
-  extractorDefaultConfidence: string;
+  memoryWriteApproval: boolean;
   skillsGlobalDir: string;
   loggingFilter: string;
   loggingFile: string;
@@ -387,15 +382,10 @@ export function System() {
               description={t("system.memory_desc")}
             >
               <div className="grid gap-4 md:grid-cols-2">
-                <TextField label={t("system.memory_embedder")} value={form.memoryEmbedder} onChange={(v) => updateField("memoryEmbedder", v)} placeholder="none | hash | fastembed" hint={t("system.help.memory_embedder")} />
-                <TextField label={t("system.memory_embedder_dim")} value={form.memoryEmbedderDim} onChange={(v) => updateField("memoryEmbedderDim", v)} inputMode="numeric" placeholder="128" hint={t("system.help.memory_embedder_dim")} />
                 <TextField label={t("system.memory_extractor_model")} value={form.memoryExtractorModel} onChange={(v) => updateField("memoryExtractorModel", v)} hint={t("system.help.memory_extractor_model")} />
-                <TextField label={t("system.memory_reranker_model")} value={form.memoryRerankerModel} onChange={(v) => updateField("memoryRerankerModel", v)} hint={t("system.help.memory_reranker_model")} />
-                <TextField label={t("system.recall_confidence_floor")} value={form.recallConfidenceFloor} onChange={(v) => updateField("recallConfidenceFloor", v)} placeholder="0.30" hint={t("system.help.recall_confidence_floor")} />
-                <TextField label={t("system.extractor_default_confidence")} value={form.extractorDefaultConfidence} onChange={(v) => updateField("extractorDefaultConfidence", v)} placeholder="0.6" hint={t("system.help.extractor_default_confidence")} />
                 <ToggleField label={t("system.memory_extractor")} checked={form.memoryExtractor} onChange={(v) => updateField("memoryExtractor", v)} hint={t("system.help.memory_extractor")} />
-                <ToggleField label={t("system.memory_reranker")} checked={form.memoryReranker} onChange={(v) => updateField("memoryReranker", v)} hint={t("system.help.memory_reranker")} />
                 <ToggleField label={t("system.memory_extractor_no_filter")} checked={form.memoryExtractorNoFilter} onChange={(v) => updateField("memoryExtractorNoFilter", v)} hint={t("system.help.memory_extractor_no_filter")} />
+                <ToggleField label={t("system.memory_write_approval")} checked={form.memoryWriteApproval} onChange={(v) => updateField("memoryWriteApproval", v)} hint={t("system.help.memory_write_approval")} />
               </div>
             </Card>
 
@@ -698,12 +688,7 @@ function formFromToml(toml: string): FormState {
     memoryExtractor: getBoolean(toml, "engine", "memory_extractor") ?? true,
     memoryExtractorModel: getString(toml, "engine", "memory_extractor_model") ?? "",
     memoryExtractorNoFilter: getBoolean(toml, "engine", "memory_extractor_no_filter") ?? false,
-    memoryReranker: getBoolean(toml, "engine", "memory_reranker") ?? false,
-    memoryRerankerModel: getString(toml, "engine", "memory_reranker_model") ?? "",
-    memoryEmbedder: getString(toml, "engine", "memory_embedder") ?? "",
-    memoryEmbedderDim: getScalar(toml, "engine", "memory_embedder_dim") ?? "",
-    recallConfidenceFloor: getScalar(toml, "engine", "recall_confidence_floor") ?? "",
-    extractorDefaultConfidence: getScalar(toml, "engine", "extractor_default_confidence") ?? "",
+    memoryWriteApproval: getBoolean(toml, "engine", "memory_write_approval") ?? false,
     skillsGlobalDir: getString(toml, "skills", "global_dir") ?? "",
     loggingFilter: getString(toml, "logging", "filter") ?? "",
     loggingFile: getString(toml, "logging", "file") ?? "",
@@ -802,18 +787,8 @@ function applyFormField(
       return setTomlValue(toml, "engine", "memory_extractor_model", optionalString(value));
     case "memoryExtractorNoFilter":
       return setTomlValue(toml, "engine", "memory_extractor_no_filter", String(value));
-    case "memoryReranker":
-      return setTomlValue(toml, "engine", "memory_reranker", String(value));
-    case "memoryRerankerModel":
-      return setTomlValue(toml, "engine", "memory_reranker_model", optionalString(value));
-    case "memoryEmbedder":
-      return setTomlValue(toml, "engine", "memory_embedder", optionalString(value));
-    case "memoryEmbedderDim":
-      return setTomlValue(toml, "engine", "memory_embedder_dim", optionalNumber(value));
-    case "recallConfidenceFloor":
-      return setTomlValue(toml, "engine", "recall_confidence_floor", optionalNumber(value));
-    case "extractorDefaultConfidence":
-      return setTomlValue(toml, "engine", "extractor_default_confidence", optionalNumber(value));
+    case "memoryWriteApproval":
+      return setTomlValue(toml, "engine", "memory_write_approval", String(value));
     case "skillsGlobalDir":
       return setTomlValue(toml, "skills", "global_dir", optionalString(value));
     case "loggingFilter":

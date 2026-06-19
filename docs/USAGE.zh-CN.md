@@ -21,7 +21,6 @@
 可选 feature：
 
 - `snaca-server/pdf` — 启用进程内 PDF 文本抽取（依赖 `pdf-extract`）
-- `snaca-memory/fastembed` — 用真实 ONNX embedder 替换默认的 hash stub
 
 DOCX / XLSX / PPTX 不再有编译期 feature——这些格式通过仓库自带的 `office-extract` skill 出进程抽取（依赖 `python-docx` / `openpyxl` / `python-pptx`），不装也不影响主程序启动。
 
@@ -123,8 +122,8 @@ data-lark/
     └── projects/<project_id>/           ← `auto-kapbiztjy2` / `proj-...`
         ├── workspace/                   ← Read/Write/Bash 的 cwd
         ├── memory/{user,project,reference,feedback}/*.md
-        ├── memory/MEMORY.md             ← 索引（系统提示注入）
-        ├── memory/.index/               ← 向量索引（启用 fastembed 后）
+        ├── memory/MEMORY.md             ← 条目索引；完整快照由引擎按需渲染
+        ├── memory/pending/*.json        ← 可选：待人工审批的 MemoryWrite
         ├── settings.json                ← project 级配置
         └── skills/<name>.md             ← project 级 Skill
 ```
@@ -159,9 +158,8 @@ history_limit = 20
 compact_after_input_tokens = 600000   # DeepSeek 1M 窗口的安全阈
 compact_keep_recent = 6
 # loop_guard_max_repeats = 3        # 同 (tool, args) 反复触发的硬上限
-# memory_embedder = "fastembed"     # 启 vector recall 时填
 # memory_extractor = true           # 开 turn 后台记忆提取
-# memory_reranker = true            # 开 LLM rerank
+# memory_write_approval = false     # MemoryWrite 是否先进入 pending 等人工审批
 # history_max_bytes = 1500000       # 最后一道兜底字节剪裁
 
 # 可选：IM 多条碎片输入组装（默认开启）
@@ -563,14 +561,9 @@ type: feedback
 - LLM 通过 `MemoryWrite` 工具在对话里直接落盘。
 - 启 `engine.memory_extractor = true` 后，每 turn 结束 SNACA 跑一次后台抽取，把对话里的偏好 / 反馈写入。
 
-### 9.3 检索（可选 vector recall）
+### 9.3 检索
 
-`engine.memory_embedder` 设为：
-- `"none"` / 默认 → 仅注入 `MEMORY.md` 索引
-- `"hash"` → 确定性 stub embedder（开发 / smoke 测试）
-- `"fastembed"` → ONNX `multilingual-e5-small`（需 `--features fastembed`）
-
-启用后每个 turn 把用户的话 embed → 顶部 `RECALL_POOL_SIZE` cosine 候选 → 可选 LLM rerank → top 5 拼进 system prompt。
+SNACA 不再维护向量 recall 索引。每个 thread 第一次 turn 会把当前项目记忆树渲染成冻结快照注入 system prompt；同一 thread 中后续 `MemoryWrite` 仍会落盘，但要到新 thread 或显式失效后才会进入提示词。需要查历史对话时，模型可用 `SessionSearch` 工具按 FTS5 搜索 transcript。
 
 ### 9.4 命令行查看
 
@@ -578,11 +571,11 @@ type: feedback
 ./target/debug/snaca-cli memory list   --data-root ./data --tenant default --project auto-kapbiztjy2
 ./target/debug/snaca-cli memory index  --data-root ./data --tenant default --project auto-kapbiztjy2
 ./target/debug/snaca-cli memory show   --data-root ./data --tenant default --project auto-kapbiztjy2 --scope user --name role
-./target/debug/snaca-cli memory search --data-root ./data --tenant default --project auto-kapbiztjy2 "测试" -k 5
 ./target/debug/snaca-cli memory import --data-root ./data --tenant default --project auto-kapbiztjy2 ./docs/  # 批量导入目录
+./target/debug/snaca-cli memory pending --data-root ./data --tenant default --project auto-kapbiztjy2
 ```
 
-> `search` / `import` 用确定性 hash embedder，**仅供调试**，不和服务器在线检索的精度等价；线上质量看 fastembed 路径。
+> `pending` / `approve` / `reject` 只在 `engine.memory_write_approval = true` 时有内容；用于把 LLM 发起的 MemoryWrite 先暂存给人工审核。
 
 ---
 

@@ -770,3 +770,152 @@ async fn mid_stream_error_aborts_turn() {
     let s = format!("{err}");
     assert!(s.contains("rate limited"), "got: {s}");
 }
+
+/// Collects every `ContentDelta::Text` the engine forwards to the
+/// listener — i.e. exactly what an IM channel would render to the user.
+#[derive(Default)]
+struct TextRecordingListener {
+    text: Mutex<String>,
+}
+
+#[async_trait]
+impl TurnEventListener for TextRecordingListener {
+    async fn on_event(&self, event: &StreamEvent) {
+        if let StreamEvent::ContentBlockDelta {
+            delta: ContentDelta::Text { text },
+            ..
+        } = event
+        {
+            self.text.lock().unwrap().push_str(text);
+        }
+    }
+}
+
+/// The model echoes our injected `<memory-context>` fence back in its
+/// streamed text, split across chunk boundaries. The scrubber must
+/// strip it from BOTH the user-facing stream (listener) and the
+/// next-turn transcript (the persisted assistant message), without
+/// dropping the legitimate text on either side of the fence.
+#[tokio::test]
+async fn streamed_memory_context_fence_is_scrubbed_from_listener_and_transcript() {
+    let llm = Arc::new(StreamingMockLlm::new());
+    // One text block whose deltas, concatenated, are:
+    //   "before <memory-context>poison</memory-context> after"
+    // The fence open straddles two chunks (`<memo` / `ry-context>`).
+    llm.enqueue(vec![
+        StreamEvent::MessageStart {
+            message_id: "m".into(),
+            model: None,
+        },
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            block: ContentBlockStart::Text,
+        },
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::Text {
+                text: "before <memo".into(),
+            },
+        },
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::Text {
+                text: "ry-context>poison</memory-context> after".into(),
+            },
+        },
+        StreamEvent::ContentBlockStop { index: 0 },
+        StreamEvent::MessageDelta {
+            stop_reason: Some(StopReason::EndTurn),
+            usage: None,
+        },
+        StreamEvent::MessageStop,
+    ]);
+
+    let (engine, db, _tmp) = fixture(llm).await;
+    let listener = Arc::new(TextRecordingListener::default());
+    let outcome = engine
+        .handle_turn_full(
+            turn_request("c_scrub"),
+            Arc::new(NoopApprovalGate),
+            listener.clone(),
+            Arc::new(NoopQuestionGate),
+        )
+        .await
+        .unwrap();
+
+    // User-facing stream: fence content gone, surrounding text intact.
+    let streamed = listener.text.lock().unwrap().clone();
+    assert!(
+        !streamed.contains("poison"),
+        "listener saw fence body: {streamed:?}"
+    );
+    assert!(
+        !streamed.contains("memory-context"),
+        "listener saw fence tag: {streamed:?}"
+    );
+    assert!(
+        streamed.contains("before "),
+        "listener lost pre-fence text: {streamed:?}"
+    );
+    assert!(
+        streamed.contains("after"),
+        "listener lost post-fence text: {streamed:?}"
+    );
+
+    // Accumulated assistant text (what the next turn / extractor reads).
+    assert!(!outcome.assistant_text.contains("poison"));
+    assert!(!outcome.assistant_text.contains("memory-context"));
+    assert!(outcome.assistant_text.contains("before "));
+    assert!(outcome.assistant_text.contains("after"));
+
+    // Persisted transcript must match — this is the surface the
+    // post-turn extractor mines, so a leak here would re-ingest our
+    // own injected context.
+    let msgs = db
+        .recent_messages(&ThreadId::new("c_scrub"), 10)
+        .await
+        .unwrap();
+    let assistant = msgs
+        .iter()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .expect("assistant message persisted");
+    match &assistant.content[0] {
+        ContentBlock::Text { text } => {
+            assert!(
+                !text.contains("poison"),
+                "transcript leaked fence body: {text:?}"
+            );
+            assert!(!text.contains("memory-context"));
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// An ordinary, fence-free streamed response must pass through the
+/// scrubber byte-for-byte — no held-back tail, no dropped text.
+#[tokio::test]
+async fn streamed_plain_text_is_unchanged_by_scrubber() {
+    let llm = Arc::new(StreamingMockLlm::new());
+    llm.enqueue(text_stream("just a normal answer with a < less-than sign"));
+
+    let (engine, _db, _tmp) = fixture(llm).await;
+    let listener = Arc::new(TextRecordingListener::default());
+    let outcome = engine
+        .handle_turn_full(
+            turn_request("c_plain"),
+            Arc::new(NoopApprovalGate),
+            listener.clone(),
+            Arc::new(NoopQuestionGate),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.assistant_text,
+        "just a normal answer with a < less-than sign"
+    );
+    assert_eq!(
+        listener.text.lock().unwrap().clone(),
+        "just a normal answer with a < less-than sign"
+    );
+}
