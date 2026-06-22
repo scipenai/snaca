@@ -84,7 +84,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart", "query"] }
 axum = "0.8.9"
 tower = "0.5.3"
-tower-http = { version = "0.6.10", features = ["trace", "cors"] }
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
 
 # Web admin: embed static SPA assets into the release binary + content-type
 # resolution for served files. `rust-embed` reads from disk in debug builds
