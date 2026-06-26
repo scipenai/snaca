@@ -90,8 +90,26 @@ model = "deepseek-chat"
 # Cap on response tokens per round. Default 4096.
 # max_tokens = 4096
 
-# Number of recent messages loaded into the prompt. Default 50.
+# Raw-row candidate pool ceiling for history loading. Default 50. The
+# kept window is sized by the dual window below, not this flat count;
+# the engine pulls history_limit*4 rows as the candidate pool.
 # history_limit = 50
+
+# Dual history window — isolates tool-call context from conversation so
+# a flurry of file-reading tool round-trips can't evict the user's
+# earlier turns.
+#
+# conversation_history_limit: max number of conversational (User +
+# Assistant) messages kept. Role::Tool result messages (large file
+# extractions) are NOT counted against this budget. Sized by a whole-
+# prefix cut. Default 30. Set to 0 to disable the conversational trim.
+# conversation_history_limit = 30
+#
+# tool_keep_recent: how many of the most recent tool_result messages
+# stay verbatim; older ones get large bodies collapsed to a marker
+# (broadened to ALL tools, Bash/Skill included, on the load path — the
+# full body is still recoverable from the DB). Default 4.
+# tool_keep_recent = 4
 
 # Compaction folds older history into a single rolling summary so the
 # context window doesn't grow unbounded across turns.

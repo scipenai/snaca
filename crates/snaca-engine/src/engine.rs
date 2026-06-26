@@ -1201,14 +1201,27 @@ impl Engine {
                 repaired,
                 self.config.compact_keep_recent,
                 self.config.collapse_tool_results_threshold,
+                // Post-compaction live tail keeps the conservative
+                // whitelist: Bash/Skill results stay verbatim so the
+                // model can still audit side effects right after a
+                // summary lands.
+                false,
             );
             out.extend(collapsed);
             return Ok(out);
         }
-        let rows = self
-            .state
-            .recent_messages(thread_id, self.config.history_limit)
-            .await?;
+        // Dual history window (Method A): pull a generous candidate pool,
+        // then size the kept window by *conversational* message count so a
+        // flurry of file-reading tool round-trips can't evict the user's
+        // earlier goals/files. `history_limit` stays the raw-row pool
+        // ceiling; `*4` mirrors the retrieval/extraction sites below so a
+        // tool-heavy thread can still fill the conversational budget.
+        let pool_limit = self
+            .config
+            .history_limit
+            .saturating_mul(4)
+            .max(self.config.conversation_history_limit.saturating_mul(4));
+        let rows = self.state.recent_messages(thread_id, pool_limit).await?;
         let messages: Vec<Message> = rows
             .into_iter()
             .map(|r| Message {
@@ -1218,12 +1231,22 @@ impl Engine {
                 created_at: r.created_at,
             })
             .collect();
-        let bounded = enforce_history_byte_cap(messages, self.config.history_max_bytes);
+        // Order is load-bearing: trim (size by conversation count) ->
+        // byte-cap (backstop + leading-orphan cleanup) -> repair (fix
+        // pairing on the final head) -> collapse (shrink stale tool
+        // bodies; needs the post-repair list to resolve names).
+        let windowed =
+            trim_to_conversation_window(messages, self.config.conversation_history_limit as usize);
+        let bounded = enforce_history_byte_cap(windowed, self.config.history_max_bytes);
         let repaired = repair_orphan_tool_uses(bounded);
         Ok(collapse_old_tool_results(
             repaired,
-            self.config.compact_keep_recent,
+            self.config.tool_keep_recent,
             self.config.collapse_tool_results_threshold,
+            // Broaden collapse to ALL tools (Bash/Skill included) — the
+            // big file-extraction dumps live there, and the full body is
+            // still recoverable from the DB if the model re-reads.
+            true,
         ))
     }
 
@@ -1602,8 +1625,15 @@ impl Engine {
                 created_at: r.created_at,
             })
             .collect();
-        let body_collapsed =
-            collapse_old_tool_results(body_msgs, 0, self.config.collapse_tool_results_threshold);
+        let body_collapsed = collapse_old_tool_results(
+            body_msgs,
+            0,
+            self.config.collapse_tool_results_threshold,
+            // Summariser keeps the conservative whitelist — it only
+            // shrinks stale read output, leaving side-effecting results
+            // for the summary to capture verbatim.
+            false,
+        );
         let body_text = render_for_summary(&body_collapsed);
         let body_count = body_rows.len();
 
@@ -2838,6 +2868,7 @@ pub fn collapse_old_tool_results(
     messages: Vec<Message>,
     keep_recent: usize,
     threshold: usize,
+    force_all_tools: bool,
 ) -> Vec<Message> {
     if threshold == 0 || messages.len() <= keep_recent + 1 {
         return messages;
@@ -2867,7 +2898,7 @@ pub fn collapse_old_tool_results(
             let collapsed: Vec<ContentBlock> = m
                 .content
                 .into_iter()
-                .map(|b| collapse_block_if_old_read(b, &name_by_id, threshold))
+                .map(|b| collapse_block_if_old_read(b, &name_by_id, threshold, force_all_tools))
                 .collect();
             Message {
                 content: collapsed,
@@ -2881,6 +2912,7 @@ fn collapse_block_if_old_read(
     block: ContentBlock,
     name_by_id: &HashMap<String, String>,
     threshold: usize,
+    force_all_tools: bool,
 ) -> ContentBlock {
     let ContentBlock::ToolResult {
         tool_use_id,
@@ -2902,7 +2934,10 @@ fn collapse_block_if_old_read(
         .get(tool_use_id.as_str())
         .map(|s| s.as_str())
         .unwrap_or("");
-    if !is_collapsible_tool(tool_name) {
+    // `force_all_tools` ignores the read-only whitelist so side-effecting
+    // dumps (Bash / Skill) collapse too — the no-compaction load path
+    // sets this since the full body is still recoverable from the DB.
+    if !force_all_tools && !is_collapsible_tool(tool_name) {
         return ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -2923,14 +2958,65 @@ fn collapse_block_if_old_read(
             is_error,
         };
     }
+    // Unknown tool name (no matching tool_use in this window) only
+    // happens under `force_all_tools`; fall back to a generic label.
+    let display_name = if tool_name.is_empty() {
+        "tool"
+    } else {
+        tool_name
+    };
     ContentBlock::ToolResult {
         tool_use_id,
         content: vec![ContentBlock::text(format!(
-            "<{tool_name} result: {total} bytes elided to save context; \
+            "<{display_name} result: {total} bytes elided to save context; \
              call again if you need the full body>"
         ))],
         is_error,
     }
+}
+
+/// Conversational half of the dual history window. Cuts a whole PREFIX
+/// so that at most `conversation_limit` *conversational* (User +
+/// Assistant) messages remain (the most recent ones). Tool and System
+/// messages don't count toward the budget but ride along inside the
+/// kept suffix.
+///
+/// Cutting a whole prefix (rather than dropping individual messages)
+/// means dropped tool round-trips drop as pairs — the only pairing
+/// hazard is a leading `Role::Tool` left at the new head when the cut
+/// lands mid-round-trip, which `enforce_history_byte_cap` and
+/// `repair_orphan_tool_uses` both strip downstream.
+///
+/// `conversation_limit == 0` disables the trim (returns the input
+/// unchanged), as does any history whose conversational count already
+/// fits.
+fn trim_to_conversation_window(messages: Vec<Message>, conversation_limit: usize) -> Vec<Message> {
+    if conversation_limit == 0 {
+        return messages;
+    }
+    let conv_total = messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .count();
+    if conv_total <= conversation_limit {
+        return messages;
+    }
+    let to_drop = conv_total - conversation_limit;
+    let mut dropped = 0usize;
+    let mut cut = 0usize;
+    for (i, m) in messages.iter().enumerate() {
+        // Stop BEFORE counting/advancing past the first message we want
+        // to keep — otherwise we'd drop one conversational turn too many.
+        if dropped == to_drop {
+            cut = i;
+            break;
+        }
+        if matches!(m.role, Role::User | Role::Assistant) {
+            dropped += 1;
+        }
+        cut = i + 1;
+    }
+    messages.into_iter().skip(cut).collect()
 }
 
 pub(crate) fn enforce_history_byte_cap(
@@ -3368,5 +3454,160 @@ mod context_length_tests {
         // straight to `ContextOverflow`. The substring fallback is no
         // longer the load-bearing path — the variant alone is enough.
         assert!(is_context_length_error(&LlmError::ContextOverflow));
+    }
+}
+
+#[cfg(test)]
+mod dual_window_tests {
+    use super::*;
+
+    fn u(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::text(text)])
+    }
+    fn a(text: &str) -> Message {
+        Message::new(Role::Assistant, vec![ContentBlock::text(text)])
+    }
+    /// Assistant message that drives a tool call (Role::Assistant — so it
+    /// counts toward the conversational budget, like the real loop).
+    fn a_call(id: &str, name: &str) -> Message {
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::text("calling..."),
+                ContentBlock::tool_use(id, name, json!({})),
+            ],
+        )
+    }
+    /// Tool-result envelope (Role::Tool — excluded from the conversational
+    /// budget; this is the key to the dual window).
+    fn tr(id: &str, body: &str) -> Message {
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new(id),
+                vec![ContentBlock::text(body)],
+            )],
+        )
+    }
+    fn has_text(messages: &[Message], needle: &str) -> bool {
+        messages.iter().any(|m| {
+            m.content.iter().any(|b| match b {
+                ContentBlock::Text { text } => text == needle,
+                _ => false,
+            })
+        })
+    }
+    fn conv_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+            .count()
+    }
+
+    #[test]
+    fn conversation_preserved_when_tool_results_present() {
+        // Two file-reading round-trips interleaved with conversation.
+        // Role::Tool result dumps must NOT consume the conversational
+        // budget, so the opening goal survives a budget that a flat
+        // last-N-rows window of the same count would have evicted.
+        let big = "x".repeat(4096);
+        let messages = vec![
+            u("goal: edit config"),
+            a_call("c1", "Bash"),
+            tr("c1", &big),
+            u("q2"),
+            a_call("c2", "Bash"),
+            tr("c2", &big),
+            u("q3"),
+            a("answer"),
+        ];
+        // 6 conversational (2 user + ... ) messages, 2 tool results.
+        assert_eq!(conv_count(&messages), 6);
+
+        let out = trim_to_conversation_window(messages.clone(), 6);
+        assert!(
+            has_text(&out, "goal: edit config"),
+            "goal must survive the conversational window"
+        );
+
+        // A flat tail keeping the same *number of conversational msgs*
+        // worth of raw rows (last 6 rows) would drop the goal — that's
+        // the regression this fixes.
+        let flat_tail = &messages[messages.len() - 6..];
+        assert!(
+            !has_text(flat_tail, "goal: edit config"),
+            "sanity: a flat last-6-rows window loses the goal"
+        );
+    }
+
+    #[test]
+    fn prefix_cut_keeps_pairing_valid() {
+        // Cut lands mid-round-trip: the kept head is an orphan tool
+        // result whose driving assistant message was dropped. repair
+        // must strip it so providers don't reject a leading tool msg.
+        let messages = vec![
+            a_call("c1", "Read"),
+            tr("c1", "body"),
+            u("a"),
+            a("b"),
+            u("c"),
+            a("d"),
+        ];
+        // 5 conversational; trim to 4 drops the leading a_call, exposing
+        // tr("c1") as a leading orphan.
+        let trimmed = trim_to_conversation_window(messages, 4);
+        assert!(matches!(trimmed[0].role, Role::Tool), "setup: head is orphan tool");
+
+        let repaired = repair_orphan_tool_uses(trimmed);
+        assert!(
+            !matches!(repaired[0].role, Role::Tool),
+            "repair must drop the leading orphan tool message"
+        );
+        // No tool_result left without a preceding tool_use.
+        let mut last_was_tool_use = false;
+        for m in &repaired {
+            let has_tool_use = m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            let has_tool_result = m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+            if has_tool_result {
+                assert!(last_was_tool_use, "orphan tool_result survived repair");
+            }
+            last_was_tool_use = has_tool_use;
+        }
+    }
+
+    #[test]
+    fn assistant_with_text_and_tool_use_counts_as_one() {
+        // a_call carries BOTH text and tool_use but is one conversational
+        // message. Trimming to keep the last 2 conversational messages
+        // yields exactly u("b") + a("c").
+        let messages = vec![u("a"), a_call("c1", "Read"), tr("c1", "body"), u("b"), a("c")];
+        let trimmed = trim_to_conversation_window(messages, 2);
+        assert_eq!(
+            conv_count(&trimmed),
+            2,
+            "exactly two conversational messages kept"
+        );
+        assert!(has_text(&trimmed, "b") && has_text(&trimmed, "c"));
+        assert!(!has_text(&trimmed, "a"), "older user turn trimmed");
+    }
+
+    #[test]
+    fn empty_and_all_tool_history_safe() {
+        // Empty input → empty output, no panic.
+        assert!(trim_to_conversation_window(Vec::new(), 5).is_empty());
+
+        // All-tool history: zero conversational messages → trim is a
+        // no-op; repair then strips the orphan tool messages.
+        let all_tool = vec![tr("c1", "x"), tr("c2", "y")];
+        let trimmed = trim_to_conversation_window(all_tool, 5);
+        assert_eq!(trimmed.len(), 2, "trim leaves all-tool history untouched");
+        let repaired = repair_orphan_tool_uses(trimmed);
+        assert!(repaired.is_empty(), "repair strips orphan tool messages");
     }
 }

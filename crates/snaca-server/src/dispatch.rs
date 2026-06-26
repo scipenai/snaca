@@ -196,9 +196,12 @@ impl PendingInput {
             if !self.text_parts.iter().any(|p| p == &text) {
                 self.text_parts.push(text.clone());
             }
-            if references_attachment(&text) {
-                self.references_attachment = true;
-            }
+            // Non-sticky: reflect the LATEST meaningful text. If the user
+            // keeps typing instead of uploading, the "waiting for a file"
+            // belief drops and `deadline()` falls back to the normal text
+            // debounce — so a stale referential state can't keep capturing
+            // later, unrelated messages.
+            self.references_attachment = references_attachment(&text);
             // If the user later recalls the running combined turn,
             // the instruction message is the most useful external id.
             if !params.message_id.is_empty() {
@@ -374,27 +377,13 @@ impl InputAssembler {
                         ),
                     }))
                 }
-            } else if pending.references_attachment && !pending.has_attachments() {
-                if pending.prompted {
-                    remove_pending = true;
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content: "等待文件的请求已过期；如需处理请重新发送要求和文件。".to_string(),
-                    }))
-                } else {
-                    pending.prompted = true;
-                    let generation = pending.bump_generation();
-                    schedule = Some((fired.key.clone(), generation, self.cfg.pending_expire));
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content:
-                            "还没收到要处理的文件。请上传文件，或发送“开始处理”按当前文字继续。"
-                                .to_string(),
-                    }))
-                }
             } else {
+                // Referential text whose file never arrived (and every
+                // other timeout) FAILS OPEN: fall through to the `Ready`
+                // release below so the user's text reaches the LLM instead
+                // of being trapped behind a "还没收到文件" dead-end. The
+                // referential_text_wait was a grace period for a near-
+                // simultaneous upload, not a hostage state.
                 None
             }
         };
@@ -1306,7 +1295,25 @@ fn is_attachment_placeholder(text: &str) -> bool {
         || lower.starts_with("[uploaded image:")
 }
 
+/// Heuristic: does the text read like a question rather than a request to
+/// act on a file? A question ABOUT documents ("你有哪些客户资料？", "在文档
+/// 里你能调取吗") is not a promise to upload one, so it must not trip the
+/// referential-wait path — answer it directly.
+fn is_question_like(text: &str) -> bool {
+    let t = text.trim();
+    if t.ends_with('?') || t.ends_with('？') {
+        return true;
+    }
+    let markers = ["吗", "呢", "哪些", "是否", "能不能", "可不可以", "是不是"];
+    markers.iter().any(|m| t.contains(m))
+}
+
 fn references_attachment(text: &str) -> bool {
+    // Interrogatives are questions about files, not "a file is coming —
+    // wait for it". Gate them out so they reach the LLM immediately.
+    if is_question_like(text) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
     let explicit_needles = [
         "附件",
@@ -2038,6 +2045,12 @@ mod tests {
         assert!(!references_attachment(
             "Use the LS tool to list files in the project workspace"
         ));
+        // Interrogatives ABOUT files are questions, not "a file is coming".
+        // These must NOT trip the referential-wait path (see the TM小龙虾
+        // "还没收到文件" trap).
+        assert!(!references_attachment("在湘阁里辣的文档里你可以调取吗"));
+        assert!(!references_attachment("你储存的客户资料有哪些"));
+        assert!(!references_attachment("你现在有哪些客户信息?"));
     }
 
     #[tokio::test]
@@ -2126,11 +2139,10 @@ mod tests {
     async fn assembler_submit_runs_referential_text_without_file() {
         let (mut asm, _rx) = test_assembler();
         let text = dummy_params_with("c1", "u1", "m-text", "帮我总结这个文件", vec![]);
-        let key = assembly_key(&text);
         assert!(matches!(asm.ingest(text), AssemblyIngest::Pending));
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key)));
-        assert!(notice.content.contains("还没收到"));
 
+        // Sending "开始处理" before the wait elapses still runs the
+        // referential text with no file (submit path unchanged).
         let submit = dummy_params_with("c1", "u1", "m-submit", "开始处理", vec![]);
         let ready = unwrap_ready(asm.ingest(submit));
         assert_eq!(ready.content, "帮我总结这个文件");
@@ -2139,16 +2151,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assembler_referential_text_expires_after_second_timeout() {
+    async fn assembler_referential_text_timeout_delivers_to_engine() {
+        // Fail-open: referential text whose file never arrives is delivered
+        // to the engine on timeout (NOT trapped behind a "还没收到文件"
+        // dead-end). This is the core of the TM小龙虾 trap fix.
         let (mut asm, _rx) = test_assembler();
         let text = dummy_params_with("c1", "u1", "m-text", "帮我总结这个文件", vec![]);
         let key = assembly_key(&text);
         assert!(matches!(asm.ingest(text), AssemblyIngest::Pending));
-        let _ = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
 
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-        assert!(notice.content.contains("已过期"));
+        let ready = unwrap_ready(asm.on_timeout(current_timeout(&asm, key.clone())));
+        assert_eq!(ready.content, "帮我总结这个文件");
+        assert!(ready.attachments.is_empty());
         assert!(!asm.pending.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn assembler_referential_followup_question_flushes_to_engine() {
+        // De-stick: after a referential text enters pending, a follow-up
+        // that is just a question (no file) clears the "waiting for a file"
+        // belief so it can't keep capturing later messages. Both texts then
+        // flush to the engine on the normal debounce.
+        let (mut asm, _rx) = test_assembler();
+        let text = dummy_params_with("c1", "u1", "m1", "帮我总结这个文件", vec![]);
+        let key = assembly_key(&text);
+        assert!(matches!(asm.ingest(text), AssemblyIngest::Pending));
+
+        let question = dummy_params_with("c1", "u1", "m2", "你现在有哪些客户信息?", vec![]);
+        assert!(matches!(asm.ingest(question), AssemblyIngest::Pending));
+        // Latest meaningful text is a question → referential belief dropped.
+        assert!(!asm.pending.get(&key).unwrap().references_attachment);
+
+        let ready = unwrap_ready(asm.on_timeout(current_timeout(&asm, key.clone())));
+        assert!(ready.content.contains("帮我总结这个文件"));
+        assert!(ready.content.contains("你现在有哪些客户信息?"));
+        assert!(asm.pending.is_empty());
     }
 
     #[tokio::test]

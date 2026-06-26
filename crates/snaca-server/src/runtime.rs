@@ -252,6 +252,16 @@ impl Runtime {
                 .engine
                 .collapse_tool_results_threshold
                 .unwrap_or(1024),
+            // Conversational half of the dual history window. `Some(0)`
+            // is treated as "explicitly disable the trim" (filtered out
+            // so it maps straight to 0); `None` -> default 30.
+            conversation_history_limit: config
+                .engine
+                .conversation_history_limit
+                .unwrap_or(30),
+            // Most-recent tool_result messages kept verbatim before
+            // collapse kicks in on older ones. `None` -> default 4.
+            tool_keep_recent: config.engine.tool_keep_recent.unwrap_or(4),
             stream_tool_execution: config.engine.stream_tool_execution.unwrap_or(true),
             stream_interrupted_max_retries: config
                 .engine

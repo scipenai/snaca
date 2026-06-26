@@ -411,6 +411,21 @@ pub struct EngineSection {
     #[serde(default)]
     pub collapse_tool_results_threshold: Option<usize>,
 
+    /// Conversational half of the dual history window: max number of
+    /// User + Assistant messages kept when loading history. Tool result
+    /// messages don't count against this budget, so file-reading tool
+    /// flurries can't evict the user's earlier turns. Default 30. Set
+    /// to 0 to disable the conversational trim.
+    #[serde(default)]
+    pub conversation_history_limit: Option<u32>,
+
+    /// Tool half of the dual history window: how many of the most
+    /// recent tool_result messages stay verbatim; older ones get large
+    /// bodies collapsed (broadened to all tools on the no-compaction
+    /// load path). Default 4.
+    #[serde(default)]
+    pub tool_keep_recent: Option<usize>,
+
     /// Pre-execute read-only no-approval tool calls in parallel with
     /// the LLM response stream. Default `true`. Set to `false` to
     /// fall back to fully-sequential post-stream execution (useful

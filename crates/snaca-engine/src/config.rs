@@ -144,6 +144,26 @@ pub struct EngineConfig {
     /// stay verbatim so the model can audit side effects.
     pub collapse_tool_results_threshold: usize,
 
+    /// Conversational half of the dual history window. Caps how many
+    /// *conversational* (User + Assistant) messages are kept when
+    /// loading history. Tool messages don't count against this budget —
+    /// a `tool_use` rides on an Assistant message (which does count),
+    /// but the separate `Role::Tool` result message does not. The
+    /// window is sized by a whole-prefix cut on this count, so a flurry
+    /// of file-reading tool round-trips can no longer evict the user's
+    /// earlier goals/files the way a flat last-N-rows window does.
+    /// Default 30. Set to 0 to disable the conversational trim (falls
+    /// back to byte-cap + collapse only).
+    pub conversation_history_limit: u32,
+
+    /// Tool half of the dual history window. How many of the most
+    /// recent tool_result messages stay verbatim in loaded history;
+    /// older ones get large bodies collapsed to a marker. On the
+    /// no-compaction load path this collapse is broadened to ALL tools
+    /// (Bash / Skill included), since their audit trail is preserved in
+    /// the DB regardless. Default 4.
+    pub tool_keep_recent: usize,
+
     /// Pre-execute read-only no-approval tool calls as soon as their
     /// input is fully streamed, in parallel with the rest of the
     /// LLM response. Cached results are consumed by the normal
@@ -214,6 +234,8 @@ impl EngineConfig {
             turn_timeout_secs: None,
             concurrent_tool_limit: 5,
             collapse_tool_results_threshold: 1024,
+            conversation_history_limit: 30,
+            tool_keep_recent: 4,
             stream_tool_execution: true,
             stream_interrupted_max_retries: 2,
             max_output_token_escalation_attempts: 2,

@@ -96,7 +96,7 @@ fn large_read_result_in_old_position_gets_collapsed() {
         assistant_text("ok"),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 1024);
+    let out = collapse_old_tool_results(messages, 2, 1024, false);
 
     // Tool result at index 2 is *before* the kept-tail (last 2),
     // collapsible tool, body well over 1024 → should be a marker.
@@ -119,7 +119,7 @@ fn small_result_stays_verbatim() {
         assistant_text("ok"),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 1024);
+    let out = collapse_old_tool_results(messages, 2, 1024, false);
 
     let body = tool_result_text(&out[2]);
     assert_eq!(body, "small body under 1KB");
@@ -136,7 +136,7 @@ fn kept_tail_never_collapses_even_when_large() {
         tool_result("call-1", &big),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 1024);
+    let out = collapse_old_tool_results(messages, 2, 1024, false);
 
     let body = tool_result_text(&out[3]);
     assert_eq!(
@@ -159,7 +159,7 @@ fn unknown_tool_results_never_collapse() {
         assistant_text("ok"),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 1024);
+    let out = collapse_old_tool_results(messages, 2, 1024, false);
 
     // MysteryMcpTool isn't in COLLAPSIBLE_TOOL_NAMES — safer to keep
     // verbatim than risk hiding a write side effect.
@@ -179,7 +179,7 @@ fn errors_never_collapse() {
         assistant_text("ok"),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 1024);
+    let out = collapse_old_tool_results(messages, 2, 1024, false);
 
     // Error message stays as-is — even oversized errors are usually
     // signal-heavy.
@@ -199,7 +199,7 @@ fn threshold_zero_disables_collapse() {
         assistant_text("ok"),
     ];
 
-    let out = collapse_old_tool_results(messages, 2, 0);
+    let out = collapse_old_tool_results(messages, 2, 0, false);
 
     let body = tool_result_text(&out[2]);
     assert_eq!(body.len(), 8192, "threshold=0 should be a no-op");
@@ -215,7 +215,7 @@ fn keep_recent_larger_than_history_is_safe_noop() {
         tool_result("call-1", &big),
     ];
 
-    let out = collapse_old_tool_results(messages, 10, 1024);
+    let out = collapse_old_tool_results(messages, 10, 1024, false);
 
     let body = tool_result_text(&out[2]);
     assert_eq!(body.len(), 4096);
@@ -234,11 +234,97 @@ fn keep_recent_zero_collapses_everything_eligible() {
         assistant_text("done"),
     ];
 
-    let out = collapse_old_tool_results(messages, 0, 1024);
+    let out = collapse_old_tool_results(messages, 0, 1024, false);
 
     let body = tool_result_text(&out[2]);
     assert!(
         body.starts_with("<Grep result:"),
         "expected Grep marker, got: {body}"
+    );
+}
+
+/// `force_all_tools = true` collapses a large Bash result even though
+/// Bash isn't in COLLAPSIBLE_TOOL_NAMES — the no-compaction load path
+/// relies on this to tame big file-extraction dumps.
+#[test]
+fn force_all_tools_collapses_bash() {
+    let big = "x".repeat(4096);
+    let messages = vec![
+        user("hi"),
+        assistant_calling("call-1", "Bash"),
+        tool_result("call-1", &big),
+        assistant_text("done"),
+        user("next"),
+        assistant_text("ok"),
+    ];
+
+    let out = collapse_old_tool_results(messages, 2, 1024, true);
+
+    let collapsed = tool_result_text(&out[2]);
+    assert!(
+        collapsed.starts_with("<Bash result:"),
+        "expected Bash marker under force_all_tools, got: {collapsed}"
+    );
+    assert!(collapsed.contains("4096 bytes"), "got: {collapsed}");
+}
+
+/// A Skill result stays verbatim with the conservative whitelist
+/// (`false`) but collapses under `force_all_tools = true`.
+#[test]
+fn force_all_tools_collapses_skill_but_default_keeps_verbatim() {
+    let big = "z".repeat(4096);
+    let build = || {
+        vec![
+            user("hi"),
+            assistant_calling("call-1", "Skill"),
+            tool_result("call-1", &big),
+            assistant_text("done"),
+            user("next"),
+            assistant_text("ok"),
+        ]
+    };
+
+    let default_out = collapse_old_tool_results(build(), 2, 1024, false);
+    assert_eq!(
+        tool_result_text(&default_out[2]).len(),
+        4096,
+        "Skill must stay verbatim under the conservative whitelist"
+    );
+
+    let forced_out = collapse_old_tool_results(build(), 2, 1024, true);
+    assert!(
+        tool_result_text(&forced_out[2]).starts_with("<Skill result:"),
+        "Skill must collapse under force_all_tools"
+    );
+}
+
+/// Under `force_all_tools`, the most recent tool_result (in the kept
+/// tail) stays verbatim while an older Bash dump collapses.
+#[test]
+fn recent_tool_results_stay_verbatim_old_ones_collapse() {
+    let old_big = "a".repeat(4096);
+    let new_big = "b".repeat(4096);
+    let messages = vec![
+        user("start"),
+        assistant_calling("call-old", "Bash"),
+        tool_result("call-old", &old_big),
+        assistant_text("mid"),
+        // Kept tail (last 2): the recent Bash round-trip.
+        assistant_calling("call-new", "Bash"),
+        tool_result("call-new", &new_big),
+    ];
+
+    let out = collapse_old_tool_results(messages, 2, 1024, true);
+
+    let old_body = tool_result_text(&out[2]);
+    assert!(
+        old_body.starts_with("<Bash result:"),
+        "old Bash result should collapse, got: {old_body}"
+    );
+    let new_body = tool_result_text(&out[5]);
+    assert_eq!(
+        new_body.len(),
+        4096,
+        "recent Bash result must stay verbatim"
     );
 }
