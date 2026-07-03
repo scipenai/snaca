@@ -1522,7 +1522,10 @@ impl Engine {
             // summarise call that follows.
             let preview_rows = self
                 .state
-                .recent_messages(thread_id, self.config.conversation_history_limit.saturating_mul(4))
+                .recent_messages(
+                    thread_id,
+                    self.config.conversation_history_limit.saturating_mul(4),
+                )
                 .await
                 .unwrap_or_default();
             let mut excerpt = String::new();
@@ -1577,7 +1580,10 @@ impl Engine {
         // the raw row order from oldest to newest to pick the cutoffs.
         let mut all = self
             .state
-            .recent_messages(thread_id, self.config.conversation_history_limit.saturating_mul(4))
+            .recent_messages(
+                thread_id,
+                self.config.conversation_history_limit.saturating_mul(4),
+            )
             .await?;
         // Need at least `protect_first + protect_last + 2` rows for a
         // non-trivial middle band. Below that, compaction would either
@@ -3588,7 +3594,10 @@ mod history_window_tests {
             a("d"),
         ];
         let trimmed = trim_to_conversation_window(messages, 4);
-        assert!(matches!(trimmed[0].role, Role::Tool), "setup: head is orphan tool");
+        assert!(
+            matches!(trimmed[0].role, Role::Tool),
+            "setup: head is orphan tool"
+        );
         let repaired = repair_orphan_tool_uses(trimmed);
         assert!(
             !matches!(repaired[0].role, Role::Tool),
@@ -3598,9 +3607,19 @@ mod history_window_tests {
 
     #[test]
     fn assistant_with_text_and_tool_use_counts_as_one() {
-        let messages = vec![u("a"), a_call("c1", "Read"), tr("c1", "body"), u("b"), a("c")];
+        let messages = vec![
+            u("a"),
+            a_call("c1", "Read"),
+            tr("c1", "body"),
+            u("b"),
+            a("c"),
+        ];
         let trimmed = trim_to_conversation_window(messages, 2);
-        assert_eq!(conv_count(&trimmed), 2, "exactly two conversational messages kept");
+        assert_eq!(
+            conv_count(&trimmed),
+            2,
+            "exactly two conversational messages kept"
+        );
         assert!(has_text(&trimmed, "b") && has_text(&trimmed, "c"));
         assert!(!has_text(&trimmed, "a"), "older user turn trimmed");
     }
