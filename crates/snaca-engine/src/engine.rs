@@ -1190,15 +1190,26 @@ impl Engine {
             // a single oversized post-compaction message (e.g. a
             // tool_result carrying a freshly extracted PDF body) can
             // still blow the window.
-            let bounded = enforce_history_byte_cap(live_msgs, self.config.history_max_bytes);
-            let repaired = repair_orphan_tool_uses(bounded);
+            let bounded = enforce_history_byte_cap(
+                live_msgs,
+                self.config.history_max_bytes,
+                self.config.compact_keep_recent,
+            );
             // Collapse old read-only tool_results so the model
             // doesn't re-pay token budget for stale Read/Grep
             // output on every turn after compaction. The kept tail
             // matches `compact_keep_recent` so the model still
-            // sees its most recent tool work verbatim.
+            // sees its most recent tool work verbatim. Pairing repair
+            // happens once at the request boundary
+            // (`ensure_tool_result_pairing` in `call_llm_and_prerun`)
+            // over the whole `head ++ summary ++ live` assembly.
+            //
+            // Order matters: byte-cap runs before collapse. A byte-cap
+            // marker is intentionally tiny (well under
+            // `collapse_tool_results_threshold`), so collapse leaves it
+            // alone and the two elision markers never fight.
             let collapsed = collapse_old_tool_results(
-                repaired,
+                bounded,
                 self.config.compact_keep_recent,
                 self.config.collapse_tool_results_threshold,
             );
@@ -1223,10 +1234,15 @@ impl Engine {
             .collect();
         let windowed =
             trim_to_conversation_window(messages, self.config.conversation_history_limit as usize);
-        let bounded = enforce_history_byte_cap(windowed, self.config.history_max_bytes);
-        let repaired = repair_orphan_tool_uses(bounded);
+        let bounded = enforce_history_byte_cap(
+            windowed,
+            self.config.history_max_bytes,
+            self.config.compact_keep_recent,
+        );
+        // Pairing repair is deferred to the request boundary
+        // (`ensure_tool_result_pairing` in `call_llm_and_prerun`).
         Ok(collapse_old_tool_results(
-            repaired,
+            bounded,
             self.config.compact_keep_recent,
             self.config.collapse_tool_results_threshold,
         ))
@@ -1722,6 +1738,17 @@ impl Engine {
         listener: &dyn TurnEventListener,
         max_tokens_override: Option<u32>,
     ) -> EngineResult<(MessageResponse, PrerunCache)> {
+        // Single pairing-invariant gate over the *complete* assembled
+        // history. `load_history` splices `head ++ summary ++ live_tail`
+        // and an orphan tool_use/tool_result can sit on any seam; running
+        // the invariant here — the one choke point every *tool-bearing*
+        // request passes through, including the prompt-too-long
+        // shrink-retry — means no assembly path can send a malformed
+        // history to the provider. (The compaction-summary and memory
+        // extractor requests bypass this, but they render history to a
+        // single flat user-text message with no tool blocks, so they
+        // can't carry an orphan.)
+        let history = ensure_tool_result_pairing(history);
         let mut attempt: u8 = 0;
         loop {
             match self
@@ -2950,13 +2977,7 @@ fn collapse_block_if_old_read(
             is_error,
         };
     }
-    let total: usize = content
-        .iter()
-        .map(|c| match c {
-            ContentBlock::Text { text } => text.len(),
-            _ => 0,
-        })
-        .sum();
+    let total = tool_result_text_len(&content);
     if total < threshold {
         return ContentBlock::ToolResult {
             tool_use_id,
@@ -2974,22 +2995,104 @@ fn collapse_block_if_old_read(
     }
 }
 
+/// Marker substituted for an old `tool_result`'s body when the byte cap
+/// clears it. The block and its `tool_use_id` are kept so pairing stays
+/// intact — only the payload is elided.
+const BYTE_CAP_CLEARED_MARKER: &str = "[Old tool result content cleared to fit context budget]";
+
+/// Byte size of a `tool_result` body's text blocks — the portion the byte
+/// cap can elide. Mirrors how `message_byte_size` counts a `ToolResult`.
+fn tool_result_text_len(content: &[ContentBlock]) -> usize {
+    content
+        .iter()
+        .map(|c| match c {
+            ContentBlock::Text { text } => text.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Bring `messages` under `max_bytes` while keeping the wire format
+/// pairing-safe.
+///
+/// Phase A — clear content, keep blocks: walk the messages oldest→newest,
+/// excluding the most recent `keep_recent`, and replace each
+/// `tool_result` body with `BYTE_CAP_CLEARED_MARKER`. The block and its
+/// `tool_use_id` survive, so no `tool_use` is ever orphaned by this pass.
+/// This is the common case — a single oversized `tool_result` (a freshly
+/// extracted PDF/xlsx body) is what usually blows the cap.
+///
+/// Phase B — fallback drop: if clearing every eligible body still leaves
+/// us over the cap (bulk sits in text / thinking / tool_use args), drop
+/// whole leading messages as a last resort. Any forward-orphan this
+/// creates is repaired by `ensure_tool_result_pairing` at the request
+/// boundary; a leading `Role::Tool` left at the new head is stripped here
+/// so the fallback alone never emits a leading tool message.
 pub(crate) fn enforce_history_byte_cap(
     mut messages: Vec<Message>,
     max_bytes: usize,
+    keep_recent: usize,
 ) -> Vec<Message> {
     if max_bytes == 0 || messages.is_empty() {
         return messages;
     }
     let mut total = messages_byte_size(&messages);
+
+    // Phase A: clear old tool_result bodies (only when over cap).
+    // Protect the most recent `keep_recent` messages (floored at 1) so
+    // the model still sees its latest tool work verbatim. Single pass per
+    // message: only clear a body that is actually LARGER than the marker
+    // (so clearing always shrinks, never grows a tiny body), and account
+    // the freed bytes incrementally.
+    const MARKER_LEN: usize = BYTE_CAP_CLEARED_MARKER.len();
+    let mut cleared = 0usize;
+    if total > max_bytes {
+        let protect_from = messages.len().saturating_sub(keep_recent.max(1));
+        for msg in messages.iter_mut().take(protect_from) {
+            if total <= max_bytes {
+                break;
+            }
+            if !matches!(msg.role, Role::Tool) {
+                continue;
+            }
+            let mut freed = 0usize;
+            for block in msg.content.iter_mut() {
+                if let ContentBlock::ToolResult {
+                    content, is_error, ..
+                } = block
+                {
+                    // Errors are small and load-bearing; leave them.
+                    if *is_error {
+                        continue;
+                    }
+                    let body = tool_result_text_len(content);
+                    // Skip bodies no larger than the marker — that covers
+                    // already-cleared results and anything too small to be
+                    // worth eliding (clearing would only add bytes).
+                    if body <= MARKER_LEN {
+                        continue;
+                    }
+                    *content = vec![ContentBlock::text(BYTE_CAP_CLEARED_MARKER)];
+                    freed += body - MARKER_LEN;
+                }
+            }
+            if freed > 0 {
+                total = total.saturating_sub(freed);
+                cleared += 1;
+            }
+        }
+    }
+
+    // Phase B: still over cap — drop whole leading messages.
     let original_len = messages.len();
     while total > max_bytes && messages.len() > 1 {
         let dropped = messages.remove(0);
         total = total.saturating_sub(message_byte_size(&dropped));
     }
-    // After byte-trimming, the new head must NOT be a `Role::Tool`
-    // message — providers reject `tool` messages that don't follow an
-    // assistant `tool_use`. Drop leading orphans the same way.
+    // On every path (even when already under cap) the head must NOT be a
+    // `Role::Tool` message — providers reject `tool` messages that don't
+    // follow an assistant `tool_use`. Drop leading orphans regardless of
+    // whether Phase B ran, so this function never returns a leading tool.
     while messages
         .first()
         .map(|m| matches!(m.role, Role::Tool))
@@ -2997,13 +3100,14 @@ pub(crate) fn enforce_history_byte_cap(
     {
         messages.remove(0);
     }
-    let kept = messages.len();
-    if kept != original_len {
+    let dropped = original_len - messages.len();
+    if cleared > 0 || dropped > 0 {
         warn!(
-            dropped = original_len - kept,
-            kept,
+            cleared,
+            dropped,
+            kept = messages.len(),
             cap_bytes = max_bytes,
-            "history-load: dropped oldest messages to fit byte cap"
+            "history-load: enforced byte cap (cleared old tool_result bodies, then dropped oldest)"
         );
     }
     messages
@@ -3023,13 +3127,7 @@ fn message_byte_size(m: &Message) -> usize {
                 n += name.len();
                 n += serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
             }
-            ContentBlock::ToolResult { content, .. } => {
-                for inner in content {
-                    if let ContentBlock::Text { text } = inner {
-                        n += text.len();
-                    }
-                }
-            }
+            ContentBlock::ToolResult { content, .. } => n += tool_result_text_len(content),
             ContentBlock::Image { .. } => {
                 // Synthetic constant — image references don't carry
                 // bytes inline, but tokens count differently. Pick a
@@ -3041,20 +3139,6 @@ fn message_byte_size(m: &Message) -> usize {
     n
 }
 
-/// Walk `messages` chronologically and ensure every assistant `tool_use`
-/// block is followed by a matching `tool_result` (or `tool_error`)
-/// somewhere downstream. When an orphan is found, splice in a
-/// synthetic `Role::Tool` message right after the offending assistant
-/// turn so the wire format stays well-formed.
-///
-/// Why this is necessary: providers like DeepSeek (and Anthropic)
-/// reject any history submission whose `tool_calls` aren't all
-/// answered. We persist each turn's pieces incrementally, so a crash
-/// or transient gate failure between "assistant tool_use written" and
-/// "tool_result written" leaves the DB in a state the next turn can't
-/// load. M2's solution was to abort the engine on those failures; M3
-/// switched to "every tool_use produces a result block" but legacy
-/// rows from older builds still need patching at load time.
 /// Conversational half of the dual history window. Cuts a whole PREFIX
 /// so that at most `conversation_limit` *conversational* (User +
 /// Assistant) messages remain (the most recent ones). Tool and System
@@ -3065,7 +3149,7 @@ fn message_byte_size(m: &Message) -> usize {
 /// means dropped tool round-trips drop as pairs — the only pairing
 /// hazard is a leading `Role::Tool` left at the new head when the cut
 /// lands mid-round-trip, which `enforce_history_byte_cap` and
-/// `repair_orphan_tool_uses` both strip downstream.
+/// `ensure_tool_result_pairing` both strip downstream.
 ///
 /// `conversation_limit == 0` disables the trim (returns the input
 /// unchanged), as does any history whose conversational count already
@@ -3182,10 +3266,69 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn repair_orphan_tool_uses(messages: Vec<Message>) -> Vec<Message> {
+/// Filter a `Role::Tool` message's blocks so only well-formed
+/// `tool_result`s survive: each must answer a `tool_use` that appeared
+/// earlier (`seen_tool_use_ids`) and must not repeat an id already
+/// answered (`answered_ids`). Reverse orphans (a result whose
+/// `tool_use` was dropped by compaction / never existed) and duplicate
+/// results (from resume or double-splice) are stripped. Kept ids are
+/// recorded into `answered_ids`. Non-`tool_result` blocks pass through
+/// untouched.
+fn filter_tool_result_blocks(
+    content: Vec<ContentBlock>,
+    seen_tool_use_ids: &std::collections::HashSet<String>,
+    answered_ids: &mut std::collections::HashSet<String>,
+) -> Vec<ContentBlock> {
+    content
+        .into_iter()
+        .filter(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                let id = tool_use_id.as_str();
+                if !seen_tool_use_ids.contains(id) {
+                    warn!(%id, "history-load: dropping orphan tool_result with no matching tool_use");
+                    return false;
+                }
+                if !answered_ids.insert(id.to_string()) {
+                    warn!(%id, "history-load: dropping duplicate tool_result");
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// Single pairing-invariant gate, applied to the *complete* assembled
+/// history right before it is sent to the provider (see
+/// `call_llm_and_prerun`). Guarantees the wire format is well-formed:
+///
+/// * every assistant `tool_use` is followed by a `Role::Tool` message
+///   answering each id (a synthetic `tool_error` is spliced in for any
+///   that isn't — the forward-orphan case that a compaction boundary or
+///   an interrupted turn can leave behind);
+/// * every `tool_result` answers a `tool_use` seen earlier, else it is
+///   dropped (reverse orphan — the assistant half was compacted away);
+/// * no `tool_use_id` is answered twice (dedup, guards resume /
+///   double-splice).
+///
+/// Why one gate over the whole list rather than per-segment repairs:
+/// `load_history` assembles `head ++ summary ++ live_tail`, and an
+/// orphan can sit on any seam. Running the invariant once at the
+/// request boundary means no assembly path can bypass it.
+///
+/// Providers like DeepSeek (and Anthropic) reject any history whose
+/// `tool_calls` aren't all answered, or that carries a dangling
+/// `tool_result` — this is the backstop that keeps that from happening.
+fn ensure_tool_result_pairing(messages: Vec<Message>) -> Vec<Message> {
     use std::collections::HashSet;
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut iter = messages.into_iter().peekable();
+    // Every `tool_use` id emitted by an assistant so far, and every
+    // `tool_result` id already consumed. Accumulated across the whole
+    // list so reverse-orphan and dedup checks span message boundaries.
+    let mut seen_tool_use_ids: HashSet<String> = HashSet::new();
+    let mut answered_ids: HashSet<String> = HashSet::new();
     while let Some(msg) = iter.next() {
         // Drop any leading or unattached tool message — providers
         // reject a tool block that doesn't follow an assistant
@@ -3209,6 +3352,18 @@ fn repair_orphan_tool_uses(messages: Vec<Message>) -> Vec<Message> {
                 warn!("history-load: dropping orphan tool message with no preceding assistant tool_use");
                 continue;
             }
+            // Strip reverse-orphan / duplicate result blocks; if the
+            // message is emptied out, drop it entirely.
+            let filtered =
+                filter_tool_result_blocks(msg.content, &seen_tool_use_ids, &mut answered_ids);
+            if filtered.is_empty() {
+                continue;
+            }
+            out.push(Message {
+                content: filtered,
+                ..msg
+            });
+            continue;
         }
 
         let assistant_tool_uses: Vec<String> = if matches!(msg.role, Role::Assistant) {
@@ -3222,75 +3377,108 @@ fn repair_orphan_tool_uses(messages: Vec<Message>) -> Vec<Message> {
         } else {
             Vec::new()
         };
+        // Record this assistant's ids before touching the following
+        // tool message so its results resolve against them.
+        for id in &assistant_tool_uses {
+            seen_tool_use_ids.insert(id.clone());
+        }
 
         out.push(msg);
 
         if assistant_tool_uses.is_empty() {
             continue;
         }
-        // Look at the very next message: if it's a Tool message,
-        // collect the tool_use_ids it answers. Anything missing
-        // becomes a synthetic tool_error block we splice in. If the
-        // next message *isn't* a Tool message, every tool_use is
-        // orphaned.
-        let answered: HashSet<String> = if matches!(iter.peek().map(|m| m.role), Some(Role::Tool)) {
-            iter.peek()
-                .map(|m| {
-                    m.content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.as_str().to_string())
-                            }
-                            _ => None,
-                        })
-                        .collect()
+        // Finalize the following tool message (if any) FIRST — filter
+        // its blocks — then decide which tool_use ids are still
+        // unanswered. Deriving `missing` from what *survives* filtering
+        // (not a raw peek) is load-bearing: a result dropped as a
+        // duplicate or reverse-orphan must count as unanswered so it
+        // gets a synthetic error, otherwise the assistant tool_use is
+        // silently orphaned again.
+        let mut result_msg: Option<Message> =
+            if matches!(iter.peek().map(|m| m.role), Some(Role::Tool)) {
+                let next = iter.next().expect("peeked Some");
+                let filtered =
+                    filter_tool_result_blocks(next.content, &seen_tool_use_ids, &mut answered_ids);
+                Some(Message {
+                    content: filtered,
+                    ..next
                 })
-                .unwrap_or_default()
-        } else {
-            HashSet::new()
-        };
+            } else {
+                None
+            };
+        let answered_here: HashSet<String> = result_msg
+            .as_ref()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            Some(tool_use_id.as_str().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let missing: Vec<String> = assistant_tool_uses
             .into_iter()
-            .filter(|id| !answered.contains(id))
+            .filter(|id| !answered_here.contains(id))
             .collect();
-        if missing.is_empty() {
-            continue;
+        if !missing.is_empty() {
+            warn!(
+                count = missing.len(),
+                "history-load: synthesising tool_error blocks for orphan tool_use ids"
+            );
+            let synth = synthetic_tool_errors(missing, &mut answered_ids);
+            match result_msg.as_mut() {
+                Some(m) => m.content.extend(synth),
+                None => {
+                    result_msg = Some(Message {
+                        id: MessageId::new(),
+                        role: Role::Tool,
+                        content: synth,
+                        created_at: Utc::now(),
+                    })
+                }
+            }
         }
-        warn!(
-            count = missing.len(),
-            "history-load: synthesising tool_error blocks for orphan tool_use ids"
-        );
-        // Build a synthetic tool message holding tool_error for each
-        // missing id. If the next message is already a Tool message,
-        // merge into it instead of creating a new one — keeps the
-        // history compact.
-        let synthetic: Vec<ContentBlock> = missing
-            .into_iter()
-            .map(|id| {
-                ContentBlock::tool_error(
-                    snaca_core::ToolUseId::new(id),
-                    "tool execution interrupted (orphan tool_use repaired at load time)"
-                        .to_string(),
-                )
-            })
-            .collect();
-        if matches!(iter.peek().map(|m| m.role), Some(Role::Tool)) {
-            // Pop the existing tool message, append the synthetic
-            // blocks, push it back.
-            let mut next = iter.next().expect("peeked Some");
-            next.content.extend(synthetic);
-            out.push(next);
-        } else {
-            out.push(Message {
-                id: MessageId::new(),
-                role: Role::Tool,
-                content: synthetic,
-                created_at: Utc::now(),
-            });
+        // Push the finalized tool turn. It is never empty here: this
+        // branch only runs when `assistant_tool_uses` is non-empty, and
+        // if the filtered content were empty then `answered_here` would
+        // be empty, forcing `missing` = all ids and a synthetic error to
+        // be appended above. The assert documents (and, in tests, guards)
+        // that invariant — an empty tool turn would re-orphan the
+        // assistant, the exact failure this gate exists to prevent.
+        if let Some(m) = result_msg {
+            debug_assert!(
+                !m.content.is_empty(),
+                "finalized tool turn must answer the assistant's tool_use ids"
+            );
+            out.push(m);
         }
     }
     out
+}
+
+/// Build a `tool_error` block for each orphaned tool_use id, marking each
+/// id as answered. Recording the id is load-bearing: a synthetic error
+/// answers the tool_use, so a later stray/duplicate `tool_result` for the
+/// same id must be deduped by `filter_tool_result_blocks` rather than
+/// double-answering it on the wire.
+fn synthetic_tool_errors(
+    ids: Vec<String>,
+    answered_ids: &mut std::collections::HashSet<String>,
+) -> Vec<ContentBlock> {
+    ids.into_iter()
+        .map(|id| {
+            answered_ids.insert(id.clone());
+            ContentBlock::tool_error(
+                snaca_core::ToolUseId::new(id),
+                "tool execution interrupted (orphan tool_use repaired at load time)".to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Flatten a slice of messages into a transcript the summariser
@@ -3601,7 +3789,7 @@ mod history_window_tests {
             matches!(trimmed[0].role, Role::Tool),
             "setup: head is orphan tool"
         );
-        let repaired = repair_orphan_tool_uses(trimmed);
+        let repaired = ensure_tool_result_pairing(trimmed);
         assert!(
             !matches!(repaired[0].role, Role::Tool),
             "repair must drop the leading orphan tool message"
@@ -3666,6 +3854,261 @@ mod history_window_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(render_workspace_files(dir.path()), "");
         assert_eq!(render_workspace_files(&dir.path().join("nope")), "");
+    }
+
+    // ---- pairing-invariant gate (`ensure_tool_result_pairing`) ----
+
+    /// Assistant message driving multiple tool calls in one turn.
+    fn a_calls(ids: &[&str]) -> Message {
+        let mut blocks = vec![ContentBlock::text("calling...")];
+        for id in ids {
+            blocks.push(ContentBlock::tool_use(*id, "Read", json!({})));
+        }
+        Message::new(Role::Assistant, blocks)
+    }
+    /// Ids answered (as `tool_result` or `tool_error`) by a `Role::Tool` msg.
+    fn answered_ids(m: &Message) -> Vec<String> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Concatenated text of the `tool_result` block answering `id`.
+    fn tool_result_body(m: &Message, id: &str) -> String {
+        m.content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id.as_str() == id => Some(
+                    content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+    /// Assert the wire invariant a provider enforces: every assistant
+    /// `tool_use` id is answered by the immediately-following tool
+    /// message, and every `tool_result` answers an earlier `tool_use`.
+    fn assert_pairing_valid(msgs: &[Message]) {
+        let mut seen = std::collections::HashSet::new();
+        for (i, m) in msgs.iter().enumerate() {
+            match m.role {
+                Role::Assistant => {
+                    let ids: Vec<String> = m
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, .. } => Some(id.as_str().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    for id in &ids {
+                        seen.insert(id.clone());
+                    }
+                    if !ids.is_empty() {
+                        let next = msgs.get(i + 1);
+                        assert!(
+                            matches!(next.map(|n| n.role), Some(Role::Tool)),
+                            "assistant tool_use at {i} not followed by a tool message"
+                        );
+                        let ans = answered_ids(next.unwrap());
+                        for id in &ids {
+                            assert!(ans.contains(id), "tool_use {id} at {i} left unanswered");
+                        }
+                    }
+                }
+                Role::Tool => {
+                    for id in answered_ids(m) {
+                        assert!(seen.contains(&id), "tool_result {id} answers no prior tool_use");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_gate_repairs_head_orphan_from_compaction() {
+        // Regression for the production incident: `load_history` splices
+        // `head ++ summary ++ live`, and the head's last message is an
+        // assistant with two tool_uses whose results were compacted away.
+        // The gate must synthesize a tool message between it and the
+        // summary so the assistant tool_use is no longer orphaned.
+        let head = vec![u("q1"), a("hi"), u("q2"), a_calls(&["c1", "c2"])];
+        let summary = u("[SNACA SUMMARY of earlier conversation]");
+        let live = vec![a_call("c3", "Bash"), tr("c3", "body")];
+        let assembled = [head, vec![summary], live].concat();
+
+        let out = ensure_tool_result_pairing(assembled);
+        assert_pairing_valid(&out);
+        // The synthetic answers sit right after the head assistant,
+        // before the summary user message.
+        let idx = out
+            .iter()
+            .position(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id.as_str() == "c1"))
+            })
+            .unwrap();
+        assert!(matches!(out[idx + 1].role, Role::Tool));
+        let ans = answered_ids(&out[idx + 1]);
+        assert!(ans.contains(&"c1".to_string()) && ans.contains(&"c2".to_string()));
+        assert!(matches!(out[idx + 2].role, Role::User), "summary preserved after synth");
+    }
+
+    #[test]
+    fn boundary_gate_drops_reverse_orphan_block_keeps_valid() {
+        // A tool message carrying one valid result (c1) and one orphan
+        // (z, whose tool_use never existed): keep c1, drop z.
+        let tool_msg = Message::new(
+            Role::Tool,
+            vec![
+                ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("ok")]),
+                ContentBlock::tool_result(ToolUseId::new("z"), vec![ContentBlock::text("orphan")]),
+            ],
+        );
+        let out = ensure_tool_result_pairing(vec![u("q"), a_call("c1", "Read"), tool_msg]);
+        assert_pairing_valid(&out);
+        let ans = answered_ids(&out[2]);
+        assert_eq!(ans, vec!["c1".to_string()], "orphan z dropped, c1 kept");
+    }
+
+    #[test]
+    fn boundary_gate_dedups_repeated_result() {
+        let tool_msg = Message::new(
+            Role::Tool,
+            vec![
+                ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("first")]),
+                ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("dupe")]),
+            ],
+        );
+        let out = ensure_tool_result_pairing(vec![u("q"), a_call("c1", "Read"), tool_msg]);
+        assert_eq!(answered_ids(&out[2]), vec!["c1".to_string()], "duplicate c1 dropped");
+    }
+
+    #[test]
+    fn byte_cap_clears_old_tool_result_body_keeps_pairing() {
+        let big = "x".repeat(5000);
+        let msgs = vec![
+            u("q"),
+            a_call("c1", "Read"),
+            tr("c1", &big),
+            u("q2"),
+            a_call("c2", "Read"),
+            tr("c2", "recent"),
+        ];
+        let out = enforce_history_byte_cap(msgs, 2000, 2);
+        assert_eq!(out.len(), 6, "no message dropped — content cleared instead");
+        assert!(messages_byte_size(&out) <= 2000, "under cap after clearing");
+        // c1 body elided to the marker, block + id intact.
+        assert_eq!(answered_ids(&out[2]), vec!["c1".to_string()]);
+        assert!(
+            tool_result_body(&out[2], "c1") == BYTE_CAP_CLEARED_MARKER,
+            "c1 body cleared to marker"
+        );
+        // Recent tail (within keep_recent=2) left verbatim.
+        assert_eq!(
+            tool_result_body(&out[5], "c2"),
+            "recent",
+            "recent tool result untouched"
+        );
+    }
+
+    #[test]
+    fn byte_cap_falls_back_to_drop_when_bulk_not_clearable() {
+        // Oversized bulk sits in a user text block — nothing to clear, so
+        // Phase B drops leading messages.
+        let big = "x".repeat(5000);
+        let msgs = vec![u(&big), a("small"), u("q2"), a("keep")];
+        let out = enforce_history_byte_cap(msgs, 300, 1);
+        assert!(out.len() < 4, "leading messages dropped");
+        assert!(has_text(&out, "keep"), "recent turn survives");
+        assert!(!matches!(out[0].role, Role::Tool), "no leading orphan tool");
+    }
+
+    #[test]
+    fn boundary_gate_dedup_does_not_orphan_assistant() {
+        // Regression for the review finding: a double-spliced round-trip
+        // (same tool_use id answered twice). The dedup drops the second
+        // result — but `missing` must be derived from what survives
+        // filtering, so the second assistant tool_use gets a synthetic
+        // error rather than an empty tool message + orphan.
+        let msgs = vec![
+            u("q"),
+            a_call("c1", "Read"),
+            tr("c1", "first"),
+            a_call("c1", "Read"),
+            tr("c1", "dupe"),
+        ];
+        let out = ensure_tool_result_pairing(msgs);
+        assert_pairing_valid(&out);
+        assert!(
+            out.iter()
+                .all(|m| !(matches!(m.role, Role::Tool) && m.content.is_empty())),
+            "no empty tool message emitted"
+        );
+        // Second turn's duplicate result was replaced by a synthetic error.
+        assert!(
+            matches!(out.last().map(|m| &m.role), Some(Role::Tool)),
+            "last turn is the answering tool message"
+        );
+        assert_eq!(answered_ids(out.last().unwrap()), vec!["c1".to_string()]);
+    }
+
+    #[test]
+    fn boundary_gate_synthetic_answer_dedups_later_stray_result() {
+        // A(c1) is a forward orphan → gets a synthetic tool_error. A later
+        // spliced tool message carries a stray real result for the same
+        // c1. Because the synthetic answer records c1 as answered, the
+        // stray must be deduped — otherwise c1 is answered twice on the
+        // wire (synthetic error + stray result), which providers reject.
+        let merged = Message::new(
+            Role::Tool,
+            vec![
+                ContentBlock::tool_result(ToolUseId::new("c2"), vec![ContentBlock::text("ok")]),
+                ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("stray")]),
+            ],
+        );
+        let msgs = vec![
+            a_call("c1", "Read"), // orphan: no following tool message
+            u("x"),
+            a_call("c2", "Read"),
+            merged,
+        ];
+        let out = ensure_tool_result_pairing(msgs);
+        assert_pairing_valid(&out);
+        // c1 must be answered exactly once across the whole history.
+        let c1_answers: usize = out
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id.as_str() == "c1"))
+            .count();
+        assert_eq!(c1_answers, 1, "c1 answered exactly once (stray deduped)");
+    }
+
+    #[test]
+    fn byte_cap_strips_leading_tool_even_under_cap() {
+        // Regression for the review finding: when already under the byte
+        // cap, the leading-Role::Tool strip must still run so the function
+        // never returns a history that begins with an unattached tool
+        // message.
+        let msgs = vec![tr("c1", "orphan"), a("b"), u("c")];
+        let out = enforce_history_byte_cap(msgs, 10_000_000, 6);
+        assert!(!matches!(out[0].role, Role::Tool), "leading orphan tool stripped");
+        assert_eq!(out.len(), 2);
     }
 }
 
