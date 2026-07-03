@@ -3702,34 +3702,31 @@ fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize
         out
     }
 
-    let chunks: Vec<String> = rows
-        .iter()
-        .map(|r| render_row(r, max_block_bytes))
-        .collect();
-    if total_max == 0 {
-        return chunks.concat();
-    }
-    // Keep the newest suffix that fits `total_max`; always keep at least
-    // the newest message even if it alone exceeds the budget (its own
-    // blocks are already per-block-capped, so it stays bounded).
-    let mut start = chunks.len();
-    let mut kept = 0usize;
-    for i in (0..chunks.len()).rev() {
-        let len = chunks[i].len();
-        if start != chunks.len() && kept + len > total_max {
+    // Render newest→oldest, keeping messages until the byte budget is
+    // reached (always at least the newest, whose own blocks are already
+    // per-block-capped). Rendering stops at the budget, so the
+    // dropped-oldest prefix is never rendered. `total_max == 0` disables
+    // the cap (keeps everything).
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for r in rows.iter().rev() {
+        let chunk = render_row(r, max_block_bytes);
+        if total_max > 0 && !kept.is_empty() && used + chunk.len() > total_max {
             break;
         }
-        kept += len;
-        start = i;
+        used += chunk.len();
+        kept.push(chunk);
     }
+    let omitted = rows.len() - kept.len();
     let mut out = String::new();
-    if start > 0 {
+    if omitted > 0 {
         out.push_str(&format!(
-            "[… {start} older messages omitted to fit the summary budget …]\n"
+            "[… {omitted} older messages omitted to fit the summary budget …]\n"
         ));
     }
-    for c in &chunks[start..] {
-        out.push_str(c);
+    // `kept` is newest→oldest; emit it chronologically.
+    for chunk in kept.iter().rev() {
+        out.push_str(chunk);
     }
     out
 }
