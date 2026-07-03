@@ -1407,9 +1407,10 @@ impl Engine {
         // panic falls back to an empty listing, matching the in-fn error
         // handling.
         let workspace_dir = self.workspace.workspace_dir(tenant, project);
-        let workspace_files = tokio::task::spawn_blocking(move || render_workspace_files(&workspace_dir))
-            .await
-            .unwrap_or_default();
+        let workspace_files =
+            tokio::task::spawn_blocking(move || render_workspace_files(&workspace_dir))
+                .await
+                .unwrap_or_default();
 
         // Cache hit on the second-and-later turns of a thread; this
         // is the whole point of the frozen-snapshot model.
