@@ -18,12 +18,17 @@ jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
       TARGET_TRIPLE: x86_64-unknown-linux-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Full history + tags so `git archive` and any history-dependent
+          # release step see the complete tree, not a depth-1 shallow clone.
+          fetch-depth: 0
 
       - name: Normalize version
         id: version

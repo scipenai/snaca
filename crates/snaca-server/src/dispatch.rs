@@ -32,6 +32,7 @@ use snaca_channel_protocol::methods::{
 use snaca_core::{ProjectId, TenantId, ThreadId};
 use snaca_engine::{Engine, TurnRequest};
 use snaca_state::Database;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -324,16 +325,18 @@ impl InputAssembler {
         // A newer fragment arrived after this timer was scheduled: the
         // generation no longer matches, so a fresh timer is already
         // pending. Drop this stale fire.
-        match self.pending.get(&fired.key) {
-            Some(pending) if pending.generation == fired.generation => {}
-            _ => return AssemblyIngest::Pending,
-        }
+        //
         // The burst has gone quiet (or hit the hard cap). Deliver
         // whatever accumulated — text, files, or both — and let the
         // engine decide whether the request is answerable. The gateway
         // never inspects content or emits its own "waiting for a file"
         // notices.
-        let pending = self.pending.remove(&fired.key).expect("checked above");
+        let pending = match self.pending.entry(fired.key) {
+            Entry::Occupied(entry) if entry.get().generation == fired.generation => entry.remove(),
+            // Generation mismatch or already consumed: the current entry
+            // (if any) stays untouched; drop this stale fire.
+            _ => return AssemblyIngest::Pending,
+        };
         AssemblyIngest::Ready(pending.into_params())
     }
 

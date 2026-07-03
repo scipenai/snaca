@@ -294,9 +294,9 @@ pub struct EngineSection {
     /// Size of the loaded history window, counted in *conversational*
     /// (User + Assistant) messages — huge `Role::Tool` results don't
     /// consume the budget, so file-extraction dumps can't evict earlier
-    /// goals/files. Default 30. (The old `history_limit` key is ignored
-    /// if still present.)
-    #[serde(default)]
+    /// goals/files. Default 30. Accepts the legacy `history_limit` key as
+    /// an alias so pre-rename configs keep working.
+    #[serde(default, alias = "history_limit")]
     pub conversation_history_limit: Option<u32>,
     /// Override the built-in system prompt. Empty / missing = use default.
     #[serde(default)]

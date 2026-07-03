@@ -1210,7 +1210,7 @@ impl Engine {
         // message count via a whole-prefix cut, so a couple of huge
         // Role::Tool dumps can't evict the user's earlier goals/files
         // the way a flat last-N-rows window does.
-        let pool_limit = self.config.conversation_history_limit.saturating_mul(4);
+        let pool_limit = self.config.pool_limit();
         let rows = self.state.recent_messages(thread_id, pool_limit).await?;
         let messages: Vec<Message> = rows
             .into_iter()
@@ -1247,7 +1247,7 @@ impl Engine {
         // Pull recent messages from the thread the worker can see. Use
         // the conversational window's raw-row pool so the extractor sees
         // roughly the same context the LLM did.
-        let pool_limit = self.config.conversation_history_limit.saturating_mul(4);
+        let pool_limit = self.config.pool_limit();
         // Per-project serial lock so two concurrent extractor tasks on
         // the same project don't trample each other's `MEMORY.md`
         // regeneration or same-name entry writes. Map insert is fast
@@ -1401,9 +1401,15 @@ impl Engine {
         // bounded dir read), even on the memory-snapshot cache-hit path,
         // so the model's view of its files is never stale. It rides as a
         // volatile segment, so this per-turn recompute never busts the
-        // cacheable memory prefix.
-        let workspace_files =
-            render_workspace_files(&self.workspace.workspace_dir(tenant, project));
+        // cacheable memory prefix. The listing uses blocking `std::fs`
+        // syscalls (read_dir + per-entry metadata), so it runs on a
+        // `spawn_blocking` thread to keep it off the async executor; a
+        // panic falls back to an empty listing, matching the in-fn error
+        // handling.
+        let workspace_dir = self.workspace.workspace_dir(tenant, project);
+        let workspace_files = tokio::task::spawn_blocking(move || render_workspace_files(&workspace_dir))
+            .await
+            .unwrap_or_default();
 
         // Cache hit on the second-and-later turns of a thread; this
         // is the whole point of the frozen-snapshot model.
@@ -1522,10 +1528,7 @@ impl Engine {
             // summarise call that follows.
             let preview_rows = self
                 .state
-                .recent_messages(
-                    thread_id,
-                    self.config.conversation_history_limit.saturating_mul(4),
-                )
+                .recent_messages(thread_id, self.config.pool_limit())
                 .await
                 .unwrap_or_default();
             let mut excerpt = String::new();
@@ -1575,15 +1578,13 @@ impl Engine {
             .unwrap_or(self.config.compact_keep_recent)
             .max(2);
         let protect_first = self.config.protect_first_n;
-        // Pull the entire thread's messages — `history_limit * 4` keeps a
-        // safe ceiling even when load_history is summary-spliced. We need
-        // the raw row order from oldest to newest to pick the cutoffs.
+        // Pull the entire thread's messages — `pool_limit()` (history_limit
+        // * 4, clamped) keeps a safe ceiling even when load_history is
+        // summary-spliced. We need the raw row order from oldest to newest
+        // to pick the cutoffs.
         let mut all = self
             .state
-            .recent_messages(
-                thread_id,
-                self.config.conversation_history_limit.saturating_mul(4),
-            )
+            .recent_messages(thread_id, self.config.pool_limit())
             .await?;
         // Need at least `protect_first + protect_last + 2` rows for a
         // non-trivial middle band. Below that, compaction would either
@@ -3166,16 +3167,17 @@ fn render_workspace_files(dir: &std::path::Path) -> String {
     out
 }
 
-/// Compact human-readable byte size (`832 B`, `12.4 KB`, `5.3 MB`).
+/// Compact human-readable byte size (`832 B`, `12.4 KiB`, `5.3 MiB`).
+/// Binary (1024-based) divisions with matching IEC unit labels.
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
     match bytes {
         b if b < KB => format!("{b} B"),
-        b if b < MB => format!("{:.1} KB", b as f64 / KB as f64),
-        b if b < GB => format!("{:.1} MB", b as f64 / MB as f64),
-        b => format!("{:.1} GB", b as f64 / GB as f64),
+        b if b < MB => format!("{:.1} KiB", b as f64 / KB as f64),
+        b if b < GB => format!("{:.1} MiB", b as f64 / MB as f64),
+        b => format!("{:.1} GiB", b as f64 / GB as f64),
     }
 }
 
