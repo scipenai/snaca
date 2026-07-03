@@ -1645,11 +1645,16 @@ impl Engine {
             .collect();
         let body_collapsed =
             collapse_old_tool_results(body_msgs, 0, self.config.collapse_tool_results_threshold);
-        // Cap each block so a large error / Bash / write body (which
-        // collapse leaves verbatim) can't blow the summary request — the
-        // request meant to rescue an over-long context. 16 KiB/block is
-        // ample for a gist and keeps the input bounded across the band.
-        let body_text = render_for_summary(&body_collapsed, SUMMARY_BLOCK_MAX_BYTES);
+        // Cap each block AND the aggregate so a band of large error / Bash
+        // / write bodies (which collapse leaves verbatim) can't blow the
+        // summary request — the request meant to rescue an over-long
+        // context. 16 KiB/block is ample for a gist; the total ceiling is
+        // the hard guarantee the request itself never overflows.
+        let body_text = render_for_summary(
+            &body_collapsed,
+            SUMMARY_BLOCK_MAX_BYTES,
+            SUMMARY_TOTAL_MAX_BYTES,
+        );
         let body_count = body_rows.len();
 
         // Build a single-shot summarization request. We deliberately
@@ -3014,9 +3019,16 @@ fn collapse_block_if_old_read(
 const BYTE_CAP_CLEARED_MARKER: &str = "[Old tool result content cleared to fit context budget]";
 
 /// Per-block byte cap when rendering the compaction-summary input
-/// (`render_for_summary`). Bounds each message's contribution so the
-/// summariser request can't itself overflow the context window.
+/// (`render_for_summary`). Bounds each message's contribution so no single
+/// message dominates the summariser request.
 const SUMMARY_BLOCK_MAX_BYTES: usize = 16 * 1024;
+
+/// Aggregate byte ceiling for the whole compaction-summary transcript.
+/// The hard guarantee that the summariser request — the one meant to
+/// rescue an over-long context — can never itself overflow, even when a
+/// band holds many mid-sized results. ~256 KiB (~64k tokens) leaves ample
+/// headroom under any modern context window.
+const SUMMARY_TOTAL_MAX_BYTES: usize = 256 * 1024;
 
 /// Byte size of a `tool_result` body's text blocks — the portion the byte
 /// cap can elide. Mirrors how `message_byte_size` counts a `ToolResult`.
@@ -3052,20 +3064,27 @@ fn cap_tool_result_content(content: Vec<ContentBlock>, max: usize) -> Vec<Conten
     if max == 0 || tool_result_text_len(&content) <= max {
         return content;
     }
-    // Split text from non-text (image) blocks; concatenate the text so a
-    // body spread across several text blocks is capped as a whole.
-    let mut text = String::new();
+    // Split text from non-text (image) blocks. Avoid materialising the
+    // whole body in the common single-text-block case (a Bash dump is one
+    // `Text` block) — borrow it directly; only concatenate when the text
+    // is genuinely spread across several blocks.
+    let mut texts: Vec<String> = Vec::new();
     let mut others: Vec<ContentBlock> = Vec::new();
     for b in content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(&t),
+            ContentBlock::Text { text: t } => texts.push(t),
             other => others.push(other),
         }
     }
+    let body: std::borrow::Cow<str> = match texts.len() {
+        1 => std::borrow::Cow::Borrowed(texts[0].as_str()),
+        _ => std::borrow::Cow::Owned(texts.concat()),
+    };
+    let text: &str = &body;
     // Keep a head and a tail so both the start of the output and any
     // trailing error/summary survive.
     let half = (max / 2).max(1);
-    let head_end = floor_char_boundary(&text, half);
+    let head_end = floor_char_boundary(text, half);
     let mut tail_start = text.len().saturating_sub(half);
     while tail_start < text.len() && !text.is_char_boundary(tail_start) {
         tail_start += 1;
@@ -3607,14 +3626,17 @@ fn synthetic_tool_errors(
 /// pre-run `collapse_old_tool_results` against the input — both paths
 /// (compaction summary, live load) get the same view.
 ///
-/// Every block's text is capped at `max_block_bytes` (layer ② of the
-/// oversized-result defence). `collapse_old_tool_results` only shrinks
-/// *read-only, non-error* results, so a large Bash / write / error body
-/// would otherwise reach here in full and blow the summary request itself
-/// — the request that is supposed to *rescue* an over-long context.
-/// Capping per block keeps the summariser input bounded regardless of
-/// tool type or error status.
-fn render_for_summary(rows: &[Message], max_block_bytes: usize) -> String {
+/// Every block's text is capped at `max_block_bytes` and the whole
+/// transcript at `total_max` (layer ② of the oversized-result defence).
+/// `collapse_old_tool_results` only shrinks *read-only, non-error*
+/// results, so a large Bash / write / error body would otherwise reach
+/// here in full and blow the summary request itself — the request that is
+/// supposed to *rescue* an over-long context. The per-block cap stops one
+/// message dominating; the `total_max` ceiling bounds the aggregate so a
+/// band of many mid-sized results can't overflow it either. `total_max`
+/// keeps the oldest messages (which carry the opening goals) and notes how
+/// many were dropped. `0` disables the respective cap.
+fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize) -> String {
     // Push `s`, truncated on a char boundary to `max_block_bytes`, with a
     // short note when anything was dropped.
     fn push_capped(out: &mut String, s: &str, max: usize) {
@@ -3625,7 +3647,16 @@ fn render_for_summary(rows: &[Message], max_block_bytes: usize) -> String {
         }
     }
     let mut out = String::new();
-    for r in rows {
+    for (i, r) in rows.iter().enumerate() {
+        // Aggregate ceiling: once the transcript reaches `total_max`, stop
+        // and note the omitted tail so the request can never overflow.
+        if total_max > 0 && out.len() >= total_max {
+            out.push_str(&format!(
+                "\n[… {} more-recent messages omitted to fit the summary budget …]\n",
+                rows.len() - i
+            ));
+            break;
+        }
         let label = match r.role {
             Role::User => "USER",
             Role::Assistant => "ASSISTANT",
@@ -4323,13 +4354,41 @@ mod history_window_tests {
                 "x".repeat(500_000),
             )],
         );
-        let rendered = render_for_summary(&[big_err], 16 * 1024);
+        let rendered = render_for_summary(&[big_err], 16 * 1024, 256 * 1024);
         assert!(
             rendered.len() < 40_000,
             "render bounded, got {}",
             rendered.len()
         );
         assert!(rendered.contains("truncated"));
+    }
+
+    #[test]
+    fn render_for_summary_bounds_aggregate() {
+        // Layer ② aggregate guarantee: many results each UNDER the per-block
+        // cap must still be bounded in total, so a large band can't overflow
+        // the summary request.
+        let msgs: Vec<Message> = (0..100)
+            .map(|i| {
+                Message::new(
+                    Role::Tool,
+                    vec![ContentBlock::tool_result(
+                        ToolUseId::new(format!("c{i}")),
+                        vec![ContentBlock::text("y".repeat(10_000))],
+                    )],
+                )
+            })
+            .collect();
+        // 100 × 10 KiB = ~1 MiB unbounded; total_max = 64 KiB must cap it.
+        // The budget check is at the top of the loop, so the bound is
+        // total_max + at most one message's rendered size (~10 KiB here).
+        let rendered = render_for_summary(&msgs, 16 * 1024, 64 * 1024);
+        assert!(
+            rendered.len() < 64 * 1024 + 16 * 1024,
+            "aggregate bounded, got {}",
+            rendered.len()
+        );
+        assert!(rendered.contains("messages omitted"));
     }
 
     #[test]
