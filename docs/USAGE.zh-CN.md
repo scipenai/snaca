@@ -690,7 +690,7 @@ sqlite3 data/state.sqlite "SELECT * FROM chat_session_binding"
 
 | 症状 | 一般原因 | 处理 |
 |---|---|---|
-| LLM 报「tool_calls without tool messages」 | 历史里有 dangling tool_use | 当前版本 `repair_orphan_tool_uses` 会兜底；继续报就 `truncate messages` 或建新 thread |
+| LLM 报「tool_calls without tool messages」 | 历史里有 dangling tool_use | 当前版本 `ensure_tool_result_pairing`（请求边界统一兜底）会修复；继续报就 `truncate messages` 或建新 thread |
 | 「turn loop exceeded N iterations」 | LLM 在某个工具上反复重试 | 看日志哪个工具 / 参数；考虑放宽 Bash relaxed 或扩 max_iterations |
 | context length exceeded | 大附件入栈 | 调小 `compact_after_input_tokens` 或 `history_max_bytes` |
 | approval card 没出现 | 默认 `SNACA_APPROVAL_MODE=allow` 已经全放行（v0 后改的默认），或工具是 ApprovalRequirement::Never，或插件没声明 `interactive_card` 能力 | 启动日志 `approval gate ... resolved=...` 那行先确认模式；想恢复卡片就 `export SNACA_APPROVAL_MODE=interactive` |
