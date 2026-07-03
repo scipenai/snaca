@@ -3633,9 +3633,14 @@ fn synthetic_tool_errors(
 /// here in full and blow the summary request itself — the request that is
 /// supposed to *rescue* an over-long context. The per-block cap stops one
 /// message dominating; the `total_max` ceiling bounds the aggregate so a
-/// band of many mid-sized results can't overflow it either. `total_max`
-/// keeps the oldest messages (which carry the opening goals) and notes how
-/// many were dropped. `0` disables the respective cap.
+/// band of many mid-sized results can't overflow it either.
+///
+/// When the band overflows `total_max` we keep the **newest** messages and
+/// drop the oldest (noting how many). The band is the *middle* slice —
+/// its head overlaps the `preserved_head` that compaction already keeps
+/// verbatim, while its newest messages bridge into the verbatim live tail,
+/// so recency is the more useful thing to preserve. `0` disables the
+/// respective cap.
 fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize) -> String {
     // Push `s`, truncated on a char boundary to `max_block_bytes`, with a
     // short note when anything was dropped.
@@ -3646,23 +3651,15 @@ fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize
             out.push_str(&format!("[…{} bytes truncated…]", s.len() - end));
         }
     }
-    let mut out = String::new();
-    for (i, r) in rows.iter().enumerate() {
-        // Aggregate ceiling: once the transcript reaches `total_max`, stop
-        // and note the omitted tail so the request can never overflow.
-        if total_max > 0 && out.len() >= total_max {
-            out.push_str(&format!(
-                "\n[… {} more-recent messages omitted to fit the summary budget …]\n",
-                rows.len() - i
-            ));
-            break;
-        }
+    // Render one message (label + per-block-capped content) into a chunk.
+    fn render_row(r: &Message, max_block_bytes: usize) -> String {
         let label = match r.role {
             Role::User => "USER",
             Role::Assistant => "ASSISTANT",
             Role::Tool => "TOOL",
             Role::System => "SYSTEM",
         };
+        let mut out = String::new();
         out.push_str(label);
         out.push_str(": ");
         for block in &r.content {
@@ -3702,6 +3699,37 @@ fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize
             out.push(' ');
         }
         out.push('\n');
+        out
+    }
+
+    let chunks: Vec<String> = rows
+        .iter()
+        .map(|r| render_row(r, max_block_bytes))
+        .collect();
+    if total_max == 0 {
+        return chunks.concat();
+    }
+    // Keep the newest suffix that fits `total_max`; always keep at least
+    // the newest message even if it alone exceeds the budget (its own
+    // blocks are already per-block-capped, so it stays bounded).
+    let mut start = chunks.len();
+    let mut kept = 0usize;
+    for i in (0..chunks.len()).rev() {
+        let len = chunks[i].len();
+        if start != chunks.len() && kept + len > total_max {
+            break;
+        }
+        kept += len;
+        start = i;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str(&format!(
+            "[… {start} older messages omitted to fit the summary budget …]\n"
+        ));
+    }
+    for c in &chunks[start..] {
+        out.push_str(c);
     }
     out
 }
@@ -4374,14 +4402,19 @@ mod history_window_tests {
                     Role::Tool,
                     vec![ContentBlock::tool_result(
                         ToolUseId::new(format!("c{i}")),
-                        vec![ContentBlock::text("y".repeat(10_000))],
+                        // Distinguishable marker at the head of each body so
+                        // we can assert WHICH messages survived.
+                        vec![ContentBlock::text(format!(
+                            "MARK{i} {}",
+                            "y".repeat(10_000)
+                        ))],
                     )],
                 )
             })
             .collect();
-        // 100 × 10 KiB = ~1 MiB unbounded; total_max = 64 KiB must cap it.
-        // The budget check is at the top of the loop, so the bound is
-        // total_max + at most one message's rendered size (~10 KiB here).
+        // 100 × 10 KiB = ~1 MiB unbounded; total_max = 64 KiB must cap it
+        // by keeping the newest suffix and dropping the oldest. Bound is
+        // total_max + at most one (always-kept newest) message.
         let rendered = render_for_summary(&msgs, 16 * 1024, 64 * 1024);
         assert!(
             rendered.len() < 64 * 1024 + 16 * 1024,
@@ -4389,6 +4422,9 @@ mod history_window_tests {
             rendered.len()
         );
         assert!(rendered.contains("messages omitted"));
+        // Tail-biased: the newest survives, the oldest is dropped.
+        assert!(rendered.contains("MARK99"), "newest kept");
+        assert!(!rendered.contains("MARK0 "), "oldest dropped");
     }
 
     #[test]
