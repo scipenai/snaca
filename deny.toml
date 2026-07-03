@@ -6,6 +6,11 @@ ignore = [
     # rustls-pemfile is archived, but this path is owned by the current
     # openlark dependency stack and has no direct safe upgrade in this repo.
     "RUSTSEC-2025-0134",
+    # ttf-parser is unmaintained (author-declared). Pulled transitively through
+    # pdf-extract -> lopdf -> ttf-parser; there is no safe upgrade available.
+    # Only an unmaintained warning (no known vulnerability); revisit if lopdf
+    # moves to an actively maintained font parser (e.g. skrifa).
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]
