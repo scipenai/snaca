@@ -252,6 +252,10 @@ impl Runtime {
                 .engine
                 .collapse_tool_results_threshold
                 .unwrap_or(1024),
+            // 0 disables the per-result cap; any positive value is the
+            // byte ceiling above which a single tool_result is truncated
+            // to a preview at capture time.
+            max_tool_result_bytes: config.engine.max_tool_result_bytes.unwrap_or(200 * 1024),
             stream_tool_execution: config.engine.stream_tool_execution.unwrap_or(true),
             stream_interrupted_max_retries: config
                 .engine

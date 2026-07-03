@@ -149,6 +149,21 @@ pub struct EngineConfig {
     /// stay verbatim so the model can audit side effects.
     pub collapse_tool_results_threshold: usize,
 
+    /// Hard per-tool-result byte ceiling applied at capture time,
+    /// *before* the result is persisted. A single tool output (a Bash
+    /// command dumping a whole spreadsheet, an error whose message
+    /// embeds a multi-MB stdout tail) that exceeds this is truncated to
+    /// a head + tail preview with a `[... N bytes truncated ...]` note,
+    /// keeping the `tool_use_id` intact. Without this, one oversized
+    /// result both blows the model context on load *and* blows the
+    /// compaction-summary request (which renders result bodies), leaving
+    /// the thread permanently wedged — `history_max_bytes` /
+    /// `collapse_*` can't recover it because it sits in the protected
+    /// recent tail. Default 200 KiB (~50k tokens) — generous for a
+    /// legitimate large read, small enough that no single result can
+    /// dominate the window. Set to 0 to disable.
+    pub max_tool_result_bytes: usize,
+
     /// Pre-execute read-only no-approval tool calls as soon as their
     /// input is fully streamed, in parallel with the rest of the
     /// LLM response. Cached results are consumed by the normal
@@ -237,6 +252,7 @@ impl EngineConfig {
             turn_timeout_secs: None,
             concurrent_tool_limit: 5,
             collapse_tool_results_threshold: 1024,
+            max_tool_result_bytes: 200 * 1024,
             stream_tool_execution: true,
             stream_interrupted_max_retries: 2,
             max_output_token_escalation_attempts: 2,
