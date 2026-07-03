@@ -198,7 +198,25 @@ pub struct EngineConfig {
     pub memory_write_approval: bool,
 }
 
+/// Absolute ceiling on the raw candidate-row pool pulled from the DB
+/// before the conversational window is applied. The pool is normally
+/// `conversation_history_limit * 4`, but a large (mis)configured limit
+/// would otherwise fetch unboundedly many rows on every turn, compaction
+/// preview, and memory extraction. Clamp keeps those queries bounded.
+pub const MAX_POOL_ROWS: u32 = 2_000;
+
 impl EngineConfig {
+    /// Size of the raw candidate-row pool to pull from the DB before
+    /// trimming to the conversational window: four times
+    /// `conversation_history_limit`, clamped to [`MAX_POOL_ROWS`]. Used by
+    /// history load, compaction preview, and memory extraction so they
+    /// stay in lockstep.
+    pub fn pool_limit(&self) -> u32 {
+        self.conversation_history_limit
+            .saturating_mul(4)
+            .min(MAX_POOL_ROWS)
+    }
+
     pub fn default_for(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
