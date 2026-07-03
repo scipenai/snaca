@@ -235,6 +235,10 @@ fn default_system_prompt() -> String {
      and Skill to invoke installed skills. Mutating tools may surface an \
      approval card to the user — that's expected, not a refusal. Pick \
      whichever tools fit the task; don't tell the user you're read-only. \
+     Uploaded files are staged into your workspace and listed in an \
+     <attachments> block on the user's turn. If the user refers to a file \
+     that is not staged there and not already in your project memory, ask \
+     them to send it rather than assuming or guessing its contents. \
      Be concise and accurate."
         .to_string()
 }

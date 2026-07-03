@@ -60,36 +60,29 @@ pub struct SkillsSection {
 pub struct ImInputSection {
     /// Enable the IM input assembler. When on, short bursts of text and
     /// attachment messages from the same user are coalesced into one
-    /// engine turn. Default true.
+    /// engine turn. The assembler is purely time/structure based — it
+    /// never inspects message content to decide whether to wait.
+    /// Default true.
     #[serde(default)]
     pub assembly_enabled: Option<bool>,
 
-    /// Debounce for ordinary text bursts, in milliseconds. Default 1500.
+    /// Debounce for a text (or text+file) burst, in milliseconds. Each
+    /// new fragment resets the window. Default 1500.
     #[serde(default)]
     pub text_debounce_ms: Option<u64>,
 
-    /// How long a file-only message waits for the user's instruction
-    /// before prompting again or auto-running, in seconds. Default 90.
+    /// Structural grace period for a file-only message: how long the
+    /// assembler waits for a trailing instruction ("帮我总结一下") to
+    /// arrive before delivering the file(s) as-is. Default 8.
     #[serde(default)]
     pub attachment_wait_secs: Option<u64>,
 
-    /// How long a referential text request ("summarize this file") waits
-    /// for a following attachment before surfacing a "no file received"
-    /// prompt, in seconds. Default 45.
+    /// Absolute ceiling, measured from the first fragment of a burst,
+    /// after which the pending buffer is always flushed regardless of
+    /// how often the debounce window has reset. Guards against a chat
+    /// wedging on input that never settles. Default 30.
     #[serde(default)]
-    pub referential_text_wait_secs: Option<u64>,
-
-    /// How long a prompted pending input may remain open before SNACA
-    /// drops it to avoid binding stale files/instructions to later chat.
-    /// Default 300.
-    #[serde(default)]
-    pub pending_expire_secs: Option<u64>,
-
-    /// If true, file-only messages run after `attachment_wait_secs` even
-    /// without explicit instructions. Default false: SNACA waits for the
-    /// user to say what to do.
-    #[serde(default)]
-    pub file_only_autorun: Option<bool>,
+    pub hard_cap_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1054,9 +1047,7 @@ api_key = "k"
 assembly_enabled = true
 text_debounce_ms = 250
 attachment_wait_secs = 12
-referential_text_wait_secs = 7
-pending_expire_secs = 99
-file_only_autorun = true
+hard_cap_secs = 99
 "#,
         )
         .unwrap();
@@ -1064,9 +1055,7 @@ file_only_autorun = true
         assert_eq!(cfg.im_input.assembly_enabled, Some(true));
         assert_eq!(cfg.im_input.text_debounce_ms, Some(250));
         assert_eq!(cfg.im_input.attachment_wait_secs, Some(12));
-        assert_eq!(cfg.im_input.referential_text_wait_secs, Some(7));
-        assert_eq!(cfg.im_input.pending_expire_secs, Some(99));
-        assert_eq!(cfg.im_input.file_only_autorun, Some(true));
+        assert_eq!(cfg.im_input.hard_cap_secs, Some(99));
     }
 
     #[test]

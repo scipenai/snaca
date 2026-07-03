@@ -168,15 +168,17 @@ model = "deepseek-chat"
 # "instruction → file" work naturally. Slash commands and question replies
 # bypass this path.
 #
-# assembly_enabled = true
-# text_debounce_ms = 1500
-# attachment_wait_secs = 90
-# referential_text_wait_secs = 45
-# pending_expire_secs = 300
+# The assembler is purely time/structure based: it decides ONLY *when* to
+# hand a burst to the engine, never *whether* the request is answerable —
+# it does not scan message content for file-related keywords. Whether a
+# referenced file is actually needed (and missing) is the model's call; it
+# asks the user when a file it needs isn't staged. A file/instruction that
+# arrives after a turn has started simply becomes the next turn.
 #
-# Default false: a file-only message is stored as pending and SNACA asks
-# the user for instructions instead of immediately invoking the LLM.
-# file_only_autorun = false
+# assembly_enabled = true
+# text_debounce_ms = 1500     # debounce for a text (or text+file) burst; each fragment resets it
+# attachment_wait_secs = 8    # file-only grace period: wait this long for a trailing instruction, then deliver as-is
+# hard_cap_secs = 30          # absolute flush ceiling from the first fragment, so a chat can never wedge
 
 [admin]
 # Admin Web UI + `/api/v1/*` REST API. The legacy `/admin/*` endpoints

@@ -35,7 +35,7 @@ use snaca_state::Database;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -50,18 +50,22 @@ const DEFAULT_CHAT_MAILBOX: usize = 8;
 const IDLE_TTL: Duration = Duration::from_secs(300);
 
 const DEFAULT_TEXT_DEBOUNCE: Duration = Duration::from_millis(1500);
-const DEFAULT_ATTACHMENT_WAIT: Duration = Duration::from_secs(90);
-const DEFAULT_REFERENTIAL_TEXT_WAIT: Duration = Duration::from_secs(45);
-const DEFAULT_PENDING_EXPIRE: Duration = Duration::from_secs(300);
+/// File-only messages wait this long for a trailing instruction to
+/// arrive before the buffer is delivered as-is. Purely structural —
+/// no message content is ever inspected to make this decision.
+const DEFAULT_ATTACHMENT_WAIT: Duration = Duration::from_secs(8);
+/// Absolute ceiling measured from the first fragment of a burst. No
+/// matter how often the debounce window resets, a pending buffer is
+/// always flushed within this bound, so a chat can never wedge waiting
+/// for input that will never settle.
+const DEFAULT_HARD_CAP: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct InputAssemblyConfig {
     pub enabled: bool,
     pub text_debounce: Duration,
     pub attachment_wait: Duration,
-    pub referential_text_wait: Duration,
-    pub pending_expire: Duration,
-    pub file_only_autorun: bool,
+    pub hard_cap: Duration,
 }
 
 impl Default for InputAssemblyConfig {
@@ -70,9 +74,7 @@ impl Default for InputAssemblyConfig {
             enabled: true,
             text_debounce: DEFAULT_TEXT_DEBOUNCE,
             attachment_wait: DEFAULT_ATTACHMENT_WAIT,
-            referential_text_wait: DEFAULT_REFERENTIAL_TEXT_WAIT,
-            pending_expire: DEFAULT_PENDING_EXPIRE,
-            file_only_autorun: false,
+            hard_cap: DEFAULT_HARD_CAP,
         }
     }
 }
@@ -157,9 +159,11 @@ struct PendingInput {
     message_ids: Vec<String>,
     text_parts: Vec<String>,
     attachments: Vec<Attachment>,
-    references_attachment: bool,
     generation: u64,
-    prompted: bool,
+    /// When the first fragment of this burst arrived. Drives the
+    /// absolute `hard_cap` so a stream that never goes quiet still
+    /// flushes.
+    first_seen: Instant,
 }
 
 impl PendingInput {
@@ -169,9 +173,8 @@ impl PendingInput {
             message_ids: Vec::new(),
             text_parts: Vec::new(),
             attachments: Vec::new(),
-            references_attachment: false,
             generation: 0,
-            prompted: false,
+            first_seen: Instant::now(),
         };
         pending.merge(params);
         pending
@@ -186,7 +189,10 @@ impl PendingInput {
         if !params.tenant_id.is_empty() {
             self.base.tenant_id = params.tenant_id.clone();
         }
-        if !params.received_at.is_empty() {
+        // Keep the FIRST fragment's arrival time as the turn timestamp
+        // (when the user's turn began), not the latest fragment's — so
+        // the timestamp injected into the turn reflects turn start.
+        if self.base.received_at.is_empty() && !params.received_at.is_empty() {
             self.base.received_at = params.received_at.clone();
         }
         if let Some(reply_to) = params.reply_to.clone() {
@@ -196,21 +202,16 @@ impl PendingInput {
             if !self.text_parts.iter().any(|p| p == &text) {
                 self.text_parts.push(text.clone());
             }
-            if references_attachment(&text) {
-                self.references_attachment = true;
-            }
             // If the user later recalls the running combined turn,
             // the instruction message is the most useful external id.
             if !params.message_id.is_empty() {
                 self.base.message_id = params.message_id.clone();
             }
-            self.prompted = false;
         }
         for att in params.attachments {
             if !self.attachments.iter().any(|a| a.id == att.id) {
                 self.attachments.push(att);
             }
-            self.prompted = false;
         }
     }
 
@@ -231,19 +232,23 @@ impl PendingInput {
         self.generation
     }
 
-    fn deadline(&self, cfg: &InputAssemblyConfig) -> Option<Duration> {
-        match (self.has_text(), self.has_attachments()) {
-            (true, true) => Some(cfg.text_debounce),
-            (false, true) if cfg.file_only_autorun => Some(cfg.attachment_wait),
-            (false, true) if !self.prompted => Some(cfg.attachment_wait),
-            (false, true) => Some(cfg.pending_expire),
-            (true, false) if self.references_attachment && !self.prompted => {
-                Some(cfg.referential_text_wait)
-            }
-            (true, false) if self.references_attachment => Some(cfg.pending_expire),
-            (true, false) => Some(cfg.text_debounce),
-            (false, false) => Some(cfg.text_debounce),
-        }
+    /// Delay before this buffer should be flushed to the engine.
+    /// Purely structural: a file-only buffer waits a little longer for a
+    /// trailing instruction to arrive; everything else uses the short
+    /// text debounce. The result is clamped by the remaining `hard_cap`
+    /// budget so a burst that never goes quiet still flushes on time.
+    /// No message content is inspected here.
+    fn deadline(&self, cfg: &InputAssemblyConfig) -> Duration {
+        let base = match (self.has_text(), self.has_attachments()) {
+            // File(s) with no instruction yet — give a short structural
+            // grace period for a trailing "帮我总结一下" to land.
+            (false, true) => cfg.attachment_wait,
+            // Text present (with or without files) or an empty message —
+            // just debounce the burst.
+            _ => cfg.text_debounce,
+        };
+        let cap_remaining = cfg.hard_cap.saturating_sub(self.first_seen.elapsed());
+        base.min(cap_remaining)
     }
 
     fn into_params(mut self) -> MessageReceivedParams {
@@ -296,17 +301,8 @@ impl InputAssembler {
             return AssemblyIngest::Ready(params);
         }
 
-        if is_submit_intent(&cleaned) {
-            if let Some(pending) = self.pending.remove(&key) {
-                return AssemblyIngest::Ready(pending.into_params());
-            }
-            return AssemblyIngest::Ready(params);
-        }
-
         let created = !self.pending.contains_key(&key);
-        let mut schedule = None;
-        let mut notice = None;
-        {
+        let (key, generation, delay) = {
             let pending = self
                 .pending
                 .entry(key.clone())
@@ -314,104 +310,30 @@ impl InputAssembler {
             if !created {
                 pending.merge(params);
             }
+            // Every new fragment reschedules the flush (debounce reset);
+            // the bumped generation invalidates the previous timer.
+            let generation = pending.bump_generation();
+            (key, generation, pending.deadline(&self.cfg))
+        };
 
-            let initial_file_only = created && pending.has_attachments() && !pending.has_text();
-            if let Some(delay) = pending.deadline(&self.cfg) {
-                let generation = pending.bump_generation();
-                schedule = Some((key.clone(), generation, delay));
-            }
-
-            if initial_file_only && !self.cfg.file_only_autorun {
-                notice = Some(AssemblyNotice {
-                    tenant_id: pending.base.tenant_id.clone(),
-                    chat_id: pending.base.chat_id.clone(),
-                    content: format!(
-                        "已收到{}。请继续发送处理要求；发送“开始处理”按默认方式处理，发送“取消”放弃。",
-                        attachment_names(&pending.attachments)
-                    ),
-                });
-            }
-        }
-
-        if let Some((key, generation, delay)) = schedule {
-            self.schedule(key, generation, delay);
-        }
-        if let Some(notice) = notice {
-            return AssemblyIngest::Notice(notice);
-        }
+        self.schedule(key, generation, delay);
         AssemblyIngest::Pending
     }
 
     fn on_timeout(&mut self, fired: AssemblyTimeout) -> AssemblyIngest {
-        let mut remove_pending = false;
-        let mut schedule = None;
-        let action = {
-            let Some(pending) = self.pending.get_mut(&fired.key) else {
-                return AssemblyIngest::Pending;
-            };
-            if pending.generation != fired.generation {
-                return AssemblyIngest::Pending;
-            }
-
-            if pending.has_attachments() && !pending.has_text() && !self.cfg.file_only_autorun {
-                if pending.prompted {
-                    remove_pending = true;
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content: "待处理文件已过期；如需处理请重新上传并说明要求。".to_string(),
-                    }))
-                } else {
-                    pending.prompted = true;
-                    let generation = pending.bump_generation();
-                    schedule = Some((fired.key.clone(), generation, self.cfg.pending_expire));
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content: format!(
-                            "{}还在等待处理要求。请补充说明，或发送“开始处理”按默认方式处理。",
-                            attachment_names(&pending.attachments)
-                        ),
-                    }))
-                }
-            } else if pending.references_attachment && !pending.has_attachments() {
-                if pending.prompted {
-                    remove_pending = true;
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content: "等待文件的请求已过期；如需处理请重新发送要求和文件。".to_string(),
-                    }))
-                } else {
-                    pending.prompted = true;
-                    let generation = pending.bump_generation();
-                    schedule = Some((fired.key.clone(), generation, self.cfg.pending_expire));
-                    Some(AssemblyIngest::Notice(AssemblyNotice {
-                        tenant_id: pending.base.tenant_id.clone(),
-                        chat_id: pending.base.chat_id.clone(),
-                        content:
-                            "还没收到要处理的文件。请上传文件，或发送“开始处理”按当前文字继续。"
-                                .to_string(),
-                    }))
-                }
-            } else {
-                None
-            }
-        };
-
-        if remove_pending {
-            self.pending.remove(&fired.key);
+        // A newer fragment arrived after this timer was scheduled: the
+        // generation no longer matches, so a fresh timer is already
+        // pending. Drop this stale fire.
+        match self.pending.get(&fired.key) {
+            Some(pending) if pending.generation == fired.generation => {}
+            _ => return AssemblyIngest::Pending,
         }
-        if let Some((key, generation, delay)) = schedule {
-            self.schedule(key, generation, delay);
-        }
-        if let Some(action) = action {
-            return action;
-        }
-
-        let Some(pending) = self.pending.remove(&fired.key) else {
-            return AssemblyIngest::Pending;
-        };
+        // The burst has gone quiet (or hit the hard cap). Deliver
+        // whatever accumulated — text, files, or both — and let the
+        // engine decide whether the request is answerable. The gateway
+        // never inspects content or emits its own "waiting for a file"
+        // notices.
+        let pending = self.pending.remove(&fired.key).expect("checked above");
         AssemblyIngest::Ready(pending.into_params())
     }
 
@@ -1306,107 +1228,12 @@ fn is_attachment_placeholder(text: &str) -> bool {
         || lower.starts_with("[uploaded image:")
 }
 
-fn references_attachment(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let explicit_needles = [
-        "附件",
-        "上传的文件",
-        "上传的文档",
-        "上传的图片",
-        "上传的表格",
-        "uploaded file",
-        "uploaded document",
-        "uploaded image",
-        "uploaded spreadsheet",
-        "attached file",
-        "attached document",
-        "attached image",
-        "attached spreadsheet",
-        "attachment",
-        "attachments",
-    ];
-    if explicit_needles.iter().any(|needle| lower.contains(needle)) {
-        return true;
-    }
-
-    let zh_refs = ["这个", "这份", "这张", "该", "上面的", "刚才的"];
-    let zh_objects = [
-        "文件", "文档", "图片", "表格", "pdf", "docx", "xlsx", "ppt", "csv", "excel",
-    ];
-    if zh_refs.iter().any(|r| {
-        zh_objects
-            .iter()
-            .any(|o| lower.contains(&format!("{r}{o}")) || lower.contains(&format!("{r} {o}")))
-    }) {
-        return true;
-    }
-
-    let en_refs = ["this", "that", "above", "previous", "attached"];
-    let en_objects = [
-        "file",
-        "document",
-        "image",
-        "spreadsheet",
-        "pdf",
-        "docx",
-        "xlsx",
-        "ppt",
-        "csv",
-        "excel",
-    ];
-    en_refs.iter().any(|r| {
-        en_objects
-            .iter()
-            .any(|o| lower.contains(&format!("{r} {o}")))
-    })
-}
-
 fn is_cancel_intent(text: &str) -> bool {
     let t = text.trim().to_ascii_lowercase();
     matches!(
         t.as_str(),
         "取消" | "不用了" | "不要了" | "算了" | "cancel" | "stop" | "never mind" | "nevermind"
     )
-}
-
-fn is_submit_intent(text: &str) -> bool {
-    let t = text.trim().to_ascii_lowercase();
-    matches!(
-        t.as_str(),
-        "开始"
-            | "开始处理"
-            | "处理"
-            | "直接处理"
-            | "就这样"
-            | "就这个"
-            | "可以了"
-            | "go"
-            | "start"
-            | "run"
-            | "process"
-            | "done"
-    )
-}
-
-fn attachment_names(attachments: &[Attachment]) -> String {
-    if attachments.is_empty() {
-        return "文件".to_string();
-    }
-    let names: Vec<&str> = attachments
-        .iter()
-        .map(|a| a.filename.as_str())
-        .filter(|s| !s.is_empty())
-        .take(3)
-        .collect();
-    match (names.len(), attachments.len()) {
-        (0, 1) => "1 个文件".to_string(),
-        (0, n) => format!("{n} 个文件"),
-        (_, 1) => format!("文件 `{}`", names[0]),
-        (_, n) if n > names.len() => {
-            format!("{} 个文件（{} 等）", n, names.join("、"))
-        }
-        _ => format!("{} 个文件（{}）", attachments.len(), names.join("、")),
-    }
 }
 
 fn attachment_summary(attachments: &[Attachment]) -> String {
@@ -1675,7 +1502,7 @@ fn cap_preview(text: &str) -> String {
 fn compose_user_text(params: &MessageReceivedParams, staged: &[StagedAttachment]) -> String {
     let body = clean_user_input(&params.content);
     if staged.is_empty() {
-        return body;
+        return prepend_turn_timestamp(&params.received_at, body);
     }
     let mut block = String::from("<attachments do-not-echo=\"true\">\n");
     let mut budget = ATTACHMENTS_BLOCK_CHARS;
@@ -1732,11 +1559,59 @@ fn compose_user_text(params: &MessageReceivedParams, staged: &[StagedAttachment]
     }
     block.push_str("</attachments>");
 
-    if body.is_empty() {
+    let composed = if body.is_empty() {
         block
     } else {
         format!("{body}\n\n{block}")
+    };
+    prepend_turn_timestamp(&params.received_at, composed)
+}
+
+/// Prefix the turn with a human-readable local timestamp derived from
+/// the IM `received_at`. Gives the model temporal awareness — so it can
+/// reason about a file the user sent "just now" and about cross-turn
+/// references like "刚才发的那份". Empty / unparseable stamps are skipped
+/// rather than guessed.
+fn prepend_turn_timestamp(received_at: &str, body: String) -> String {
+    match format_turn_timestamp(received_at) {
+        Some(ts) if body.is_empty() => ts,
+        Some(ts) => format!("{ts} {body}"),
+        None => body,
     }
+}
+
+/// Format an IM `received_at` into a bracketed local-time label like
+/// `[2026-05-06 16:00:00]`. Accepts RFC3339 (the Lark plugin's format)
+/// and a bare epoch in seconds or milliseconds. Returns `None` when the
+/// value is empty or cannot be interpreted.
+fn format_turn_timestamp(received_at: &str) -> Option<String> {
+    let trimmed = received_at.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(
+            dt.with_timezone(&chrono::Local)
+                .format("[%Y-%m-%d %H:%M:%S]")
+                .to_string(),
+        );
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        // 13+ digits ⇒ milliseconds; otherwise seconds.
+        let (secs, nsecs) = if trimmed.len() >= 13 {
+            (n / 1000, ((n % 1000) * 1_000_000) as u32)
+        } else {
+            (n, 0)
+        };
+        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+            return Some(
+                dt.with_timezone(&chrono::Local)
+                    .format("[%Y-%m-%d %H:%M:%S]")
+                    .to_string(),
+            );
+        }
+    }
+    None
 }
 
 fn escape_fence_text(input: &str) -> String {
@@ -1857,9 +1732,7 @@ mod tests {
             enabled: true,
             text_debounce: Duration::from_secs(60),
             attachment_wait: Duration::from_secs(60),
-            referential_text_wait: Duration::from_secs(60),
-            pending_expire: Duration::from_secs(60),
-            file_only_autorun: false,
+            hard_cap: Duration::from_secs(60),
         })
     }
 
@@ -1936,8 +1809,9 @@ mod tests {
             vec![dummy_attachment("att-1", "spec.md")],
         );
         let key = assembly_key(&file);
-        let notice = unwrap_notice(asm.ingest(file));
-        assert!(notice.content.contains("spec.md"));
+        // A file with no instruction is buffered silently — no gateway
+        // "已收到文件…" prompt anymore.
+        assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
         assert_eq!(asm.pending.len(), 1);
 
         let text = dummy_params_with("c1", "u1", "m-text", "请总结重点", vec![]);
@@ -1985,7 +1859,7 @@ mod tests {
             vec![dummy_attachment("att-a", "a.md")],
         );
         let key = assembly_key(&file_a);
-        let _ = unwrap_notice(asm.ingest(file_a));
+        assert!(matches!(asm.ingest(file_a), AssemblyIngest::Pending));
 
         let file_b = dummy_params_with(
             "c1",
@@ -2026,67 +1900,12 @@ mod tests {
         assert_eq!(ready.message_id, "m2");
     }
 
-    #[test]
-    fn references_attachment_requires_specific_file_terms() {
-        assert!(references_attachment("帮我总结这个文件"));
-        assert!(references_attachment("看一下这个 PDF"));
-        assert!(references_attachment("please review the attachment"));
-        assert!(references_attachment("please review the uploaded file"));
-        assert!(!references_attachment("先看这个问题"));
-        assert!(!references_attachment("这些点再补充一下"));
-        assert!(!references_attachment("列出当前目录有哪些文件"));
-        assert!(!references_attachment(
-            "Use the LS tool to list files in the project workspace"
-        ));
-    }
-
     #[tokio::test]
-    async fn assembler_file_only_timeout_prompts_without_running() {
+    async fn assembler_file_only_delivers_after_timeout_without_prompt() {
+        // A file with no instruction is delivered as-is once the grace
+        // window elapses — the model decides what to do / asks. The
+        // gateway never emits a "waiting for instructions" notice.
         let (mut asm, _rx) = test_assembler();
-        let file = dummy_params_with(
-            "c1",
-            "u1",
-            "m-file",
-            "[uploaded file: report.pdf]",
-            vec![dummy_attachment("att-1", "report.pdf")],
-        );
-        let key = assembly_key(&file);
-        let _ = unwrap_notice(asm.ingest(file));
-
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-        assert!(notice.content.contains("等待处理要求"));
-        assert!(asm.pending.contains_key(&key));
-    }
-
-    #[tokio::test]
-    async fn assembler_file_only_expires_after_second_timeout() {
-        let (mut asm, _rx) = test_assembler();
-        let file = dummy_params_with(
-            "c1",
-            "u1",
-            "m-file",
-            "[uploaded file: report.pdf]",
-            vec![dummy_attachment("att-1", "report.pdf")],
-        );
-        let key = assembly_key(&file);
-        let _ = unwrap_notice(asm.ingest(file));
-        let _ = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-        assert!(notice.content.contains("已过期"));
-        assert!(!asm.pending.contains_key(&key));
-    }
-
-    #[tokio::test]
-    async fn assembler_file_only_autorun_submits_after_timeout() {
-        let (mut asm, _rx) = test_assembler_with(InputAssemblyConfig {
-            enabled: true,
-            text_debounce: Duration::from_secs(60),
-            attachment_wait: Duration::from_secs(60),
-            referential_text_wait: Duration::from_secs(60),
-            pending_expire: Duration::from_secs(60),
-            file_only_autorun: true,
-        });
         let file = dummy_params_with(
             "c1",
             "u1",
@@ -2098,57 +1917,48 @@ mod tests {
         assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
 
         let ready = unwrap_ready(asm.on_timeout(current_timeout(&asm, key)));
+        // File-only turns fall back to the attachment summary as the body.
         assert!(ready.content.contains("用户上传了以下文件"));
         assert_eq!(ready.attachments.len(), 1);
         assert!(asm.pending.is_empty());
     }
 
     #[tokio::test]
-    async fn assembler_submit_runs_file_only_pending_turn() {
-        let (mut asm, _rx) = test_assembler();
-        let file = dummy_params_with(
-            "c1",
-            "u1",
-            "m-file",
-            "[uploaded file: report.pdf]",
-            vec![dummy_attachment("att-1", "report.pdf")],
-        );
-        let _ = unwrap_notice(asm.ingest(file));
-
-        let submit = dummy_params_with("c1", "u1", "m-submit", "开始处理", vec![]);
-        let ready = unwrap_ready(asm.ingest(submit));
-        assert!(ready.content.contains("用户上传了以下文件"));
-        assert_eq!(ready.attachments.len(), 1);
-        assert!(asm.pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn assembler_submit_runs_referential_text_without_file() {
+    async fn assembler_text_only_delivers_without_waiting_for_a_file() {
+        // "总结这个文件" with no attachment must NOT trap waiting for a
+        // file — it debounces like any other text and is delivered so the
+        // engine can answer (the doc may already be in memory/history).
         let (mut asm, _rx) = test_assembler();
         let text = dummy_params_with("c1", "u1", "m-text", "帮我总结这个文件", vec![]);
         let key = assembly_key(&text);
         assert!(matches!(asm.ingest(text), AssemblyIngest::Pending));
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key)));
-        assert!(notice.content.contains("还没收到"));
 
-        let submit = dummy_params_with("c1", "u1", "m-submit", "开始处理", vec![]);
-        let ready = unwrap_ready(asm.ingest(submit));
+        let ready = unwrap_ready(asm.on_timeout(current_timeout(&asm, key)));
         assert_eq!(ready.content, "帮我总结这个文件");
         assert!(ready.attachments.is_empty());
         assert!(asm.pending.is_empty());
     }
 
     #[tokio::test]
-    async fn assembler_referential_text_expires_after_second_timeout() {
-        let (mut asm, _rx) = test_assembler();
-        let text = dummy_params_with("c1", "u1", "m-text", "帮我总结这个文件", vec![]);
+    async fn assembler_hard_cap_forces_flush_on_a_never_quiet_stream() {
+        // With a zero hard cap, deadline() clamps to 0 so the very next
+        // timeout fires immediately regardless of the debounce window —
+        // a chat can never wedge on input that never settles.
+        let (mut asm, _rx) = test_assembler_with(InputAssemblyConfig {
+            enabled: true,
+            text_debounce: Duration::from_secs(600),
+            attachment_wait: Duration::from_secs(600),
+            hard_cap: Duration::from_secs(0),
+        });
+        let text = dummy_params_with("c1", "u1", "m-text", "一直在打字", vec![]);
         let key = assembly_key(&text);
         assert!(matches!(asm.ingest(text), AssemblyIngest::Pending));
-        let _ = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-
-        let notice = unwrap_notice(asm.on_timeout(current_timeout(&asm, key.clone())));
-        assert!(notice.content.contains("已过期"));
-        assert!(!asm.pending.contains_key(&key));
+        assert_eq!(
+            asm.pending.get(&key).unwrap().deadline(&asm.cfg),
+            Duration::from_secs(0)
+        );
+        let ready = unwrap_ready(asm.on_timeout(current_timeout(&asm, key)));
+        assert_eq!(ready.content, "一直在打字");
     }
 
     #[tokio::test]
@@ -2162,7 +1972,7 @@ mod tests {
             vec![dummy_attachment("att-1", "report.pdf")],
         );
         let key = assembly_key(&file);
-        let _ = unwrap_notice(asm.ingest(file));
+        assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
 
         let cancel = dummy_params_with("c1", "u1", "m-cancel", "取消", vec![]);
         let notice = unwrap_notice(asm.ingest(cancel));
@@ -2184,7 +1994,7 @@ mod tests {
             "[uploaded file: report.pdf]",
             vec![dummy_attachment("att-1", "report.pdf")],
         );
-        let _ = unwrap_notice(asm.ingest(file));
+        assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
 
         let cmd = dummy_params_with("c1", "u1", "m-cmd", "/snaca status", vec![]);
         let ready = unwrap_ready(asm.ingest(cmd));
@@ -2198,9 +2008,7 @@ mod tests {
             enabled: false,
             text_debounce: Duration::from_secs(60),
             attachment_wait: Duration::from_secs(60),
-            referential_text_wait: Duration::from_secs(60),
-            pending_expire: Duration::from_secs(60),
-            file_only_autorun: false,
+            hard_cap: Duration::from_secs(60),
         });
         let file = dummy_params_with(
             "c1",
@@ -2245,7 +2053,7 @@ mod tests {
             "[uploaded file: alice.md]",
             vec![dummy_attachment("att-1", "alice.md")],
         );
-        let _ = unwrap_notice(asm.ingest(file));
+        assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
 
         let bob = dummy_params_with("group", "bob", "m-bob", "正常问答", vec![]);
         let bob_key = assembly_key(&bob);
@@ -2270,7 +2078,7 @@ mod tests {
             Some("thread-root"),
         );
         let root_key = assembly_key(&root_file);
-        let _ = unwrap_notice(asm.ingest(root_file));
+        assert!(matches!(asm.ingest(root_file), AssemblyIngest::Pending));
 
         let other_text =
             dummy_params_with_reply_to("c1", "u1", "m-other", "普通问答", vec![], Some("thread-2"));
@@ -2293,7 +2101,7 @@ mod tests {
             "[uploaded file: report.pdf]",
             vec![dummy_attachment("att-1", "report.pdf")],
         );
-        let _ = unwrap_notice(asm.ingest(file));
+        assert!(matches!(asm.ingest(file), AssemblyIngest::Pending));
         let recalled = MessageRecalledParams {
             auth: String::new(),
             tenant_id: "tenant".into(),
@@ -2304,6 +2112,20 @@ mod tests {
         };
         assert!(asm.recall(&recalled));
         assert!(asm.pending.is_empty());
+    }
+
+    #[test]
+    fn turn_timestamp_prefixes_rfc3339_and_skips_unparseable() {
+        // RFC3339 (the Lark plugin's format) → bracketed local-time prefix.
+        let out = prepend_turn_timestamp("2026-05-06T08:00:00Z", "总结这个文件".to_string());
+        assert!(out.starts_with('['), "timestamp prefixed: {out}");
+        assert!(out.contains("2026-"), "date rendered: {out}");
+        assert!(out.ends_with("总结这个文件"), "body preserved: {out}");
+        // Bare epoch seconds are also accepted.
+        assert!(prepend_turn_timestamp("1746518400", "hi".to_string()).starts_with('['));
+        // Empty / unparseable stamps leave the body untouched.
+        assert_eq!(prepend_turn_timestamp("", "hi".to_string()), "hi");
+        assert_eq!(prepend_turn_timestamp("not-a-date", "hi".to_string()), "hi");
     }
 
     #[tokio::test]

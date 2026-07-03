@@ -486,22 +486,12 @@ fn build_input_assembly_config(config: &Config) -> InputAssemblyConfig {
             .filter(|s| *s > 0)
             .map(Duration::from_secs)
             .unwrap_or(defaults.attachment_wait),
-        referential_text_wait: config
+        hard_cap: config
             .im_input
-            .referential_text_wait_secs
+            .hard_cap_secs
             .filter(|s| *s > 0)
             .map(Duration::from_secs)
-            .unwrap_or(defaults.referential_text_wait),
-        pending_expire: config
-            .im_input
-            .pending_expire_secs
-            .filter(|s| *s > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(defaults.pending_expire),
-        file_only_autorun: config
-            .im_input
-            .file_only_autorun
-            .unwrap_or(defaults.file_only_autorun),
+            .unwrap_or(defaults.hard_cap),
     }
 }
 
@@ -659,10 +649,8 @@ impl ConfigSnapshot {
             "im_input": {
                 "assembly_enabled": cfg.im_input.assembly_enabled.unwrap_or(true),
                 "text_debounce_ms": cfg.im_input.text_debounce_ms.unwrap_or(1500),
-                "attachment_wait_secs": cfg.im_input.attachment_wait_secs.unwrap_or(90),
-                "referential_text_wait_secs": cfg.im_input.referential_text_wait_secs.unwrap_or(45),
-                "pending_expire_secs": cfg.im_input.pending_expire_secs.unwrap_or(300),
-                "file_only_autorun": cfg.im_input.file_only_autorun.unwrap_or(false),
+                "attachment_wait_secs": cfg.im_input.attachment_wait_secs.unwrap_or(8),
+                "hard_cap_secs": cfg.im_input.hard_cap_secs.unwrap_or(30),
             },
             "plugins": plugins_json,
             "mcp": mcp_json,
