@@ -1194,6 +1194,7 @@ impl Engine {
                 live_msgs,
                 self.config.history_max_bytes,
                 self.config.compact_keep_recent,
+                self.config.max_tool_result_bytes,
             );
             // Collapse old read-only tool_results so the model
             // doesn't re-pay token budget for stale Read/Grep
@@ -1238,6 +1239,7 @@ impl Engine {
             windowed,
             self.config.history_max_bytes,
             self.config.compact_keep_recent,
+            self.config.max_tool_result_bytes,
         );
         // Pairing repair is deferred to the request boundary
         // (`ensure_tool_result_pairing` in `call_llm_and_prerun`).
@@ -1643,7 +1645,11 @@ impl Engine {
             .collect();
         let body_collapsed =
             collapse_old_tool_results(body_msgs, 0, self.config.collapse_tool_results_threshold);
-        let body_text = render_for_summary(&body_collapsed);
+        // Cap each block so a large error / Bash / write body (which
+        // collapse leaves verbatim) can't blow the summary request — the
+        // request meant to rescue an over-long context. 16 KiB/block is
+        // ample for a gist and keeps the input bounded across the band.
+        let body_text = render_for_summary(&body_collapsed, SUMMARY_BLOCK_MAX_BYTES);
         let body_count = body_rows.len();
 
         // Build a single-shot summarization request. We deliberately
@@ -2209,7 +2215,12 @@ impl Engine {
                 prebuilt,
             )
             .await;
-        match outcome {
+        // Cap every result path at capture time (layer ① of the
+        // oversized-result defence): a single tool output that exceeds
+        // `max_tool_result_bytes` is truncated to a head+tail preview
+        // before it is ever persisted, so it can neither blow the model
+        // context on load nor blow the compaction-summary request.
+        let mut result = match outcome {
             Ok(Ok(out)) => {
                 // Block-list outputs (Read on .pdf / image /
                 // notebook) pass through straight as ToolResult
@@ -2256,7 +2267,9 @@ impl Engine {
                     }),
                 }
             }
-        }
+        };
+        result.block = cap_tool_result_block(result.block, self.config.max_tool_result_bytes);
+        result
     }
 
     /// Decide whether `tool` may run for this `(tenant, project)` and
@@ -3000,6 +3013,11 @@ fn collapse_block_if_old_read(
 /// intact — only the payload is elided.
 const BYTE_CAP_CLEARED_MARKER: &str = "[Old tool result content cleared to fit context budget]";
 
+/// Per-block byte cap when rendering the compaction-summary input
+/// (`render_for_summary`). Bounds each message's contribution so the
+/// summariser request can't itself overflow the context window.
+const SUMMARY_BLOCK_MAX_BYTES: usize = 16 * 1024;
+
 /// Byte size of a `tool_result` body's text blocks — the portion the byte
 /// cap can elide. Mirrors how `message_byte_size` counts a `ToolResult`.
 fn tool_result_text_len(content: &[ContentBlock]) -> usize {
@@ -3010,6 +3028,78 @@ fn tool_result_text_len(content: &[ContentBlock]) -> usize {
             _ => 0,
         })
         .sum()
+}
+
+/// Largest byte prefix of `s` that ends on a UTF-8 char boundary and is
+/// `<= max`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Truncate a `tool_result`'s text to a head+tail preview when it exceeds
+/// `max` bytes, keeping non-text blocks (images) intact. Layer ① of the
+/// oversized-result defence — applied at capture time so no single result
+/// can dominate the model context or the compaction-summary request.
+/// `max == 0` disables it.
+fn cap_tool_result_content(content: Vec<ContentBlock>, max: usize) -> Vec<ContentBlock> {
+    if max == 0 || tool_result_text_len(&content) <= max {
+        return content;
+    }
+    // Split text from non-text (image) blocks; concatenate the text so a
+    // body spread across several text blocks is capped as a whole.
+    let mut text = String::new();
+    let mut others: Vec<ContentBlock> = Vec::new();
+    for b in content {
+        match b {
+            ContentBlock::Text { text: t } => text.push_str(&t),
+            other => others.push(other),
+        }
+    }
+    // Keep a head and a tail so both the start of the output and any
+    // trailing error/summary survive.
+    let half = (max / 2).max(1);
+    let head_end = floor_char_boundary(&text, half);
+    let mut tail_start = text.len().saturating_sub(half);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // Guard against overlap when head and tail would meet.
+    let tail_start = tail_start.max(head_end);
+    let dropped = tail_start.saturating_sub(head_end);
+    let preview = format!(
+        "{}\n\n[... {dropped} bytes truncated to fit the context window; \
+         re-run the tool if the full output is needed ...]\n\n{}",
+        &text[..head_end],
+        &text[tail_start..],
+    );
+    let mut out = Vec::with_capacity(others.len() + 1);
+    out.push(ContentBlock::text(preview));
+    out.extend(others);
+    out
+}
+
+/// Apply `cap_tool_result_content` to a `ToolResult` block, preserving its
+/// `tool_use_id` and `is_error`. Non-result blocks pass through.
+fn cap_tool_result_block(block: ContentBlock, max: usize) -> ContentBlock {
+    match block {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => ContentBlock::ToolResult {
+            tool_use_id,
+            content: cap_tool_result_content(content, max),
+            is_error,
+        },
+        other => other,
+    }
 }
 
 /// Bring `messages` under `max_bytes` while keeping the wire format
@@ -3028,14 +3118,41 @@ fn tool_result_text_len(content: &[ContentBlock]) -> usize {
 /// creates is repaired by `ensure_tool_result_pairing` at the request
 /// boundary; a leading `Role::Tool` left at the new head is stripped here
 /// so the fallback alone never emits a leading tool message.
+///
+/// Layer ③ (`per_result_max`): before the total-cap phases, clamp *any*
+/// single `tool_result` body larger than `per_result_max` to a head+tail
+/// preview — even one inside the protected `keep_recent` tail. A single
+/// oversized recent result (a legacy row from before the capture-time cap,
+/// or one written by another path) would otherwise dominate the window
+/// while Phase A's `keep_recent` protection deliberately skips it. `0`
+/// disables this clamp.
 pub(crate) fn enforce_history_byte_cap(
     mut messages: Vec<Message>,
     max_bytes: usize,
     keep_recent: usize,
+    per_result_max: usize,
 ) -> Vec<Message> {
     if max_bytes == 0 || messages.is_empty() {
         return messages;
     }
+
+    // Layer ③: retroactively clamp oversized individual results anywhere
+    // in the window (including the recent tail) to a preview.
+    if per_result_max > 0 {
+        for msg in messages.iter_mut() {
+            if !matches!(msg.role, Role::Tool) {
+                continue;
+            }
+            for block in msg.content.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if tool_result_text_len(content) > per_result_max {
+                        *content = cap_tool_result_content(std::mem::take(content), per_result_max);
+                    }
+                }
+            }
+        }
+    }
+
     let mut total = messages_byte_size(&messages);
 
     // Phase A: clear old tool_result bodies (only when over cap).
@@ -3489,7 +3606,24 @@ fn synthetic_tool_errors(
 /// Takes `&[Message]` rather than the raw `MessageRow` so callers can
 /// pre-run `collapse_old_tool_results` against the input — both paths
 /// (compaction summary, live load) get the same view.
-fn render_for_summary(rows: &[Message]) -> String {
+///
+/// Every block's text is capped at `max_block_bytes` (layer ② of the
+/// oversized-result defence). `collapse_old_tool_results` only shrinks
+/// *read-only, non-error* results, so a large Bash / write / error body
+/// would otherwise reach here in full and blow the summary request itself
+/// — the request that is supposed to *rescue* an over-long context.
+/// Capping per block keeps the summariser input bounded regardless of
+/// tool type or error status.
+fn render_for_summary(rows: &[Message], max_block_bytes: usize) -> String {
+    // Push `s`, truncated on a char boundary to `max_block_bytes`, with a
+    // short note when anything was dropped.
+    fn push_capped(out: &mut String, s: &str, max: usize) {
+        let end = floor_char_boundary(s, max);
+        out.push_str(&s[..end]);
+        if end < s.len() {
+            out.push_str(&format!("[…{} bytes truncated…]", s.len() - end));
+        }
+    }
     let mut out = String::new();
     for r in rows {
         let label = match r.role {
@@ -3502,17 +3636,16 @@ fn render_for_summary(rows: &[Message]) -> String {
         out.push_str(": ");
         for block in &r.content {
             match block {
-                ContentBlock::Text { text } => out.push_str(text),
+                ContentBlock::Text { text } => push_capped(&mut out, text, max_block_bytes),
                 ContentBlock::Thinking { text, .. } => {
                     out.push_str("[thinking] ");
-                    out.push_str(text);
+                    push_capped(&mut out, text, max_block_bytes);
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
-                    out.push_str(&format!(
-                        "[called tool {} with {}]",
-                        name,
-                        serde_json::to_string(input).unwrap_or_default()
-                    ));
+                    let input = serde_json::to_string(input).unwrap_or_default();
+                    out.push_str(&format!("[called tool {name} with "));
+                    push_capped(&mut out, &input, max_block_bytes);
+                    out.push(']');
                 }
                 ContentBlock::ToolResult {
                     content, is_error, ..
@@ -3524,11 +3657,14 @@ fn render_for_summary(rows: &[Message]) -> String {
                     };
                     out.push_str(prefix);
                     out.push(' ');
-                    for inner in content {
-                        if let ContentBlock::Text { text } = inner {
-                            out.push_str(text);
-                        }
-                    }
+                    let body: String = content
+                        .iter()
+                        .filter_map(|inner| match inner {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    push_capped(&mut out, &body, max_block_bytes);
                 }
                 ContentBlock::Image { .. } => out.push_str("[image]"),
             }
@@ -4022,7 +4158,7 @@ mod history_window_tests {
             a_call("c2", "Read"),
             tr("c2", "recent"),
         ];
-        let out = enforce_history_byte_cap(msgs, 2000, 2);
+        let out = enforce_history_byte_cap(msgs, 2000, 2, 0);
         assert_eq!(out.len(), 6, "no message dropped — content cleared instead");
         assert!(messages_byte_size(&out) <= 2000, "under cap after clearing");
         // c1 body elided to the marker, block + id intact.
@@ -4045,7 +4181,7 @@ mod history_window_tests {
         // Phase B drops leading messages.
         let big = "x".repeat(5000);
         let msgs = vec![u(&big), a("small"), u("q2"), a("keep")];
-        let out = enforce_history_byte_cap(msgs, 300, 1);
+        let out = enforce_history_byte_cap(msgs, 300, 1, 0);
         assert!(out.len() < 4, "leading messages dropped");
         assert!(has_text(&out, "keep"), "recent turn survives");
         assert!(!matches!(out[0].role, Role::Tool), "no leading orphan tool");
@@ -4118,12 +4254,110 @@ mod history_window_tests {
         // never returns a history that begins with an unattached tool
         // message.
         let msgs = vec![tr("c1", "orphan"), a("b"), u("c")];
-        let out = enforce_history_byte_cap(msgs, 10_000_000, 6);
+        let out = enforce_history_byte_cap(msgs, 10_000_000, 6, 0);
         assert!(
             !matches!(out[0].role, Role::Tool),
             "leading orphan tool stripped"
         );
         assert_eq!(out.len(), 2);
+    }
+
+    // ---- oversized-tool-result defence (layers ①/②/③) ----
+
+    fn result_body_text(block: &ContentBlock) -> String {
+        match block {
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn cap_tool_result_truncates_oversized_body_keeps_id() {
+        // Layer ①: a huge body is truncated to a head+tail preview while
+        // the tool_use_id and is_error survive (so pairing is intact).
+        let big = "x".repeat(500_000);
+        let block = ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text(&big)]);
+        let capped = cap_tool_result_block(block, 100_000);
+        match &capped {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id.as_str(), "c1");
+                let len = tool_result_text_len(content);
+                assert!(len <= 100_000 + 256, "truncated to ~max, got {len}");
+                assert!(result_body_text(&capped).contains("bytes truncated"));
+            }
+            _ => panic!("expected tool_result"),
+        }
+    }
+
+    #[test]
+    fn cap_tool_result_noop_when_small_or_disabled() {
+        let block =
+            ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("small")]);
+        assert_eq!(cap_tool_result_block(block.clone(), 100_000), block);
+        // max == 0 disables the cap entirely.
+        let big = ContentBlock::tool_result(
+            ToolUseId::new("c1"),
+            vec![ContentBlock::text("x".repeat(50_000))],
+        );
+        assert_eq!(cap_tool_result_block(big.clone(), 0), big);
+    }
+
+    #[test]
+    fn render_for_summary_caps_each_block() {
+        // Layer ②: a large tool_error body (which collapse never shrinks)
+        // must not blow the summary render.
+        let big_err = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_error(
+                ToolUseId::new("c1"),
+                "x".repeat(500_000),
+            )],
+        );
+        let rendered = render_for_summary(&[big_err], 16 * 1024);
+        assert!(
+            rendered.len() < 40_000,
+            "render bounded, got {}",
+            rendered.len()
+        );
+        assert!(rendered.contains("truncated"));
+    }
+
+    #[test]
+    fn byte_cap_clamps_oversized_result_in_recent_tail() {
+        // Layer ③ (the production incident shape): the newest tool result
+        // is 1 MB and sits inside the protected keep_recent tail, so Phase
+        // A skips it — but per_result_max must still clamp it to a preview.
+        let big = "x".repeat(1_000_000);
+        let msgs = vec![
+            u("q"),
+            a_call("c1", "Bash"),
+            Message::new(
+                Role::Tool,
+                vec![ContentBlock::tool_result(
+                    ToolUseId::new("c1"),
+                    vec![ContentBlock::text(&big)],
+                )],
+            ),
+        ];
+        let out = enforce_history_byte_cap(msgs, 1_500_000, 6, 200 * 1024);
+        let tool_msg = out.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
+        let len = tool_result_text_len(&tool_msg.content);
+        assert!(
+            len <= 200 * 1024 + 256,
+            "recent oversized result clamped, got {len}"
+        );
+        // tool_use_id preserved → still answers c1.
+        assert_eq!(answered_ids(tool_msg), vec!["c1".to_string()]);
     }
 }
 

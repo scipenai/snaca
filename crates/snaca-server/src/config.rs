@@ -409,6 +409,15 @@ pub struct EngineSection {
     #[serde(default)]
     pub collapse_tool_results_threshold: Option<usize>,
 
+    /// Hard per-tool-result byte ceiling applied at capture time. A
+    /// single tool output larger than this (a Bash dump, an error with
+    /// a multi-MB stdout tail) is truncated to a head+tail preview
+    /// before being persisted, so it can't blow the model context on
+    /// load or the compaction-summary request. Default 200 KiB. Set to
+    /// 0 to disable.
+    #[serde(default)]
+    pub max_tool_result_bytes: Option<usize>,
+
     /// Pre-execute read-only no-approval tool calls in parallel with
     /// the LLM response stream. Default `true`. Set to `false` to
     /// fall back to fully-sequential post-stream execution (useful
