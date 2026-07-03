@@ -3871,7 +3871,9 @@ mod history_window_tests {
         m.content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str().to_string()),
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    Some(tool_use_id.as_str().to_string())
+                }
                 _ => None,
             })
             .collect()
@@ -3931,7 +3933,10 @@ mod history_window_tests {
                 }
                 Role::Tool => {
                     for id in answered_ids(m) {
-                        assert!(seen.contains(&id), "tool_result {id} answers no prior tool_use");
+                        assert!(
+                            seen.contains(&id),
+                            "tool_result {id} answers no prior tool_use"
+                        );
                     }
                 }
                 _ => {}
@@ -3966,7 +3971,10 @@ mod history_window_tests {
         assert!(matches!(out[idx + 1].role, Role::Tool));
         let ans = answered_ids(&out[idx + 1]);
         assert!(ans.contains(&"c1".to_string()) && ans.contains(&"c2".to_string()));
-        assert!(matches!(out[idx + 2].role, Role::User), "summary preserved after synth");
+        assert!(
+            matches!(out[idx + 2].role, Role::User),
+            "summary preserved after synth"
+        );
     }
 
     #[test]
@@ -3996,7 +4004,11 @@ mod history_window_tests {
             ],
         );
         let out = ensure_tool_result_pairing(vec![u("q"), a_call("c1", "Read"), tool_msg]);
-        assert_eq!(answered_ids(&out[2]), vec!["c1".to_string()], "duplicate c1 dropped");
+        assert_eq!(
+            answered_ids(&out[2]),
+            vec!["c1".to_string()],
+            "duplicate c1 dropped"
+        );
     }
 
     #[test]
@@ -4107,7 +4119,10 @@ mod history_window_tests {
         // message.
         let msgs = vec![tr("c1", "orphan"), a("b"), u("c")];
         let out = enforce_history_byte_cap(msgs, 10_000_000, 6);
-        assert!(!matches!(out[0].role, Role::Tool), "leading orphan tool stripped");
+        assert!(
+            !matches!(out[0].role, Role::Tool),
+            "leading orphan tool stripped"
+        );
         assert_eq!(out.len(), 2);
     }
 }
