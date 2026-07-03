@@ -191,7 +191,7 @@ impl Runtime {
                 .unwrap_or_else(|| EngineConfig::default_for(&config.llm.model).system_prompt),
             max_iterations: config.engine.max_iterations.unwrap_or(10),
             max_tokens: config.engine.max_tokens.or(Some(4096)),
-            history_limit: config.engine.history_limit.unwrap_or(50),
+            conversation_history_limit: config.engine.conversation_history_limit.unwrap_or(30),
             // Treat `Some(0)` as "explicitly disabled" — same as `None`. Any
             // positive value enables auto-compaction at that threshold.
             compact_after_input_tokens: config.engine.compact_after_input_tokens.filter(|t| *t > 0),
@@ -641,7 +641,7 @@ impl ConfigSnapshot {
             },
             "engine": {
                 "max_iterations": cfg.engine.max_iterations,
-                "history_limit": cfg.engine.history_limit,
+                "conversation_history_limit": cfg.engine.conversation_history_limit,
                 "compact_after_input_tokens": cfg.engine.compact_after_input_tokens,
                 "memory_extractor": cfg.engine.memory_extractor.unwrap_or(true),
                 "memory_write_approval": cfg.engine.memory_write_approval.unwrap_or(false),

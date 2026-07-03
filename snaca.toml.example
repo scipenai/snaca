@@ -90,8 +90,12 @@ model = "deepseek-chat"
 # Cap on response tokens per round. Default 4096.
 # max_tokens = 4096
 
-# Number of recent messages loaded into the prompt. Default 50.
-# history_limit = 50
+# Size of the loaded history window, counted in CONVERSATIONAL
+# (user + assistant) messages. Huge Role::Tool results (file extraction,
+# Bash dumps) do NOT consume this budget, so they can't evict the user's
+# earlier goals/uploaded-file references the way a flat last-N-rows
+# window would. Default 30. (The older `history_limit` key is ignored.)
+# conversation_history_limit = 30
 
 # Compaction folds older history into a single rolling summary so the
 # context window doesn't grow unbounded across turns.

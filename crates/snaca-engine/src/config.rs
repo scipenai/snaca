@@ -15,13 +15,18 @@ pub struct EngineConfig {
     /// Cap on response tokens (forwarded to provider). `None` = use provider default.
     pub max_tokens: Option<u32>,
 
-    /// How many recent messages to load from the DB when building the
-    /// initial prompt. The user message just appended is included.
-    pub history_limit: u32,
+    /// Size of the loaded history window, counted in *conversational*
+    /// (`User` + `Assistant`) messages. The window is sized by a
+    /// whole-prefix cut on this count, so a flurry of huge `Role::Tool`
+    /// results (file extraction, Bash dumps) does NOT consume the budget
+    /// and evict the user's earlier goals/files the way a flat
+    /// last-N-rows window would. The just-appended user message is
+    /// included.
+    pub conversation_history_limit: u32,
 
     /// Compact the thread once a single turn's *input* token count
     /// exceeds this threshold. `None` disables auto-compaction (the
-    /// engine still respects `history_limit` truncation). Set this well
+    /// engine still respects `conversation_history_limit` truncation). Set this well
     /// below the model's context window — leave headroom for the
     /// system prompt, tool schemas, and the next user turn. Default
     /// `None` keeps M1 behaviour; the server wires a real value (~12k)
@@ -200,7 +205,7 @@ impl EngineConfig {
             system_prompt: default_system_prompt(),
             max_iterations: 10,
             max_tokens: Some(4096),
-            history_limit: 50,
+            conversation_history_limit: 30,
             compact_after_input_tokens: None,
             compact_keep_recent: 6,
             protect_first_n: 4,

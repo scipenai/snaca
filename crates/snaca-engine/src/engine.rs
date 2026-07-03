@@ -1157,7 +1157,7 @@ impl Engine {
                 .messages_after(
                     thread_id,
                     &comp.summary_until_message_id,
-                    self.config.history_limit,
+                    self.config.conversation_history_limit,
                 )
                 .await?;
             let mut out = Vec::with_capacity(head.len() + live.len() + 1);
@@ -1205,10 +1205,13 @@ impl Engine {
             out.extend(collapsed);
             return Ok(out);
         }
-        let rows = self
-            .state
-            .recent_messages(thread_id, self.config.history_limit)
-            .await?;
+        // Dual window: pull a generous candidate pool of raw rows, then
+        // size the kept window by *conversational* (User+Assistant)
+        // message count via a whole-prefix cut, so a couple of huge
+        // Role::Tool dumps can't evict the user's earlier goals/files
+        // the way a flat last-N-rows window does.
+        let pool_limit = self.config.conversation_history_limit.saturating_mul(4);
+        let rows = self.state.recent_messages(thread_id, pool_limit).await?;
         let messages: Vec<Message> = rows
             .into_iter()
             .map(|r| Message {
@@ -1218,7 +1221,9 @@ impl Engine {
                 created_at: r.created_at,
             })
             .collect();
-        let bounded = enforce_history_byte_cap(messages, self.config.history_max_bytes);
+        let windowed =
+            trim_to_conversation_window(messages, self.config.conversation_history_limit as usize);
+        let bounded = enforce_history_byte_cap(windowed, self.config.history_max_bytes);
         let repaired = repair_orphan_tool_uses(bounded);
         Ok(collapse_old_tool_results(
             repaired,
@@ -1239,10 +1244,10 @@ impl Engine {
         let state = self.state.clone();
         let workspace = self.workspace.clone();
         let memory_provider = self.memory_provider.clone();
-        // Pull *all* recent messages from the thread the worker can
-        // see — same window the engine uses for retrieval, so the
-        // extractor sees the same context the LLM did.
-        let history_limit = self.config.history_limit;
+        // Pull recent messages from the thread the worker can see. Use
+        // the conversational window's raw-row pool so the extractor sees
+        // roughly the same context the LLM did.
+        let pool_limit = self.config.conversation_history_limit.saturating_mul(4);
         // Per-project serial lock so two concurrent extractor tasks on
         // the same project don't trample each other's `MEMORY.md`
         // regeneration or same-name entry writes. Map insert is fast
@@ -1258,7 +1263,7 @@ impl Engine {
         };
         tokio::spawn(async move {
             let _g = project_lock.lock().await;
-            let rows = match state.recent_messages(&thread, history_limit).await {
+            let rows = match state.recent_messages(&thread, pool_limit).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "extractor: history fetch failed");
@@ -1392,6 +1397,14 @@ impl Engine {
         _user_query: &str,
         loop_guard_hint: Option<&LoopGuardHint>,
     ) -> Vec<SystemSegment> {
+        // Live workspace file listing — recomputed every turn (cheap
+        // bounded dir read), even on the memory-snapshot cache-hit path,
+        // so the model's view of its files is never stale. It rides as a
+        // volatile segment, so this per-turn recompute never busts the
+        // cacheable memory prefix.
+        let workspace_files =
+            render_workspace_files(&self.workspace.workspace_dir(tenant, project));
+
         // Cache hit on the second-and-later turns of a thread; this
         // is the whole point of the frozen-snapshot model.
         if let Some(cached) = self
@@ -1404,6 +1417,7 @@ impl Engine {
                 &self.config.system_prompt,
                 &cached,
                 "",
+                &workspace_files,
                 loop_guard_hint,
             );
         }
@@ -1418,6 +1432,7 @@ impl Engine {
             &self.config.system_prompt,
             &snapshot_text,
             "",
+            &workspace_files,
             loop_guard_hint,
         )
     }
@@ -1507,7 +1522,7 @@ impl Engine {
             // summarise call that follows.
             let preview_rows = self
                 .state
-                .recent_messages(thread_id, self.config.history_limit.saturating_mul(4))
+                .recent_messages(thread_id, self.config.conversation_history_limit.saturating_mul(4))
                 .await
                 .unwrap_or_default();
             let mut excerpt = String::new();
@@ -1562,7 +1577,7 @@ impl Engine {
         // the raw row order from oldest to newest to pick the cutoffs.
         let mut all = self
             .state
-            .recent_messages(thread_id, self.config.history_limit.saturating_mul(4))
+            .recent_messages(thread_id, self.config.conversation_history_limit.saturating_mul(4))
             .await?;
         // Need at least `protect_first + protect_last + 2` rows for a
         // non-trivial middle band. Below that, compaction would either
@@ -2506,6 +2521,7 @@ fn compose_system_segments(
     base: &str,
     index: &str,
     _recall: &str,
+    workspace_files: &str,
     loop_guard_hint: Option<&LoopGuardHint>,
 ) -> Vec<SystemSegment> {
     let mut stable = current_date_preamble(chrono::Local::now());
@@ -2524,6 +2540,23 @@ fn compose_system_segments(
         stable.push_str(index.trim());
     }
     let mut segs: Vec<SystemSegment> = vec![SystemSegment::cacheable(stable)];
+    // Live workspace file listing — a VOLATILE (non-cacheable) segment
+    // recomputed every turn and held out of the cacheable prefix, so the
+    // model always sees the current set of files (the durable source of
+    // truth for uploads) even after the turns that introduced them have
+    // been evicted, and adding/removing a file never busts the memory
+    // prefix cache.
+    if !workspace_files.trim().is_empty() {
+        segs.push(SystemSegment::volatile(format!(
+            "\n\n---\n\n## Workspace Files\n\n\
+             These files are in your project workspace — the durable \
+             source of truth for anything the user uploaded. Read them \
+             with the `Read` tool (paths are workspace-relative). This \
+             list is current as of THIS turn; before telling the user you \
+             don't have a file, check here first.\n\n{}",
+            workspace_files.trim(),
+        )));
+    }
     if let Some(hint) = loop_guard_hint {
         let snippet = if hint.input_snippet.is_empty() {
             "(input not captured)".to_string()
@@ -2552,7 +2585,7 @@ fn compose_system_segments(
 /// builds since the engine itself only ever speaks segments.
 #[cfg(test)]
 fn compose_system_prompt(base: &str, index: &str, recall: &str) -> String {
-    let segs = compose_system_segments(base, index, recall, None);
+    let segs = compose_system_segments(base, index, recall, "", None);
     let mut out = String::new();
     for s in segs {
         out.push_str(&s.text);
@@ -3014,6 +3047,132 @@ fn message_byte_size(m: &Message) -> usize {
 /// load. M2's solution was to abort the engine on those failures; M3
 /// switched to "every tool_use produces a result block" but legacy
 /// rows from older builds still need patching at load time.
+/// Conversational half of the dual history window. Cuts a whole PREFIX
+/// so that at most `conversation_limit` *conversational* (User +
+/// Assistant) messages remain (the most recent ones). Tool and System
+/// messages don't count toward the budget but ride along inside the
+/// kept suffix.
+///
+/// Cutting a whole prefix (rather than dropping individual messages)
+/// means dropped tool round-trips drop as pairs — the only pairing
+/// hazard is a leading `Role::Tool` left at the new head when the cut
+/// lands mid-round-trip, which `enforce_history_byte_cap` and
+/// `repair_orphan_tool_uses` both strip downstream.
+///
+/// `conversation_limit == 0` disables the trim (returns the input
+/// unchanged), as does any history whose conversational count already
+/// fits.
+fn trim_to_conversation_window(messages: Vec<Message>, conversation_limit: usize) -> Vec<Message> {
+    if conversation_limit == 0 {
+        return messages;
+    }
+    let conv_total = messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .count();
+    if conv_total <= conversation_limit {
+        return messages;
+    }
+    let to_drop = conv_total - conversation_limit;
+    let mut dropped = 0usize;
+    let mut cut = 0usize;
+    for (i, m) in messages.iter().enumerate() {
+        // Stop BEFORE counting/advancing past the first message we want
+        // to keep — otherwise we'd drop one conversational turn too many.
+        if dropped == to_drop {
+            cut = i;
+            break;
+        }
+        if matches!(m.role, Role::User | Role::Assistant) {
+            dropped += 1;
+        }
+        cut = i + 1;
+    }
+    messages.into_iter().skip(cut).collect()
+}
+
+/// Render a compact, bounded listing of the project workspace's top
+/// level for injection into the system prompt. Uploaded files land at
+/// the workspace root (see [`Engine::stage_attachment`]), so a top-level
+/// view surfaces exactly what the user sent. Hidden entries and noise
+/// directories (build output, dependency trees) are pruned; the listing
+/// is capped in both entry count and characters. Returns `""` for a
+/// missing / empty workspace so the caller emits no segment.
+fn render_workspace_files(dir: &std::path::Path) -> String {
+    const MAX_ENTRIES: usize = 60;
+    const MAX_CHARS: usize = 4096;
+    /// Non-dotted directories that are build output or dependency trees,
+    /// never user uploads. (Dotted dirs like `.git` / `.snaca` are
+    /// already skipped by the hidden-entry filter below.)
+    const NOISE_DIRS: &[&str] = &[
+        "node_modules",
+        "target",
+        "bin",
+        "obj",
+        "venv",
+        "__pycache__",
+        "dist",
+        "build",
+    ];
+
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    // (is_dir, name, size) — skip hidden entries and noise dirs.
+    let mut entries: Vec<(bool, String, u64)> = Vec::new();
+    for ent in read.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = ent.metadata() else { continue };
+        let is_dir = meta.is_dir();
+        if is_dir && NOISE_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        entries.push((is_dir, name, if is_dir { 0 } else { meta.len() }));
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
+    // Files first (false < true), then dirs; each group alphabetical —
+    // the user's uploads (files at the root) lead the listing.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let total = entries.len();
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (is_dir, name, size) in entries.into_iter().take(MAX_ENTRIES) {
+        let line = if is_dir {
+            format!("- {name}/\n")
+        } else {
+            format!("- {name} ({})\n", human_size(size))
+        };
+        if out.len() + line.len() > MAX_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < total {
+        out.push_str(&format!("- […{} more not shown]\n", total - shown));
+    }
+    out
+}
+
+/// Compact human-readable byte size (`832 B`, `12.4 KB`, `5.3 MB`).
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    match bytes {
+        b if b < KB => format!("{b} B"),
+        b if b < MB => format!("{:.1} KB", b as f64 / KB as f64),
+        b if b < GB => format!("{:.1} MB", b as f64 / MB as f64),
+        b => format!("{:.1} GB", b as f64 / GB as f64),
+    }
+}
+
 fn repair_orphan_tool_uses(messages: Vec<Message>) -> Vec<Message> {
     use std::collections::HashSet;
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
@@ -3280,7 +3439,7 @@ mod system_prompt_tests {
         // one cacheable segment. Loop-guard hints (tested separately)
         // are the only thing that can ever push a volatile second
         // segment into the prompt now.
-        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", None);
+        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", "", None);
         assert_eq!(
             segs.len(),
             1,
@@ -3295,7 +3454,7 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_recall() {
-        let segs = compose_system_segments("BASE", "user/foo", "", None);
+        let segs = compose_system_segments("BASE", "user/foo", "", "", None);
         assert_eq!(segs.len(), 1, "no recall => single segment");
         assert!(segs[0].cacheable);
         assert!(segs[0].text.contains("BASE"));
@@ -3304,10 +3463,187 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_memory_and_no_recall() {
-        let segs = compose_system_segments("BASE", "", "", None);
+        let segs = compose_system_segments("BASE", "", "", "", None);
         assert_eq!(segs.len(), 1);
         assert!(segs[0].cacheable);
         assert!(!segs[0].text.contains("## Project Memory"));
+    }
+
+    #[test]
+    fn workspace_files_ride_a_volatile_segment_without_busting_the_prefix() {
+        // With a file list present, a SECOND segment appears — and it is
+        // volatile, so it never busts the cacheable memory prefix.
+        let with_files = compose_system_segments(
+            "BASE",
+            "user/foo",
+            "",
+            "- report.pdf (1.2 KB)\n- notes.md (300 B)\n",
+            None,
+        );
+        assert_eq!(with_files.len(), 2, "file list adds one segment");
+        assert!(with_files[0].cacheable, "memory prefix stays cacheable");
+        assert!(!with_files[1].cacheable, "file list segment is volatile");
+        assert!(with_files[1].text.contains("## Workspace Files"));
+        assert!(with_files[1].text.contains("report.pdf"));
+
+        // The cacheable prefix is byte-identical whether or not the file
+        // list changes — the whole point of holding it out of the cache.
+        let no_files = compose_system_segments("BASE", "user/foo", "", "", None);
+        assert_eq!(
+            with_files[0].text, no_files[0].text,
+            "adding/removing files must not change the cacheable prefix"
+        );
+        assert_eq!(no_files.len(), 1, "empty file list emits no segment");
+    }
+}
+
+#[cfg(test)]
+mod history_window_tests {
+    use super::*;
+
+    fn u(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::text(text)])
+    }
+    fn a(text: &str) -> Message {
+        Message::new(Role::Assistant, vec![ContentBlock::text(text)])
+    }
+    /// Assistant message that drives a tool call — counts toward the
+    /// conversational budget, like the real loop.
+    fn a_call(id: &str, name: &str) -> Message {
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::text("calling..."),
+                ContentBlock::tool_use(id, name, json!({})),
+            ],
+        )
+    }
+    /// Tool-result envelope — excluded from the conversational budget;
+    /// this is the key to the dual window.
+    fn tr(id: &str, body: &str) -> Message {
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new(id),
+                vec![ContentBlock::text(body)],
+            )],
+        )
+    }
+    fn has_text(messages: &[Message], needle: &str) -> bool {
+        messages.iter().any(|m| {
+            m.content.iter().any(|b| match b {
+                ContentBlock::Text { text } => text == needle,
+                _ => false,
+            })
+        })
+    }
+    fn conv_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+            .count()
+    }
+
+    #[test]
+    fn conversation_preserved_when_tool_results_present() {
+        // Two file-reading round-trips interleaved with conversation.
+        // Role::Tool result dumps must NOT consume the conversational
+        // budget, so the opening goal survives a budget that a flat
+        // last-N-rows window of the same count would have evicted.
+        let big = "x".repeat(4096);
+        let messages = vec![
+            u("goal: edit config"),
+            a_call("c1", "Bash"),
+            tr("c1", &big),
+            u("q2"),
+            a_call("c2", "Bash"),
+            tr("c2", &big),
+            u("q3"),
+            a("answer"),
+        ];
+        assert_eq!(conv_count(&messages), 6);
+
+        let out = trim_to_conversation_window(messages.clone(), 6);
+        assert!(
+            has_text(&out, "goal: edit config"),
+            "goal must survive the conversational window"
+        );
+        let flat_tail = &messages[messages.len() - 6..];
+        assert!(
+            !has_text(flat_tail, "goal: edit config"),
+            "sanity: a flat last-6-rows window loses the goal"
+        );
+    }
+
+    #[test]
+    fn prefix_cut_keeps_pairing_valid() {
+        // Cut lands mid-round-trip: repair must strip the leading orphan
+        // tool result so providers don't reject a leading tool message.
+        let messages = vec![
+            a_call("c1", "Read"),
+            tr("c1", "body"),
+            u("a"),
+            a("b"),
+            u("c"),
+            a("d"),
+        ];
+        let trimmed = trim_to_conversation_window(messages, 4);
+        assert!(matches!(trimmed[0].role, Role::Tool), "setup: head is orphan tool");
+        let repaired = repair_orphan_tool_uses(trimmed);
+        assert!(
+            !matches!(repaired[0].role, Role::Tool),
+            "repair must drop the leading orphan tool message"
+        );
+    }
+
+    #[test]
+    fn assistant_with_text_and_tool_use_counts_as_one() {
+        let messages = vec![u("a"), a_call("c1", "Read"), tr("c1", "body"), u("b"), a("c")];
+        let trimmed = trim_to_conversation_window(messages, 2);
+        assert_eq!(conv_count(&trimmed), 2, "exactly two conversational messages kept");
+        assert!(has_text(&trimmed, "b") && has_text(&trimmed, "c"));
+        assert!(!has_text(&trimmed, "a"), "older user turn trimmed");
+    }
+
+    #[test]
+    fn empty_all_tool_and_zero_limit_safe() {
+        assert!(trim_to_conversation_window(Vec::new(), 5).is_empty());
+        // zero limit disables the trim.
+        let msgs = vec![u("a"), a("b")];
+        assert_eq!(trim_to_conversation_window(msgs.clone(), 0).len(), 2);
+        // all-tool history: no conversational messages → no-op.
+        let all_tool = vec![tr("c1", "x"), tr("c2", "y")];
+        let trimmed = trim_to_conversation_window(all_tool, 5);
+        assert_eq!(trimmed.len(), 2, "trim leaves all-tool history untouched");
+    }
+
+    #[test]
+    fn render_workspace_files_lists_uploads_and_prunes_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("利润分析.xlsx"), vec![0u8; 2048]).unwrap();
+        std::fs::write(root.join("notes.md"), b"hi").unwrap();
+        std::fs::create_dir(root.join("slides")).unwrap();
+        // Noise that must be pruned.
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules").join("junk.js"), b"x").unwrap();
+        std::fs::create_dir(root.join(".snaca")).unwrap();
+
+        let out = render_workspace_files(root);
+        assert!(out.contains("利润分析.xlsx"), "upload listed: {out}");
+        assert!(out.contains("notes.md"));
+        assert!(out.contains("slides/"), "user dir listed with slash: {out}");
+        assert!(!out.contains("node_modules"), "noise dir pruned: {out}");
+        assert!(!out.contains(".snaca"), "hidden dir pruned: {out}");
+        // Files lead, dirs follow.
+        assert!(out.find("notes.md").unwrap() < out.find("slides/").unwrap());
+    }
+
+    #[test]
+    fn render_workspace_files_empty_for_missing_or_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(render_workspace_files(dir.path()), "");
+        assert_eq!(render_workspace_files(&dir.path().join("nope")), "");
     }
 }
 

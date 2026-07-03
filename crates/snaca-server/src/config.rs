@@ -291,8 +291,13 @@ pub struct EngineSection {
     pub max_iterations: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Size of the loaded history window, counted in *conversational*
+    /// (User + Assistant) messages — huge `Role::Tool` results don't
+    /// consume the budget, so file-extraction dumps can't evict earlier
+    /// goals/files. Default 30. (The old `history_limit` key is ignored
+    /// if still present.)
     #[serde(default)]
-    pub history_limit: Option<u32>,
+    pub conversation_history_limit: Option<u32>,
     /// Override the built-in system prompt. Empty / missing = use default.
     #[serde(default)]
     pub system_prompt: Option<String>,
