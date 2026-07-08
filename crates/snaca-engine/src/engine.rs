@@ -1328,15 +1328,27 @@ impl Engine {
             .state
             .recent_messages(thread_id, self.config.pool_limit())
             .await?;
-        // Redactable candidates: tool_results and assistant messages that
-        // aren't already redacted. User messages are excluded — redacting
-        // them would rewrite the user's own words; if the poison is there
-        // we degrade instead. Already-redacted rows are held redacted by
-        // `build_probe_history` but aren't re-localized.
+        // Only rows that actually reach the model can be the culprit —
+        // build the probe history once with nothing redacted and keep the
+        // ids it contains. Rows that `build_probe_history` windows or
+        // byte-caps out (or collapses to an elision marker) can't affect a
+        // probe, so leaving them in `candidates` would only inflate the
+        // search and risk hitting `probe_cap` before isolating the poison.
+        let in_window: HashSet<MessageId> =
+            build_probe_history(&rows, &HashSet::new(), &self.config)
+                .iter()
+                .map(|m| m.id)
+                .collect();
+        // Redactable candidates: in-window tool_results and assistant
+        // messages that aren't already redacted. User messages are excluded
+        // — redacting them would rewrite the user's own words; if the poison
+        // is there we degrade instead. Already-redacted rows are held
+        // redacted by `build_probe_history` but aren't re-localized.
         let candidates: Vec<MessageId> = rows
             .iter()
             .filter(|r| matches!(r.role, Role::Tool | Role::Assistant))
             .filter(|r| r.redacted_at.is_none())
+            .filter(|r| in_window.contains(&r.id))
             .map(|r| r.id)
             .collect();
         if candidates.is_empty() {
@@ -1404,6 +1416,22 @@ impl Engine {
             // never over-redacts innocent history.
             base.extend(right.iter().copied());
             suspects = left;
+        }
+
+        // Only persist a redaction when the search actually isolated a
+        // single row. If we exited because `probe_cap` was hit with more
+        // than one suspect left, `suspects[0]` is a guess that might be an
+        // innocent row (and might not even be the poison) — marking it would
+        // over-redact without healing. Degrade gracefully instead.
+        if suspects.len() != 1 {
+            warn!(
+                thread_id = thread_id.as_str(),
+                probes,
+                remaining = suspects.len(),
+                "content-filter localization hit the probe cap without isolating \
+                 a single row; degrading instead of guessing"
+            );
+            return Ok(PoisonLocation::Unredactable);
         }
 
         let target = suspects[0];
