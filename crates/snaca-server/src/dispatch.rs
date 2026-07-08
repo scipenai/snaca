@@ -1245,10 +1245,25 @@ fn attachment_summary(attachments: &[Attachment]) -> String {
     }
     let lines: Vec<String> = attachments
         .iter()
-        .map(|a| format!("- {} ({}, {} bytes)", a.filename, a.mime_type, a.size))
+        .map(|a| {
+            // `size`/`mime_type` are unreliable here: this runs at input
+            // assembly, *before* the file is downloaded, and Lark omits
+            // `file_size`/`file_type` on quoted/reply attachments — leaving
+            // 0 / octet-stream. Echoing "0 bytes" makes the model read the
+            // upload as empty or failed and refuse the file. The
+            // authoritative size + mime land later in the post-staging
+            // `<attachments>` fence, so only surface a size we actually
+            // trust (> 0) and never a fabricated one.
+            if a.size > 0 {
+                format!("- {} ({} bytes)", a.filename, a.size)
+            } else {
+                format!("- {}", a.filename)
+            }
+        })
         .collect();
     format!(
-        "用户上传了以下文件，请先判断可做的默认处理：\n{}",
+        "用户上传了以下文件（已接收并保存到本地工作区，见下方附件清单里的本地路径，\
+         可直接用工具读取，不是外链、无需登录），请先判断可做的默认处理：\n{}",
         lines.join("\n")
     )
 }
@@ -1508,6 +1523,15 @@ fn compose_user_text(params: &MessageReceivedParams, staged: &[StagedAttachment]
         return prepend_turn_timestamp(&params.received_at, body);
     }
     let mut block = String::from("<attachments do-not-echo=\"true\">\n");
+    // Header the model can always trust: these are local files already on
+    // disk, not remote links. Counters the failure mode where a stale
+    // "this link needs login, I can't open it" conclusion from an earlier
+    // URL fetch leaks forward and the model refuses a freshly-staged file.
+    block.push_str(
+        "  <note>These files are already downloaded to your local workspace at the paths \
+         below. Read them directly with your tools (Read / Bash / office-extract). They are \
+         local files, not links — no login or external access is needed.</note>\n",
+    );
     let mut budget = ATTACHMENTS_BLOCK_CHARS;
     let mut included = 0usize;
     for att in staged {
@@ -2379,6 +2403,56 @@ mod tests {
         assert!(out.contains("<note>"));
         assert!(out.contains("office-extract"));
         assert!(!out.contains("<preview>"));
+    }
+
+    #[test]
+    fn attachment_summary_never_echoes_untrusted_zero_size() {
+        // Regression: quoted/reply attachments arrive with size 0 and
+        // octet-stream. The summary must not render "0 bytes" (the model
+        // reads it as an empty/failed upload and refuses the file).
+        let att = Attachment {
+            id: "a1".into(),
+            filename: "旭华实验店推进工作2 · 商业洞察(1).docx".into(),
+            mime_type: "application/octet-stream".into(),
+            size: 0,
+        };
+        let out = attachment_summary(std::slice::from_ref(&att));
+        assert!(out.contains("旭华实验店推进工作2 · 商业洞察(1).docx"));
+        assert!(!out.contains("0 bytes"), "must not echo a fake size: {out}");
+        assert!(!out.contains("octet-stream"), "must not echo a fake mime: {out}");
+        // And it tells the model the file is already local, not a link.
+        assert!(out.contains("已接收并保存到本地"));
+    }
+
+    #[test]
+    fn attachment_summary_shows_trusted_positive_size() {
+        let att = Attachment {
+            id: "a1".into(),
+            filename: "notes.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 128,
+        };
+        let out = attachment_summary(std::slice::from_ref(&att));
+        assert!(out.contains("notes.txt (128 bytes)"));
+    }
+
+    #[test]
+    fn compose_user_text_marks_attachments_as_local_files() {
+        // The fence carries a trustworthy header on every attachment turn,
+        // so a stale "this link needs login" conclusion can't leak forward.
+        let params = dummy_params_with("chat", "user", "msg", "这份文件也打不开吗", vec![]);
+        let staged = vec![StagedAttachment {
+            filename: "report.docx".into(),
+            workspace_rel: "report.docx".into(),
+            bytes: 15809,
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
+            preview: None,
+        }];
+        let out = compose_user_text(&params, &staged);
+        assert!(out.contains("already downloaded to your local workspace"));
+        assert!(out.contains("no login or external access is needed"));
+        // Authoritative size still present via the fence.
+        assert!(out.contains("15809 bytes"));
     }
 
     #[test]
