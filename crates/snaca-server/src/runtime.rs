@@ -216,6 +216,15 @@ impl Runtime {
                 .engine
                 .malformed_tool_args_max_retries
                 .unwrap_or(2),
+            // `Some(0)` -> disable content-filter recovery (surface the
+            // moderation rejection immediately). `None` -> engine default
+            // (4 localize-and-redact rounds). Guards against a poisoned
+            // history message (flagged external content persisted in a
+            // tool_result) bricking the thread on every replayed turn.
+            content_filter_max_retries: config
+                .engine
+                .content_filter_max_retries
+                .unwrap_or(4),
             compact_summary_max_tokens: config
                 .engine
                 .compact_summary_max_tokens

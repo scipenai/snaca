@@ -40,6 +40,10 @@ pub struct MessageRow {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     pub created_at: DateTime<Utc>,
+    /// Set when the engine localized this message as the cause of a
+    /// provider content-moderation rejection. When present, `load_history`
+    /// substitutes a neutral placeholder for the body. `None` = not redacted.
+    pub redacted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]

@@ -78,6 +78,18 @@ pub enum LlmError {
     #[error("provider error {code}: {message}")]
     Provider { code: String, message: String },
 
+    /// The provider's content-moderation layer rejected the request
+    /// (DeepSeek `Content Exists Risk`, OpenAI `content_filter`, Qwen
+    /// `data_inspection_failed`, ...). Distinct from `Provider` because
+    /// the engine has a special recovery path: the offending content is
+    /// almost always a *persisted* history message (e.g. a WebSearch
+    /// tool_result carrying flagged external text), so replaying the
+    /// thread bricks every subsequent turn. The engine localizes and
+    /// redacts the poison message rather than surfacing a hard error.
+    /// Not retryable — the retry wrapper must pass it straight through.
+    #[error("content filtered by provider {code}: {message}")]
+    ContentFiltered { code: String, message: String },
+
     #[error("operation timed out")]
     Timeout,
 

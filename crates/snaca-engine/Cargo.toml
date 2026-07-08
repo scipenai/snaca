@@ -34,3 +34,4 @@ snaca-tools.workspace = true
 snaca-skills.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
