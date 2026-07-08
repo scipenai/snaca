@@ -7,7 +7,9 @@
 //! redacted, and let the thread heal.
 
 use async_trait::async_trait;
-use snaca_core::{ContentBlock, Message, ProjectId, Role, SessionId, TenantId, ThreadId, ToolUseId};
+use snaca_core::{
+    ContentBlock, Message, ProjectId, Role, SessionId, TenantId, ThreadId, ToolUseId,
+};
 use snaca_engine::{Engine, EngineConfig, TurnRequest};
 use snaca_llm::{
     LlmClient, LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps, StopReason,
@@ -52,9 +54,9 @@ fn block_contains_poison(b: &ContentBlock) -> bool {
     match b {
         ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.contains(POISON),
         ContentBlock::ToolResult { content, .. } => content.iter().any(block_contains_poison),
-        ContentBlock::ToolUse { input, .. } => {
-            serde_json::to_string(input).unwrap_or_default().contains(POISON)
-        }
+        ContentBlock::ToolUse { input, .. } => serde_json::to_string(input)
+            .unwrap_or_default()
+            .contains(POISON),
         ContentBlock::Image { .. } => false,
     }
 }
@@ -238,7 +240,10 @@ async fn live_deepseek_poison_thread_heals() {
     let before = db.recent_messages(&thread, 100).await.unwrap();
     let injected = before
         .iter()
-        .find(|r| r.id.to_string().starts_with("aaaaaaaa-0000-0000-0000-000000000002"))
+        .find(|r| {
+            r.id.to_string()
+                .starts_with("aaaaaaaa-0000-0000-0000-000000000002")
+        })
         .expect("injected poison tool_result present in the captured DB");
     assert!(
         injected.redacted_at.is_none(),
@@ -246,10 +251,9 @@ async fn live_deepseek_poison_thread_heals() {
     );
 
     // Real DeepSeek client + retry wrapper, matching snaca.toml (v4-pro).
-    let ds = snaca_llm::DeepSeekClient::new(
-        DeepSeekConfig::new(api_key).with_model("deepseek-v4-pro"),
-    )
-    .unwrap();
+    let ds =
+        snaca_llm::DeepSeekClient::new(DeepSeekConfig::new(api_key).with_model("deepseek-v4-pro"))
+            .unwrap();
     let llm = Arc::new(RetryingLlmClient::new(ds, RetryConfig::default()));
 
     let tmp = tempfile::tempdir().unwrap();
@@ -286,7 +290,10 @@ async fn live_deepseek_poison_thread_heals() {
     let after = db.recent_messages(&thread, 100).await.unwrap();
     let injected_after = after
         .iter()
-        .find(|r| r.id.to_string().starts_with("aaaaaaaa-0000-0000-0000-000000000002"))
+        .find(|r| {
+            r.id.to_string()
+                .starts_with("aaaaaaaa-0000-0000-0000-000000000002")
+        })
         .unwrap();
     assert!(
         injected_after.redacted_at.is_some(),
@@ -302,10 +309,7 @@ async fn live_deepseek_poison_thread_heals() {
         .collect();
     eprintln!("=== redacted rows: {} ===\n{:#?}", redacted.len(), redacted);
     // Innocent, non-flagged rows (e.g. the very first "hi") stay intact.
-    let first_user = after
-        .iter()
-        .find(|r| matches!(r.role, Role::User))
-        .unwrap();
+    let first_user = after.iter().find(|r| matches!(r.role, Role::User)).unwrap();
     assert!(
         first_user.redacted_at.is_none(),
         "user messages are never redacted"

@@ -221,10 +221,7 @@ impl Runtime {
             // (4 localize-and-redact rounds). Guards against a poisoned
             // history message (flagged external content persisted in a
             // tool_result) bricking the thread on every replayed turn.
-            content_filter_max_retries: config
-                .engine
-                .content_filter_max_retries
-                .unwrap_or(4),
+            content_filter_max_retries: config.engine.content_filter_max_retries.unwrap_or(4),
             compact_summary_max_tokens: config
                 .engine
                 .compact_summary_max_tokens

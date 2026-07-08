@@ -805,11 +805,7 @@ impl Engine {
                              localizing and redacting the poison history message"
                         );
                         match self
-                            .localize_and_redact_poison(
-                                &thread_id,
-                                &system_segments,
-                                &tool_schemas,
-                            )
+                            .localize_and_redact_poison(&thread_id, &system_segments, &tool_schemas)
                             .await?
                         {
                             PoisonLocation::Redacted(ids) => {
@@ -1219,10 +1215,7 @@ impl Engine {
                         self.config.protect_first_n.max(1) as u32,
                     )
                     .await?;
-                head_rows
-                    .into_iter()
-                    .map(message_from_persisted)
-                    .collect()
+                head_rows.into_iter().map(message_from_persisted).collect()
             } else {
                 Vec::new()
             };
@@ -1250,10 +1243,7 @@ impl Engine {
                 ))],
                 created_at: comp.compacted_at,
             });
-            let live_msgs: Vec<Message> = live
-                .into_iter()
-                .map(message_from_persisted)
-                .collect();
+            let live_msgs: Vec<Message> = live.into_iter().map(message_from_persisted).collect();
             // Apply the byte cap to the live tail too — the summary
             // preamble already shrinks the history by definition, but
             // a single oversized post-compaction message (e.g. a
@@ -1485,10 +1475,7 @@ impl Engine {
                     return;
                 }
             };
-            let messages: Vec<Message> = rows
-                .into_iter()
-                .map(message_from_persisted)
-                .collect();
+            let messages: Vec<Message> = rows.into_iter().map(message_from_persisted).collect();
             let proposals = extractor.extract(&tenant, &project, &messages).await;
             if proposals.is_empty() {
                 return;
@@ -1831,8 +1818,7 @@ impl Engine {
         // trip the provider's content filter, so `message_from_persisted`
         // substitutes the placeholder before the body is rendered.
         let body_count = body_rows.len();
-        let body_msgs: Vec<Message> =
-            body_rows.into_iter().map(message_from_persisted).collect();
+        let body_msgs: Vec<Message> = body_rows.into_iter().map(message_from_persisted).collect();
         let body_collapsed =
             collapse_old_tool_results(body_msgs, 0, self.config.collapse_tool_results_threshold);
         // Cap each block AND the aggregate so a band of large error / Bash
