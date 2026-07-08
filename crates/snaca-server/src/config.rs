@@ -337,6 +337,15 @@ pub struct EngineSection {
     #[serde(default)]
     pub malformed_tool_args_max_retries: Option<u8>,
 
+    /// Per-turn cap on transparent recovery from
+    /// `LlmError::ContentFiltered` — the provider's content-moderation
+    /// layer rejecting the request (e.g. DeepSeek "Content Exists Risk").
+    /// Each round binary-searches the current history window to localize
+    /// the flagged message(s), marks them redacted, and re-runs the turn.
+    /// `Some(0)` disables (immediate surface). Default 4.
+    #[serde(default)]
+    pub content_filter_max_retries: Option<u8>,
+
     /// Hard cap on the summariser's output tokens. Default 2048. Too
     /// low truncates summaries mid-sentence and re-fires compaction on
     /// the next turn; too high just turns history budget into preamble

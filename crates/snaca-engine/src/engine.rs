@@ -46,7 +46,7 @@ use snaca_tools_api::{
     ToolResult,
 };
 use snaca_workspace::WorkspaceLayout;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -654,6 +654,15 @@ impl Engine {
             // can't write valid JSON doesn't burn the whole iteration budget.
             let mut malformed_args_attempts: u8 = 0;
             let max_malformed_args_retries = self.config.malformed_tool_args_max_retries;
+            // Bounded recovery counter for `LlmError::ContentFiltered` —
+            // the provider's moderation layer rejecting the request because
+            // a *persisted* history message carries flagged content. Each
+            // strike localizes and redacts one poison message, then
+            // re-enters the loop. Bound so a thread whose poison can't be
+            // localized (e.g. it lives in a user message) degrades
+            // gracefully instead of looping.
+            let mut content_filter_attempts: u8 = 0;
+            let max_content_filter_retries = self.config.content_filter_max_retries;
             let mut repeated_tool_failures: HashMap<(String, String), usize> = HashMap::new();
 
             loop {
@@ -772,6 +781,72 @@ impl Engine {
                             })
                             .await?;
                         continue;
+                    }
+                    Err(EngineError::Llm(e))
+                        if content_filter_attempts < max_content_filter_retries
+                            && is_content_filter_error(&e) =>
+                    {
+                        // Provider content-moderation rejection (DeepSeek
+                        // "Content Exists Risk" et al.). The flagged content
+                        // is almost always a persisted history message —
+                        // replaying it re-triggers the filter every turn and
+                        // bricks the thread. Localize the offending message
+                        // via binary search, mark it redacted (future
+                        // `load_history` substitutes a placeholder), and
+                        // retry. Withheld-error pattern: don't surface to the
+                        // channel while recovery can still run.
+                        content_filter_attempts += 1;
+                        warn!(
+                            thread_id = thread_id.as_str(),
+                            attempt = content_filter_attempts,
+                            max = max_content_filter_retries,
+                            error = %e,
+                            "provider content filter rejected the request; \
+                             localizing and redacting the poison history message"
+                        );
+                        match self
+                            .localize_and_redact_poison(&thread_id, &system_segments, &tool_schemas)
+                            .await?
+                        {
+                            PoisonLocation::Redacted(ids) => {
+                                warn!(
+                                    thread_id = thread_id.as_str(),
+                                    redacted = ids.len(),
+                                    "redacted poison message(s); retrying turn"
+                                );
+                                continue;
+                            }
+                            PoisonLocation::Unredactable => {
+                                // Poison sits in a user message or the system
+                                // prompt — we won't silently rewrite the
+                                // user's own words. Emit a graceful notice and
+                                // end the turn cleanly; the thread stays usable
+                                // for the next message.
+                                warn!(
+                                    thread_id = thread_id.as_str(),
+                                    "content-filter poison not in a redactable message; \
+                                     ending turn with degraded notice"
+                                );
+                                let notice = "抱歉，本轮对话中包含无法通过内容安全审核的内容，\
+                                    我暂时无法继续处理。请换一种表述，或开启一个新的话题。";
+                                self.state
+                                    .append_message(&NewMessage {
+                                        thread_id: thread_id.clone(),
+                                        session_id,
+                                        role: Role::Assistant,
+                                        content: vec![ContentBlock::text(notice)],
+                                    })
+                                    .await?;
+                                let outbound_files = drain_outbound(&outbound_slot);
+                                return Ok(TurnOutcome {
+                                    session_id,
+                                    assistant_text: notice.to_string(),
+                                    iterations,
+                                    usage: total_usage,
+                                    outbound_files,
+                                });
+                            }
+                        }
                     }
                     Err(e) => return Err(e),
                 };
@@ -1140,15 +1215,7 @@ impl Engine {
                         self.config.protect_first_n.max(1) as u32,
                     )
                     .await?;
-                head_rows
-                    .into_iter()
-                    .map(|r| Message {
-                        id: r.id,
-                        role: r.role,
-                        content: r.content,
-                        created_at: r.created_at,
-                    })
-                    .collect()
+                head_rows.into_iter().map(message_from_persisted).collect()
             } else {
                 Vec::new()
             };
@@ -1176,15 +1243,7 @@ impl Engine {
                 ))],
                 created_at: comp.compacted_at,
             });
-            let live_msgs: Vec<Message> = live
-                .into_iter()
-                .map(|r| Message {
-                    id: r.id,
-                    role: r.role,
-                    content: r.content,
-                    created_at: r.created_at,
-                })
-                .collect();
+            let live_msgs: Vec<Message> = live.into_iter().map(message_from_persisted).collect();
             // Apply the byte cap to the live tail too — the summary
             // preamble already shrinks the history by definition, but
             // a single oversized post-compaction message (e.g. a
@@ -1224,15 +1283,7 @@ impl Engine {
         // the way a flat last-N-rows window does.
         let pool_limit = self.config.pool_limit();
         let rows = self.state.recent_messages(thread_id, pool_limit).await?;
-        let messages: Vec<Message> = rows
-            .into_iter()
-            .map(|r| Message {
-                id: r.id,
-                role: r.role,
-                content: r.content,
-                created_at: r.created_at,
-            })
-            .collect();
+        let messages: Vec<Message> = rows.into_iter().map(message_from_persisted).collect();
         let windowed =
             trim_to_conversation_window(messages, self.config.conversation_history_limit as usize);
         let bounded = enforce_history_byte_cap(
@@ -1248,6 +1299,142 @@ impl Engine {
             self.config.compact_keep_recent,
             self.config.collapse_tool_results_threshold,
         ))
+    }
+
+    /// One localize-and-redact round for a `LlmError::ContentFiltered`.
+    ///
+    /// Loads the current thread window, then binary-searches the
+    /// redactable messages (tool_results + assistant messages) to the
+    /// single row whose content trips the provider's moderation filter,
+    /// marks it redacted, and returns [`PoisonLocation::Redacted`]. When
+    /// even redacting every redactable message can't clear the filter the
+    /// poison lives in a user message or the system prompt, which we won't
+    /// silently rewrite — returns [`PoisonLocation::Unredactable`] so the
+    /// caller can degrade gracefully.
+    ///
+    /// Each probe is a minimal (`max_tokens = 1`) LLM call: moderation acts
+    /// on the request *input*, so a one-token completion is enough to learn
+    /// whether a given redaction set passes. Probe count is
+    /// `O(log n)`-ish and hard-capped; the outer
+    /// `content_filter_max_retries` bounds how many rounds run in a turn,
+    /// so multiple independent poison messages are peeled off one per round.
+    async fn localize_and_redact_poison(
+        &self,
+        thread_id: &ThreadId,
+        system_segments: &[SystemSegment],
+        tool_schemas: &[ToolSchema],
+    ) -> EngineResult<PoisonLocation> {
+        let rows = self
+            .state
+            .recent_messages(thread_id, self.config.pool_limit())
+            .await?;
+        // Redactable candidates: tool_results and assistant messages that
+        // aren't already redacted. User messages are excluded — redacting
+        // them would rewrite the user's own words; if the poison is there
+        // we degrade instead. Already-redacted rows are held redacted by
+        // `build_probe_history` but aren't re-localized.
+        let candidates: Vec<MessageId> = rows
+            .iter()
+            .filter(|r| matches!(r.role, Role::Tool | Role::Assistant))
+            .filter(|r| r.redacted_at.is_none())
+            .map(|r| r.id)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(PoisonLocation::Unredactable);
+        }
+
+        // Hard cap on probes so a pathological thread can't spin the LLM.
+        let probe_cap: u32 = 24;
+        let mut probes: u32 = 0;
+
+        // Coarse check: redact ALL candidates. If the filter still fires,
+        // the poison is outside the redactable set (user/system).
+        let all: HashSet<MessageId> = candidates.iter().copied().collect();
+        probes += 1;
+        if self
+            .probe_content_filter(system_segments, &rows, &all, tool_schemas)
+            .await?
+            == ProbeOutcome::Filtered
+        {
+            return Ok(PoisonLocation::Unredactable);
+        }
+
+        // Binary search for one offending row. Invariant across the loop:
+        //   probe(base)            == Filtered  (poison still present)
+        //   probe(base ∪ suspects) == Passed    (redacting suspects clears it)
+        // `base` starts empty — probe(∅) mirrors the real failing request.
+        let mut base: HashSet<MessageId> = HashSet::new();
+        let mut suspects: Vec<MessageId> = candidates;
+        while suspects.len() > 1 && probes < probe_cap {
+            let mid = suspects.len() / 2;
+            let left = suspects[..mid].to_vec();
+            let right = suspects[mid..].to_vec();
+
+            // Does redacting `right` (on top of base) clear the filter?
+            let mut set = base.clone();
+            set.extend(right.iter().copied());
+            probes += 1;
+            if self
+                .probe_content_filter(system_segments, &rows, &set, tool_schemas)
+                .await?
+                == ProbeOutcome::Passed
+            {
+                suspects = right;
+                continue;
+            }
+
+            // No — try `left` alone.
+            let mut set = base.clone();
+            set.extend(left.iter().copied());
+            probes += 1;
+            if self
+                .probe_content_filter(system_segments, &rows, &set, tool_schemas)
+                .await?
+                == ProbeOutcome::Passed
+            {
+                suspects = left;
+                continue;
+            }
+
+            // Neither half alone clears it → poison in BOTH halves. Hold
+            // `right` redacted (in memory only) and narrow into `left`. The
+            // invariant is preserved: probe(base ∪ right) is Filtered, and
+            // probe(base ∪ right ∪ left) == probe(base ∪ suspects) Passed.
+            // Only the finally-isolated row is ever persisted, so this
+            // never over-redacts innocent history.
+            base.extend(right.iter().copied());
+            suspects = left;
+        }
+
+        let target = suspects[0];
+        self.state.mark_message_redacted(&target).await?;
+        Ok(PoisonLocation::Redacted(vec![target]))
+    }
+
+    /// Minimal moderation probe: build the candidate history (with
+    /// `redact_ids` ∪ already-redacted rows neutralized), send it with
+    /// `max_tokens = 1`, and report whether the provider's content filter
+    /// fired. Non-moderation errors propagate — a transient during
+    /// localization aborts the round rather than silently mislabeling.
+    async fn probe_content_filter(
+        &self,
+        system_segments: &[SystemSegment],
+        rows: &[snaca_state::MessageRow],
+        redact_ids: &HashSet<MessageId>,
+        tool_schemas: &[ToolSchema],
+    ) -> EngineResult<ProbeOutcome> {
+        let history = build_probe_history(rows, redact_ids, &self.config);
+        let history = ensure_tool_result_pairing(history);
+        let req = MessageRequest::new(&self.config.model)
+            .with_system_segments(system_segments.to_vec())
+            .with_messages(history)
+            .with_tools(tool_schemas.to_vec())
+            .with_max_tokens(1);
+        match self.llm.create_message(req).await {
+            Ok(_) => Ok(ProbeOutcome::Passed),
+            Err(LlmError::ContentFiltered { .. }) => Ok(ProbeOutcome::Filtered),
+            Err(e) => Err(EngineError::Llm(e)),
+        }
     }
 
     /// Fire the configured `MemoryExtractor` on a background task. The
@@ -1288,15 +1475,7 @@ impl Engine {
                     return;
                 }
             };
-            let messages: Vec<Message> = rows
-                .into_iter()
-                .map(|r| Message {
-                    id: r.id,
-                    role: r.role,
-                    content: r.content,
-                    created_at: r.created_at,
-                })
-                .collect();
+            let messages: Vec<Message> = rows.into_iter().map(message_from_persisted).collect();
             let proposals = extractor.extract(&tenant, &project, &messages).await;
             if proposals.is_empty() {
                 return;
@@ -1634,15 +1813,12 @@ impl Engine {
         // tail = 0) since the kept tail was already sliced off
         // above — the summariser doesn't need to see verbatim
         // results for anything in this set.
-        let body_msgs: Vec<Message> = body_rows
-            .iter()
-            .map(|r| Message {
-                id: r.id,
-                role: r.role,
-                content: r.content.clone(),
-                created_at: r.created_at,
-            })
-            .collect();
+        // Neutralize any already-redacted (poison) rows here too — a
+        // summary request that renders their flagged content would itself
+        // trip the provider's content filter, so `message_from_persisted`
+        // substitutes the placeholder before the body is rendered.
+        let body_count = body_rows.len();
+        let body_msgs: Vec<Message> = body_rows.into_iter().map(message_from_persisted).collect();
         let body_collapsed =
             collapse_old_tool_results(body_msgs, 0, self.config.collapse_tool_results_threshold);
         // Cap each block AND the aggregate so a band of large error / Bash
@@ -1655,7 +1831,6 @@ impl Engine {
             SUMMARY_BLOCK_MAX_BYTES,
             SUMMARY_TOTAL_MAX_BYTES,
         );
-        let body_count = body_rows.len();
 
         // Build a single-shot summarization request. We deliberately
         // re-use the engine's LLM client and the same model — using a
@@ -3785,6 +3960,130 @@ pub(crate) fn is_context_length_error(err: &LlmError) -> bool {
         "input length exceeds",
     ];
     HINTS.iter().any(|h| haystack.contains(h))
+}
+
+/// Placeholder substituted for a redacted message's body. Kept short so
+/// it stays well under `collapse_tool_results_threshold` (the collapse
+/// pass leaves it alone) and carries no flaggable content of its own.
+pub(crate) const REDACTED_PLACEHOLDER: &str =
+    "[SNACA: content omitted — flagged by provider content policy]";
+
+/// Whether this error is a provider content-moderation rejection that the
+/// engine should recover from by localizing and redacting the offending
+/// history message (rather than surfacing a hard error that bricks the
+/// thread on every replayed turn).
+pub(crate) fn is_content_filter_error(err: &LlmError) -> bool {
+    matches!(err, LlmError::ContentFiltered { .. })
+}
+
+/// Rewrite a single content block into a structurally-identical but
+/// content-free form. Preserves everything the provider's message-shape
+/// validation and tool_use/tool_result pairing depend on — block kind,
+/// `ToolUse` id + name, `ToolResult` tool_use_id + is_error — while
+/// replacing every free-text / argument / image payload with
+/// [`REDACTED_PLACEHOLDER`]. Redacting any message therefore never
+/// orphans a tool_result or drops a tool_use.
+fn redact_block(block: ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::Text { .. } | ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => {
+            ContentBlock::text(REDACTED_PLACEHOLDER)
+        }
+        ContentBlock::ToolUse { id, name, .. } => ContentBlock::ToolUse {
+            id,
+            name,
+            input: serde_json::json!({ "_snaca_redacted": true }),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        } => ContentBlock::ToolResult {
+            tool_use_id,
+            content: vec![ContentBlock::text(REDACTED_PLACEHOLDER)],
+            is_error,
+        },
+    }
+}
+
+/// Apply [`redact_block`] to every block of a message's content.
+fn redact_message_content(content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    content.into_iter().map(redact_block).collect()
+}
+
+/// Build the LLM-facing [`Message`] from a persisted row, substituting a
+/// neutral placeholder for the body when the row is marked redacted.
+fn message_from_persisted(row: snaca_state::MessageRow) -> Message {
+    let content = if row.redacted_at.is_some() {
+        redact_message_content(row.content)
+    } else {
+        row.content
+    };
+    Message {
+        id: row.id,
+        role: row.role,
+        content,
+        created_at: row.created_at,
+    }
+}
+
+/// Outcome of [`Engine::localize_and_redact_poison`].
+enum PoisonLocation {
+    /// The offending message(s) were localized and marked redacted; a
+    /// retry of the turn will now pass the content filter.
+    Redacted(Vec<MessageId>),
+    /// The poison is in a user message or the system prompt — nothing the
+    /// engine can safely auto-redact. The caller degrades gracefully.
+    Unredactable,
+}
+
+/// Result of a single content-moderation probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// The request passed the provider's content filter.
+    Passed,
+    /// The provider's content filter rejected the request.
+    Filtered,
+}
+
+/// Assemble a probe history from raw rows, neutralizing every row in
+/// `redact_ids` (the in-memory trial set) as well as rows already marked
+/// redacted in the DB. Mirrors `load_history`'s non-compaction pipeline
+/// (window → byte-cap → collapse) so a probe's shape matches what a real
+/// turn would send; pairing repair is applied by the caller.
+fn build_probe_history(
+    rows: &[snaca_state::MessageRow],
+    redact_ids: &HashSet<MessageId>,
+    cfg: &EngineConfig,
+) -> Vec<Message> {
+    let msgs: Vec<Message> = rows
+        .iter()
+        .map(|r| {
+            let redact = r.redacted_at.is_some() || redact_ids.contains(&r.id);
+            let content = if redact {
+                redact_message_content(r.content.clone())
+            } else {
+                r.content.clone()
+            };
+            Message {
+                id: r.id,
+                role: r.role,
+                content,
+                created_at: r.created_at,
+            }
+        })
+        .collect();
+    let windowed = trim_to_conversation_window(msgs, cfg.conversation_history_limit as usize);
+    let bounded = enforce_history_byte_cap(
+        windowed,
+        cfg.history_max_bytes,
+        cfg.compact_keep_recent,
+        cfg.max_tool_result_bytes,
+    );
+    collapse_old_tool_results(
+        bounded,
+        cfg.compact_keep_recent,
+        cfg.collapse_tool_results_threshold,
+    )
 }
 
 #[cfg(test)]

@@ -71,6 +71,22 @@ pub struct EngineConfig {
     /// converge on the first try.
     pub malformed_tool_args_max_retries: u8,
 
+    /// Per-turn cap on transparent recovery from
+    /// `LlmError::ContentFiltered` — the provider's content-moderation
+    /// layer rejecting the request (e.g. DeepSeek "Content Exists Risk").
+    /// The flagged content is almost always a *persisted* history message
+    /// (a WebSearch/WebFetch tool_result carrying politically sensitive
+    /// external text), so replaying the thread re-triggers the filter on
+    /// every turn and bricks the thread. On each strike the engine
+    /// binary-searches the current window to localize the poison
+    /// message(s), marks them redacted (`load_history` then substitutes a
+    /// neutral placeholder), and re-runs the turn. Bounds how many
+    /// localize-and-redact rounds run before the engine gives up and
+    /// surfaces a graceful degraded message. Set to 0 to disable (surface
+    /// the error immediately). Default 4 — a round can redact one poison
+    /// message, and a thread rarely holds more than a couple.
+    pub content_filter_max_retries: u8,
+
     /// Hard cap on the summariser's output tokens. The summary is fed
     /// back as a synthetic preamble on every subsequent turn until the
     /// thread compacts again, so a fat summary just trades old-message
@@ -244,6 +260,7 @@ impl EngineConfig {
             protect_first_n: 4,
             compact_max_retries: 3,
             malformed_tool_args_max_retries: 2,
+            content_filter_max_retries: 4,
             compact_summary_max_tokens: 2048,
             compact_blocking: false,
             loop_guard_max_repeats: Some(5),

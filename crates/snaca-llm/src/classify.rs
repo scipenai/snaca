@@ -53,6 +53,24 @@ pub fn classify_http_error(
         return LlmError::ContextOverflow;
     }
 
+    // (1b) Content-moderation phrasing also wins regardless of status.
+    // DeepSeek carries "Content Exists Risk" in a 400
+    // `invalid_request_error`, so a plain status/envelope match would
+    // mislabel it as a generic `Provider` error. The engine's recovery
+    // path (localize + redact the poison history message) depends on
+    // this dedicated variant.
+    if looks_like_content_filter(provider_message, body) {
+        let code = provider_error_code
+            .or(provider_error_type)
+            .map(str::to_string)
+            .unwrap_or_else(|| status.to_string());
+        let message = provider_message.unwrap_or("content flagged by provider moderation");
+        return LlmError::ContentFiltered {
+            code,
+            message: message.to_string(),
+        };
+    }
+
     // (2) Status-code mapping.
     match status {
         429 => return LlmError::RateLimited { retry_after },
@@ -139,6 +157,33 @@ fn looks_like_context_overflow(message: Option<&str>, body: &str) -> bool {
         "input length exceeds",
         "string too long",
         "request too large",
+    ];
+    let haystacks = [message.unwrap_or(""), body];
+    for h in haystacks {
+        let lower = h.to_ascii_lowercase();
+        if HINTS.iter().any(|p| lower.contains(p)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Heuristic match for "the provider's content-moderation layer rejected
+/// this request". These are distinct from context-overflow and from
+/// ordinary invalid-request errors: the request is well-formed, but its
+/// *content* tripped a safety/compliance filter. Because the flagged
+/// content is usually a persisted history message, the engine needs to
+/// recognise this class to localize and redact the poison rather than
+/// bricking the thread.
+fn looks_like_content_filter(message: Option<&str>, body: &str) -> bool {
+    const HINTS: &[&str] = &[
+        "content exists risk", // DeepSeek
+        "content_filter",      // OpenAI finish_reason / error code
+        "content management policy",
+        "content policy",
+        "data_inspection_failed", // Alibaba / Qwen (DashScope)
+        "risk of illegal",
+        "flagged by content",
     ];
     let haystacks = [message.unwrap_or(""), body];
     for h in haystacks {
@@ -263,6 +308,57 @@ mod tests {
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens (context_length_exceeded)."}}"#,
         );
         assert!(matches!(e, LlmError::ContextOverflow));
+    }
+
+    #[test]
+    fn deepseek_content_exists_risk_is_content_filtered() {
+        // DeepSeek returns 400 invalid_request_error with this exact
+        // message when moderation rejects the request. It must NOT be
+        // mislabeled as a generic Provider error.
+        let e = classify_http_error(
+            400,
+            None,
+            Some("invalid_request_error"),
+            None,
+            Some("Content Exists Risk"),
+            "",
+        );
+        match e {
+            LlmError::ContentFiltered { code, message } => {
+                assert_eq!(code, "invalid_request_error");
+                assert_eq!(message, "Content Exists Risk");
+            }
+            other => panic!("expected ContentFiltered, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn content_filter_detected_in_raw_body() {
+        // Some providers only put the moderation signal in the raw body.
+        let e = classify_http_error(
+            400,
+            None,
+            None,
+            None,
+            None,
+            r#"{"error":{"message":"Output data may contain inappropriate content.","code":"data_inspection_failed"}}"#,
+        );
+        assert!(matches!(e, LlmError::ContentFiltered { .. }));
+    }
+
+    #[test]
+    fn ordinary_invalid_request_is_not_content_filtered() {
+        // A generic invalid_request_error without moderation phrasing must
+        // still fall through to the Provider envelope, not ContentFiltered.
+        let e = classify_http_error(
+            400,
+            None,
+            Some("invalid_request_error"),
+            None,
+            Some("Missing required parameter: model"),
+            "",
+        );
+        assert!(matches!(e, LlmError::Provider { .. }));
     }
 
     #[test]

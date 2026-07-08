@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS messages (
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    -- Set when the engine localizes this message as the cause of a
+    -- provider content-moderation rejection (e.g. DeepSeek "Content
+    -- Exists Risk"). `load_history` then replaces its body with a neutral
+    -- placeholder so the flagged content stops re-triggering the filter
+    -- on every replayed turn. NULL = not redacted. Legacy DBs acquire the
+    -- column via the in-place ALTER migration in db.rs.
+    redacted_at TEXT,
     FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
 

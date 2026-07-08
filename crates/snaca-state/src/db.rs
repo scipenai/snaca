@@ -72,7 +72,30 @@ impl Database {
         self.migrate_approval_decisions_add_input_signature()
             .await?;
         self.migrate_thread_compactions_add_summary_from().await?;
+        self.migrate_messages_add_redacted().await?;
         self.migrate_messages_fts_backfill().await?;
+        Ok(())
+    }
+
+    /// Add the `redacted_at` column to `messages` on legacy DBs. Fresh
+    /// DBs get it via `schema.sql`. Nullable (no default needed): existing
+    /// rows read back as `NULL` = not redacted. Idempotent — skips when
+    /// the column already exists.
+    async fn migrate_messages_add_redacted(&self) -> StateResult<()> {
+        let rows = sqlx::query("PRAGMA table_info(messages)")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_col = rows.iter().any(|r| {
+            r.try_get::<String, _>("name")
+                .map(|n| n == "redacted_at")
+                .unwrap_or(false)
+        });
+        if has_col {
+            return Ok(());
+        }
+        sqlx::query("ALTER TABLE messages ADD COLUMN redacted_at TEXT")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -330,7 +353,21 @@ impl Database {
             role: msg.role,
             content: msg.content.clone(),
             created_at: now,
+            redacted_at: None,
         })
+    }
+
+    /// Mark a message as redacted. `load_history` will replace its body
+    /// with a neutral placeholder from now on, so a message whose content
+    /// tripped a provider content filter stops re-poisoning every replayed
+    /// turn. Idempotent; a no-op if the id doesn't exist.
+    pub async fn mark_message_redacted(&self, id: &MessageId) -> StateResult<()> {
+        sqlx::query("UPDATE messages SET redacted_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn recent_messages(
@@ -339,7 +376,7 @@ impl Database {
         limit: u32,
     ) -> StateResult<Vec<MessageRow>> {
         let rows = sqlx::query(
-            "SELECT id, thread_id, session_id, role, content, created_at FROM messages \
+            "SELECT id, thread_id, session_id, role, content, created_at, redacted_at FROM messages \
              WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(thread.as_str())
@@ -367,7 +404,7 @@ impl Database {
         limit: u32,
     ) -> StateResult<Vec<MessageRow>> {
         let rows = sqlx::query(
-            "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+            "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at, m.redacted_at \
              FROM messages m \
              JOIN threads t ON t.id = m.thread_id \
              WHERE m.thread_id = ? AND t.tenant_id = ? AND t.project_id = ? \
@@ -412,7 +449,7 @@ impl Database {
         // join filters to messages whose thread belongs to the
         // caller's project. `bm25(messages_fts)` returns ascending
         // (lower = better match) so we ORDER BY it directly.
-        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at, m.redacted_at \
                    FROM messages_fts \
                    JOIN messages m ON m.rowid = messages_fts.rowid \
                    JOIN threads t ON t.id = m.thread_id \
@@ -455,7 +492,7 @@ impl Database {
         query: &str,
         limit: u32,
     ) -> StateResult<Vec<MessageRow>> {
-        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at \
+        let sql = "SELECT m.id, m.thread_id, m.session_id, m.role, m.content, m.created_at, m.redacted_at \
                    FROM messages_fts \
                    JOIN messages m ON m.rowid = messages_fts.rowid \
                    JOIN threads t ON t.id = m.thread_id \
@@ -499,7 +536,7 @@ impl Database {
         limit: u32,
     ) -> StateResult<Vec<MessageRow>> {
         let rows = sqlx::query(
-            "SELECT id, thread_id, session_id, role, content, created_at FROM messages \
+            "SELECT id, thread_id, session_id, role, content, created_at, redacted_at FROM messages \
              WHERE thread_id = ? \
                AND created_at < COALESCE( \
                      (SELECT created_at FROM messages WHERE id = ?), \
@@ -530,7 +567,7 @@ impl Database {
         // earliest possible time so the query degrades to "all messages"
         // instead of returning empty silently.
         let rows = sqlx::query(
-            "SELECT id, thread_id, session_id, role, content, created_at FROM messages \
+            "SELECT id, thread_id, session_id, role, content, created_at, redacted_at FROM messages \
              WHERE thread_id = ? \
                AND created_at > COALESCE( \
                      (SELECT created_at FROM messages WHERE id = ?), \
@@ -1401,6 +1438,10 @@ fn message_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<MessageRow> {
         role: role_from_str(&row.try_get::<String, _>("role")?)?,
         content,
         created_at: parse_dt(&row.try_get::<String, _>("created_at")?)?,
+        redacted_at: row
+            .try_get::<Option<String>, _>("redacted_at")?
+            .map(|s| parse_dt(&s))
+            .transpose()?,
     })
 }
 
@@ -1663,6 +1704,86 @@ mod tests {
             ContentBlock::Text { text } => assert_eq!(text, "hi"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn mark_message_redacted_sets_redacted_at() {
+        let db = db().await;
+        let thread = NewThread {
+            id: ThreadId::new("chat_redact"),
+            tenant_id: TenantId::new("t"),
+            project_id: ProjectId::from_raw("p"),
+        };
+        db.insert_thread(&thread).await.unwrap();
+        let session = SessionId::new();
+        let poison = db
+            .append_message(&NewMessage {
+                thread_id: thread.id.clone(),
+                session_id: session,
+                role: Role::Tool,
+                content: vec![ContentBlock::text("flagged external content")],
+            })
+            .await
+            .unwrap();
+        // Fresh row: not redacted.
+        assert!(poison.redacted_at.is_none());
+        let before = db.recent_messages(&thread.id, 10).await.unwrap();
+        assert!(before[0].redacted_at.is_none());
+
+        db.mark_message_redacted(&poison.id).await.unwrap();
+
+        let after = db.recent_messages(&thread.id, 10).await.unwrap();
+        assert!(
+            after[0].redacted_at.is_some(),
+            "redacted_at must be set after mark_message_redacted"
+        );
+        // Idempotent — a second call must not error.
+        db.mark_message_redacted(&poison.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_messages_add_redacted_upgrades_legacy_db() {
+        // Build a pre-redacted-column `messages` table by hand, then run
+        // migrations and confirm the column is added and queries work.
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let db = Database { pool };
+
+        // First pass adds the column; also proves the full schema + other
+        // migrations coexist with the legacy table.
+        db.run_migrations().await.unwrap();
+        // Idempotent: second pass is a no-op (column already present).
+        db.run_migrations().await.unwrap();
+
+        let cols = sqlx::query("PRAGMA table_info(messages)")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let has_redacted = cols.iter().any(|r| {
+            r.try_get::<String, _>("name")
+                .map(|n| n == "redacted_at")
+                .unwrap_or(false)
+        });
+        assert!(has_redacted, "migration must add the redacted_at column");
     }
 
     #[tokio::test]
