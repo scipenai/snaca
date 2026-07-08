@@ -142,6 +142,133 @@ async fn seed_thread_with_poison(db: &Database, thread: &ThreadId) {
     .unwrap();
 }
 
+/// Seed `thread` with `poison_count` poison tool_results interleaved with
+/// innocent ones, so localization must peel off multiple poisons across
+/// rounds (exercising the both-halves branch of the binary search).
+async fn seed_thread_with_multiple_poisons(db: &Database, thread: &ThreadId, poison_count: usize) {
+    db.insert_thread(&NewThread {
+        id: thread.clone(),
+        tenant_id: TenantId::new("tenant_a"),
+        project_id: ProjectId::from_raw("proj_x"),
+    })
+    .await
+    .unwrap();
+    let session = SessionId::new();
+    for i in 0..poison_count {
+        // An innocent tool_result between poisons so redaction can't just
+        // blanket the tail.
+        let call_ok = format!("call_ok_{i}");
+        db.append_message(&NewMessage {
+            thread_id: thread.clone(),
+            session_id: session,
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                call_ok.as_str(),
+                "WebSearch",
+                serde_json::json!({ "query": "safe topic" }),
+            )],
+        })
+        .await
+        .unwrap();
+        db.append_message(&NewMessage {
+            thread_id: thread.clone(),
+            session_id: session,
+            role: Role::Tool,
+            content: vec![ContentBlock::tool_result(
+                ToolUseId::new(call_ok.as_str()),
+                vec![ContentBlock::text(format!("innocent result {i}"))],
+            )],
+        })
+        .await
+        .unwrap();
+        let call_bad = format!("call_bad_{i}");
+        db.append_message(&NewMessage {
+            thread_id: thread.clone(),
+            session_id: session,
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                call_bad.as_str(),
+                "WebSearch",
+                serde_json::json!({ "query": "headlines" }),
+            )],
+        })
+        .await
+        .unwrap();
+        db.append_message(&NewMessage {
+            thread_id: thread.clone(),
+            session_id: session,
+            role: Role::Tool,
+            content: vec![ContentBlock::tool_result(
+                ToolUseId::new(call_bad.as_str()),
+                vec![ContentBlock::text(format!("result {i}: {POISON} flagged"))],
+            )],
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn multiple_poisons_are_peeled_off_across_rounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = WorkspaceLayout::new(tmp.path()).unwrap();
+    let db = Database::open_in_memory().await.unwrap();
+    let tools = ToolRegistryBuilder::default().add(EchoTool).build();
+    let llm = Arc::new(PoisonAwareLlm::new("all clean now"));
+    let mut cfg = EngineConfig::default_for("mock-model");
+    cfg.content_filter_max_retries = 6;
+    let engine = Engine::new(llm.clone(), tools, db.clone(), workspace, cfg);
+
+    let thread = ThreadId::new("chat_multi_poison");
+    let poison_count = 3;
+    seed_thread_with_multiple_poisons(&db, &thread, poison_count).await;
+
+    let outcome = engine
+        .handle_turn(TurnRequest {
+            tenant_id: TenantId::new("tenant_a"),
+            project_id: ProjectId::from_raw("proj_x"),
+            thread_id: thread.clone(),
+            user_text: "please continue".into(),
+            message_id: None,
+        })
+        .await
+        .expect("thread with several poisons should still heal");
+
+    assert_eq!(outcome.assistant_text, "all clean now");
+
+    let rows = db.recent_messages(&thread, 100).await.unwrap();
+    // Exactly the poison tool_results are redacted — no more, no less.
+    let redacted_poison = rows
+        .iter()
+        .filter(|r| r.redacted_at.is_some())
+        .filter(|r| {
+            r.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { tool_use_id, .. }
+                    if tool_use_id.to_string().starts_with("call_bad_"))
+            })
+        })
+        .count();
+    assert_eq!(
+        redacted_poison, poison_count,
+        "every poison tool_result should be redacted"
+    );
+    // Innocent tool_results are preserved.
+    let redacted_innocent = rows
+        .iter()
+        .filter(|r| r.redacted_at.is_some())
+        .filter(|r| {
+            r.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { tool_use_id, .. }
+                    if tool_use_id.to_string().starts_with("call_ok_"))
+            })
+        })
+        .count();
+    assert_eq!(
+        redacted_innocent, 0,
+        "innocent tool_results must never be redacted"
+    );
+}
+
 #[tokio::test]
 async fn poison_tool_result_is_localized_and_thread_heals() {
     let tmp = tempfile::tempdir().unwrap();
