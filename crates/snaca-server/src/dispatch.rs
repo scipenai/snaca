@@ -2419,7 +2419,10 @@ mod tests {
         let out = attachment_summary(std::slice::from_ref(&att));
         assert!(out.contains("旭华实验店推进工作2 · 商业洞察(1).docx"));
         assert!(!out.contains("0 bytes"), "must not echo a fake size: {out}");
-        assert!(!out.contains("octet-stream"), "must not echo a fake mime: {out}");
+        assert!(
+            !out.contains("octet-stream"),
+            "must not echo a fake mime: {out}"
+        );
         // And it tells the model the file is already local, not a link.
         assert!(out.contains("已接收并保存到本地"));
     }
