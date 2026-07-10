@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use snaca_agent_api::{NoopApprovalGate, NoopQuestionGate};
 use snaca_engine::{Engine, EngineConfig, NoopListener, TurnEventListener, TurnRequest};
 use snaca_llm::{ContentDelta as LlmDelta, LlmClient};
-use snaca_state::{Database, SqliteConversationStore};
+use snaca_state::SqliteConversationStore;
 use snaca_workspace::{LocalWorkspaceProvider, WorkspaceLayout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +49,7 @@ pub use snaca_llm::{
     LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps, RetryConfig,
     RetryingLlmClient, StopReason, StreamEvent,
 };
+pub use snaca_state::{Database, MessageRow, StateError, StateResult, ThreadRow, ThreadSummaryRow};
 pub use snaca_tools_api::{
     ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolRegistry,
     ToolResult,

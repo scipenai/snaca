@@ -4,7 +4,7 @@ use crate::error::{StateError, StateResult};
 use crate::models::{
     ChatBinding, MessageRow, NewMessage, NewOutboxEntry, NewScheduledTask, NewThread, OutboxKind,
     OutboxRow, OutboxStatus, PersistedDecision, ScheduledTask, StoredApprovalDecision,
-    ThreadCompaction, ThreadRow, ToolCallRow,
+    ThreadCompaction, ThreadRow, ThreadSummaryRow, ToolCallRow,
 };
 use chrono::{DateTime, Utc};
 use snaca_core::{
@@ -651,6 +651,131 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         row.map(compaction_from_row).transpose()
+    }
+
+    // -------- sidecar metadata (thread_meta / message_meta) --------
+    //
+    // Downstream-writable opaque JSON attached 1:1 to a thread or message.
+    // snaca never interprets `data`; hosts embedding snaca as a library stash
+    // their own attributes (conversation title, turn grouping, ...) here so the
+    // core `threads` / `messages` tables stay domain-agnostic. Writes replace
+    // the whole blob (latest wins); the referenced row's `ON DELETE CASCADE`
+    // reaps the metadata when the thread / message is deleted.
+
+    /// Upsert the opaque metadata blob for `thread`. The latest call wins.
+    pub async fn set_thread_meta(
+        &self,
+        thread: &ThreadId,
+        data: &serde_json::Value,
+    ) -> StateResult<()> {
+        let data_json = serde_json::to_string(data)?;
+        sqlx::query(
+            "INSERT INTO thread_meta (thread_id, data) VALUES (?, ?) \
+             ON CONFLICT(thread_id) DO UPDATE SET data = excluded.data",
+        )
+        .bind(thread.as_str())
+        .bind(data_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The opaque metadata blob for `thread`, or `None` if never set.
+    pub async fn get_thread_meta(
+        &self,
+        thread: &ThreadId,
+    ) -> StateResult<Option<serde_json::Value>> {
+        let row = sqlx::query("SELECT data FROM thread_meta WHERE thread_id = ?")
+            .bind(thread.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| Ok(serde_json::from_str(&r.try_get::<String, _>("data")?)?))
+            .transpose()
+    }
+
+    /// Upsert the opaque metadata blob for `message`. The latest call wins.
+    pub async fn set_message_meta(
+        &self,
+        message: &MessageId,
+        data: &serde_json::Value,
+    ) -> StateResult<()> {
+        let data_json = serde_json::to_string(data)?;
+        sqlx::query(
+            "INSERT INTO message_meta (message_id, data) VALUES (?, ?) \
+             ON CONFLICT(message_id) DO UPDATE SET data = excluded.data",
+        )
+        .bind(message.to_string())
+        .bind(data_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The opaque metadata blob for `message`, or `None` if never set.
+    pub async fn get_message_meta(
+        &self,
+        message: &MessageId,
+    ) -> StateResult<Option<serde_json::Value>> {
+        let row = sqlx::query("SELECT data FROM message_meta WHERE message_id = ?")
+            .bind(message.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| Ok(serde_json::from_str(&r.try_get::<String, _>("data")?)?))
+            .transpose()
+    }
+
+    /// All message metadata for a thread in one query — avoids N+1 when a host
+    /// renders turn-grouped messages. Only messages that have metadata appear.
+    pub async fn get_message_meta_for_thread(
+        &self,
+        thread: &ThreadId,
+    ) -> StateResult<Vec<(MessageId, serde_json::Value)>> {
+        let rows = sqlx::query(
+            "SELECT mm.message_id, mm.data FROM message_meta mm \
+             JOIN messages m ON m.id = mm.message_id \
+             WHERE m.thread_id = ?",
+        )
+        .bind(thread.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                let id = MessageId::from_uuid(parse_uuid(&r.try_get::<String, _>("message_id")?)?);
+                let data = serde_json::from_str(&r.try_get::<String, _>("data")?)?;
+                Ok((id, data))
+            })
+            .collect()
+    }
+
+    /// Per-thread conversation summaries for `(tenant, project)`, one row per
+    /// thread. `turn_count` is `COUNT(DISTINCT session_id)` — snaca stamps one
+    /// `session_id` per turn, so this is the domain-agnostic turn analog. The
+    /// raw `thread_meta` blob rides along as `meta` (snaca does not parse it);
+    /// hosts read their own `title` etc. out of it. Ordered most-recently-active
+    /// first, threads with no messages last.
+    pub async fn list_thread_summaries(
+        &self,
+        tenant: &TenantId,
+        project: &ProjectId,
+    ) -> StateResult<Vec<ThreadSummaryRow>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.tenant_id, t.project_id, t.created_at, \
+                    MAX(m.created_at)            AS last_active_at, \
+                    COUNT(m.id)                  AS message_count, \
+                    COUNT(DISTINCT m.session_id) AS turn_count, \
+                    tm.data                      AS meta \
+             FROM threads t \
+             LEFT JOIN messages m      ON m.thread_id  = t.id \
+             LEFT JOIN thread_meta tm  ON tm.thread_id = t.id \
+             WHERE t.tenant_id = ? AND t.project_id = ? \
+             GROUP BY t.id \
+             ORDER BY (last_active_at IS NULL), last_active_at DESC, t.created_at DESC",
+        )
+        .bind(tenant.as_str())
+        .bind(project.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(thread_summary_from_row).collect()
     }
 
     // -------- tool_calls --------
@@ -1493,6 +1618,31 @@ fn compaction_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<ThreadCompac
     })
 }
 
+fn thread_summary_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<ThreadSummaryRow> {
+    // `MAX`/`COUNT` over a LEFT JOIN yield NULL / 0 for a thread with no
+    // messages; `meta` is NULL when the thread has no thread_meta row.
+    let last_active_at = row
+        .try_get::<Option<String>, _>("last_active_at")?
+        .map(|s| parse_dt(&s))
+        .transpose()?;
+    let meta = row
+        .try_get::<Option<String>, _>("meta")?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?;
+    Ok(ThreadSummaryRow {
+        thread: ThreadRow {
+            id: ThreadId::new(row.try_get::<String, _>("id")?),
+            tenant_id: TenantId::new(row.try_get::<String, _>("tenant_id")?),
+            project_id: ProjectId::from_raw(row.try_get::<String, _>("project_id")?),
+            created_at: parse_dt(&row.try_get::<String, _>("created_at")?)?,
+        },
+        last_active_at,
+        message_count: row.try_get::<i64, _>("message_count")?.max(0) as u64,
+        turn_count: row.try_get::<i64, _>("turn_count")?.max(0) as u64,
+        meta,
+    })
+}
+
 fn outbox_from_row(row: sqlx::sqlite::SqliteRow) -> StateResult<OutboxRow> {
     let kind_raw: String = row.try_get("kind")?;
     let kind = OutboxKind::parse(&kind_raw)
@@ -2319,5 +2469,213 @@ mod tests {
             .await
             .unwrap();
         assert!(!after);
+    }
+
+    // -------- sidecar metadata (thread_meta / message_meta) --------
+
+    async fn seed_thread(db: &Database, id: &str, tenant: &str, project: &str) -> ThreadId {
+        let t = NewThread {
+            id: ThreadId::new(id),
+            tenant_id: TenantId::new(tenant),
+            project_id: ProjectId::from_raw(project),
+        };
+        db.insert_thread(&t).await.unwrap();
+        t.id
+    }
+
+    #[tokio::test]
+    async fn thread_meta_roundtrips_and_overwrites() {
+        let db = db().await;
+        let thread = seed_thread(&db, "chat_meta", "t", "p").await;
+
+        // Unset -> None.
+        assert!(db.get_thread_meta(&thread).await.unwrap().is_none());
+
+        db.set_thread_meta(&thread, &serde_json::json!({"title": "First"}))
+            .await
+            .unwrap();
+        let got = db.get_thread_meta(&thread).await.unwrap().unwrap();
+        assert_eq!(got["title"], "First");
+
+        // Second set replaces the whole blob (latest wins).
+        db.set_thread_meta(&thread, &serde_json::json!({"title": "Renamed"}))
+            .await
+            .unwrap();
+        let got = db.get_thread_meta(&thread).await.unwrap().unwrap();
+        assert_eq!(got["title"], "Renamed");
+    }
+
+    #[tokio::test]
+    async fn message_meta_roundtrips_and_batch_reads_per_thread() {
+        let db = db().await;
+        let thread = seed_thread(&db, "chat_mm", "t", "p").await;
+        let session = SessionId::new();
+        let m1 = db
+            .append_message(&NewMessage {
+                thread_id: thread.clone(),
+                session_id: session,
+                role: Role::User,
+                content: vec![ContentBlock::text("hi")],
+            })
+            .await
+            .unwrap();
+        let m2 = db
+            .append_message(&NewMessage {
+                thread_id: thread.clone(),
+                session_id: session,
+                role: Role::Assistant,
+                content: vec![ContentBlock::text("hello")],
+            })
+            .await
+            .unwrap();
+
+        assert!(db.get_message_meta(&m1.id).await.unwrap().is_none());
+        db.set_message_meta(&m1.id, &serde_json::json!({"turn_id": "turn-1"}))
+            .await
+            .unwrap();
+        db.set_message_meta(&m2.id, &serde_json::json!({"turn_id": "turn-1"}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_message_meta(&m1.id).await.unwrap().unwrap()["turn_id"],
+            "turn-1"
+        );
+
+        // Batch: both messages have meta; the map keys back to their ids.
+        let batch = db.get_message_meta_for_thread(&thread).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|(_, data)| data["turn_id"] == "turn-1"));
+        assert!(batch.iter().any(|(id, _)| *id == m1.id));
+        assert!(batch.iter().any(|(id, _)| *id == m2.id));
+    }
+
+    #[tokio::test]
+    async fn deleting_thread_cascades_sidecar_metadata() {
+        let db = db().await;
+        let thread = seed_thread(&db, "chat_cascade", "t", "p").await;
+        let session = SessionId::new();
+        let msg = db
+            .append_message(&NewMessage {
+                thread_id: thread.clone(),
+                session_id: session,
+                role: Role::User,
+                content: vec![ContentBlock::text("hi")],
+            })
+            .await
+            .unwrap();
+        db.set_thread_meta(&thread, &serde_json::json!({"title": "Doomed"}))
+            .await
+            .unwrap();
+        db.set_message_meta(&msg.id, &serde_json::json!({"turn_id": "t"}))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM threads WHERE id = ?")
+            .bind(thread.as_str())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // FK ON DELETE CASCADE reaps both sidecars (message_meta via messages).
+        let thread_meta: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM thread_meta WHERE thread_id = ?")
+                .bind(thread.as_str())
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(thread_meta, None);
+        let msg_meta: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM message_meta WHERE message_id = ?")
+                .bind(msg.id.to_string())
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(msg_meta, None);
+    }
+
+    #[tokio::test]
+    async fn list_thread_summaries_aggregates_activity_and_meta() {
+        let db = db().await;
+        // Thread A: two turns (two distinct session_ids), 3 messages, has title.
+        let a = seed_thread(&db, "A", "t", "p").await;
+        for (sid, role, text) in [
+            (SessionId::new(), Role::User, "q1"),
+            (SessionId::new(), Role::User, "q2"),
+        ] {
+            db.append_message(&NewMessage {
+                thread_id: a.clone(),
+                session_id: sid,
+                role,
+                content: vec![ContentBlock::text(text)],
+            })
+            .await
+            .unwrap();
+            // second message in the same turn for the last session
+            db.append_message(&NewMessage {
+                thread_id: a.clone(),
+                session_id: sid,
+                role: Role::Assistant,
+                content: vec![ContentBlock::text("a")],
+            })
+            .await
+            .unwrap();
+        }
+        db.set_thread_meta(&a, &serde_json::json!({"title": "Titled A"}))
+            .await
+            .unwrap();
+
+        // Thread B: no messages, no meta.
+        seed_thread(&db, "B", "t", "p").await;
+
+        // Thread in a different project must not appear.
+        seed_thread(&db, "C", "t", "other").await;
+
+        let summaries = db
+            .list_thread_summaries(&TenantId::new("t"), &ProjectId::from_raw("p"))
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 2);
+
+        // Active thread A sorts before empty thread B.
+        let sa = &summaries[0];
+        assert_eq!(sa.thread.id.as_str(), "A");
+        assert_eq!(sa.message_count, 4);
+        assert_eq!(sa.turn_count, 2, "distinct session_id count");
+        assert!(sa.last_active_at.is_some());
+        assert_eq!(sa.meta.as_ref().unwrap()["title"], "Titled A");
+
+        let sb = &summaries[1];
+        assert_eq!(sb.thread.id.as_str(), "B");
+        assert_eq!(sb.message_count, 0);
+        assert_eq!(sb.turn_count, 0);
+        assert!(sb.last_active_at.is_none());
+        assert!(sb.meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn sidecar_tables_created_on_fresh_and_legacy_db() {
+        // A legacy pool without the sidecar tables gains them via
+        // `CREATE TABLE IF NOT EXISTS` in run_migrations (idempotent).
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        let db = Database { pool };
+        db.run_migrations().await.unwrap();
+        // Re-running is a no-op.
+        db.run_migrations().await.unwrap();
+        let thread = seed_thread(&db, "legacy", "t", "p").await;
+        db.set_thread_meta(&thread, &serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_thread_meta(&thread).await.unwrap().unwrap()["ok"],
+            true
+        );
     }
 }

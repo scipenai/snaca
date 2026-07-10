@@ -16,7 +16,7 @@ pub struct NewThread {
     pub project_id: ProjectId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadRow {
     pub id: ThreadId,
     pub tenant_id: TenantId,
@@ -86,6 +86,24 @@ pub struct ThreadCompaction {
     pub msg_count_before: u32,
     pub input_tokens_before: u32,
     pub compacted_at: DateTime<Utc>,
+}
+
+/// Aggregated per-thread summary for a conversation list. All fields except
+/// `meta` are computed from snaca's own tables, so this stays domain-agnostic:
+/// `turn_count` is `COUNT(DISTINCT messages.session_id)` — one `session_id` is
+/// stamped on every message of a single turn, making it the persisted analog of
+/// a "turn". `meta` is the raw opaque JSON a host stashed in `thread_meta`
+/// (e.g. a conversation title); snaca does not interpret it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummaryRow {
+    pub thread: ThreadRow,
+    /// `MAX(messages.created_at)`; `None` when the thread has no messages.
+    pub last_active_at: Option<DateTime<Utc>>,
+    pub message_count: u64,
+    /// `COUNT(DISTINCT messages.session_id)` — the upstream turn analog.
+    pub turn_count: u64,
+    /// Raw `thread_meta.data` JSON; `None` when no metadata was set.
+    pub meta: Option<serde_json::Value>,
 }
 
 /// Persisted approval decision for
