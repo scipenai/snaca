@@ -23,5 +23,5 @@ pub use error::{StateError, StateResult};
 pub use models::{
     ChatBinding, MessageRow, NewMessage, NewOutboxEntry, NewScheduledTask, NewThread, OutboxKind,
     OutboxRow, OutboxStatus, PersistedDecision, ScheduledTask, StoredApprovalDecision,
-    ThreadCompaction, ThreadRow, ToolCallRow,
+    ThreadCompaction, ThreadRow, ThreadSummaryRow, ToolCallRow,
 };

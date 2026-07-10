@@ -87,6 +87,25 @@ CREATE TABLE IF NOT EXISTS thread_compactions (
     FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
 
+-- Downstream-writable sidecar metadata. One row per thread / message
+-- (PK is the referenced id). `data` is opaque JSON to snaca: hosts embedding
+-- snaca as a library stash their own per-thread / per-message attributes here
+-- (e.g. an editor host's conversation title or turn grouping) without snaca
+-- knowing or caring about the shape. ON DELETE CASCADE ties the metadata's
+-- lifetime to the thread / message it annotates. New tables acquire on both
+-- fresh and legacy DBs via `CREATE TABLE IF NOT EXISTS` in run_migrations.
+CREATE TABLE IF NOT EXISTS thread_meta (
+    thread_id  TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS message_meta (
+    message_id TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+
 -- M2/M5: per-(tenant, project, tool, input) approval decisions remembered
 -- across turns. Decision values are 'allow' or 'deny'; 'allow_once' is not
 -- persisted (it expires with the turn it was granted in).

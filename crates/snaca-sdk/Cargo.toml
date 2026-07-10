@@ -36,6 +36,10 @@ path = "../../examples/sdk/custom_store.rs"
 name = "memory_live_demo"
 path = "../../examples/sdk/memory_live_demo.rs"
 
+[[example]]
+name = "r5_sidecar_downstream"
+path = "../../examples/sdk/r5_sidecar_downstream.rs"
+
 [dependencies]
 snaca-core.workspace = true
 snaca-agent-api.workspace = true
