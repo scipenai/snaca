@@ -60,6 +60,7 @@ async fn engine_runs_real_read_tool_against_workspace() {
             thread_id: ThreadId::new("chat_real"),
             user_text: "summarise README".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -124,6 +125,7 @@ async fn engine_surfaces_path_traversal_as_tool_error() {
             thread_id: ThreadId::new("chat_safety"),
             user_text: "show me passwd".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

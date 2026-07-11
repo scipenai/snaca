@@ -230,6 +230,7 @@ async fn multiple_poisons_are_peeled_off_across_rounds() {
             thread_id: thread.clone(),
             user_text: "please continue".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("thread with several poisons should still heal");
@@ -294,6 +295,7 @@ async fn poison_tool_result_is_localized_and_thread_heals() {
             thread_id: thread.clone(),
             user_text: "please continue".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("turn should recover, not error");
@@ -403,6 +405,7 @@ async fn live_deepseek_poison_thread_heals() {
             thread_id: thread.clone(),
             user_text: "只用一句话跟我打个招呼就好，不要调用任何工具，不要搜索。".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("thread must heal and the turn must succeed, not surface ContentFiltered");
@@ -468,6 +471,7 @@ async fn poison_in_user_message_degrades_gracefully() {
             thread_id: thread.clone(),
             user_text: format!("tell me about {POISON}"),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("turn should degrade gracefully, not error");

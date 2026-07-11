@@ -110,6 +110,7 @@ impl Agent {
                     thread_id: input.thread_id,
                     user_text: input.text,
                     message_id: input.message_id,
+                    ephemeral_system: input.ephemeral_system,
                 },
                 Arc::new(NoopApprovalGate),
                 Arc::new(NoopListener),
@@ -139,6 +140,7 @@ impl Agent {
                         thread_id: input.thread_id,
                         user_text: input.text,
                         message_id: input.message_id,
+                        ephemeral_system: input.ephemeral_system,
                     },
                     Arc::new(NoopApprovalGate),
                     listener,
@@ -245,6 +247,9 @@ pub struct AgentInput {
     pub project_id: Option<ProjectId>,
     pub thread_id: Option<ThreadId>,
     pub message_id: Option<String>,
+    /// Volatile per-turn system context (R1), appended after the cacheable
+    /// system prefix. `None` leaves the request identical to omitting it.
+    pub ephemeral_system: Option<String>,
 }
 
 impl AgentInput {
@@ -255,6 +260,7 @@ impl AgentInput {
             project_id: None,
             thread_id: None,
             message_id: None,
+            ephemeral_system: None,
         }
     }
 
@@ -278,6 +284,12 @@ impl AgentInput {
         self
     }
 
+    /// Set the volatile per-turn system context (R1).
+    pub fn ephemeral_system(mut self, ephemeral_system: impl Into<String>) -> Self {
+        self.ephemeral_system = Some(ephemeral_system.into());
+        self
+    }
+
     fn with_defaults(self, defaults: &AgentDefaults) -> ResolvedAgentInput {
         ResolvedAgentInput {
             text: self.text,
@@ -287,6 +299,7 @@ impl AgentInput {
                 .unwrap_or_else(|| defaults.project_id.clone()),
             thread_id: self.thread_id.unwrap_or_else(|| defaults.thread_id.clone()),
             message_id: self.message_id,
+            ephemeral_system: self.ephemeral_system,
         }
     }
 }
@@ -310,6 +323,7 @@ struct ResolvedAgentInput {
     project_id: ProjectId,
     thread_id: ThreadId,
     message_id: Option<String>,
+    ephemeral_system: Option<String>,
 }
 
 #[derive(Debug, Clone)]
