@@ -135,6 +135,9 @@ impl Tool for ZoteroSearchTool {
 #[tokio::main]
 async fn main() -> snaca_sdk::Result<()> {
     let base = std::env::temp_dir().join("snaca-editor-demo");
+    // Start from a clean slate so re-runs are deterministic — otherwise the
+    // persistent sqlite db under `base` accumulates messages/turns across runs.
+    std::fs::remove_dir_all(&base).ok();
     let data_root = base.join("data");
     let project_dir = base.join("user-project");
     std::fs::create_dir_all(&data_root).ok();

@@ -569,7 +569,9 @@ impl AgentBuilder {
             None => WorkspaceLayout::new(data_root)?,
         };
         if let Some(dir) = explicit_workspace {
-            workspace = workspace.with_explicit_workspace(dir)?;
+            // Resolve relatives against cwd, mirroring `data_root` — the two
+            // path setters stay consistent instead of one erroring on relatives.
+            workspace = workspace.with_explicit_workspace(ensure_absolute(dir)?)?;
         }
         let tools = tools.unwrap_or_else(ToolRegistry::empty);
         let config = config.unwrap_or_else(|| EngineConfig::default_for(model));

@@ -2844,7 +2844,7 @@ fn compose_system_segments(
     // after the cacheable prefix so it never busts the cache. Passed through
     // verbatim — the host owns its formatting. Absent/blank → nothing pushed,
     // keeping the request byte-identical to the pre-field behaviour.
-    if let Some(extra) = ephemeral_system.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(extra) = ephemeral_system.filter(|s| !s.trim().is_empty()) {
         segs.push(SystemSegment::volatile(extra.to_string()));
     }
     // Live workspace file listing — a VOLATILE (non-cacheable) segment
@@ -4265,6 +4265,11 @@ mod system_prompt_tests {
         // Blank ephemeral is treated as absent.
         let blank = compose_system_segments("BASE", "user/foo", "", "", Some("   "), None);
         assert_eq!(blank.len(), 1);
+        // Non-blank content is pushed verbatim — leading/trailing whitespace the
+        // host included is preserved, not normalized.
+        let padded =
+            compose_system_segments("BASE", "user/foo", "", "", Some("\n  keep me  "), None);
+        assert_eq!(padded[1].text, "\n  keep me  ");
     }
 
     #[test]

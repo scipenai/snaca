@@ -72,12 +72,19 @@ done
 # the public `snaca-sdk` facade alone — importing any snaca-internal crate would
 # mean the zero-source-diff submodule promise no longer holds. This is the
 # machine-checked form of that promise.
+internal_re='snaca_(engine|state|tools|tools_api|workspace|skills|mcp|memory|core|agent_api|llm|channel_protocol|channel_host|server)::'
 for ex in \
   examples/sdk/r5_sidecar_downstream.rs \
   examples/sdk/editor_like_downstream.rs
 do
-  if grep -nE '^[[:space:]]*use[[:space:]]+snaca_(engine|state|tools|tools_api|workspace|skills|mcp|memory|core|agent_api|llm|channel_protocol|channel_host|server)\b' "$ex"; then
-    fail "$ex imports a snaca-internal crate; the downstream harness must use the snaca_sdk facade only"
+  # A renamed/removed harness must break the gate loudly, not slip through as a
+  # false pass (grep on a missing file exits non-zero, which `if` swallows).
+  [ -f "$ex" ] || fail "expected downstream harness $ex is missing"
+  # Match any path into an internal crate — `use snaca_engine::…` AND inline
+  # `snaca_engine::Engine::new(…)` — not just `use` lines, so a fully-qualified
+  # reference can't bypass the facade-only rule.
+  if grep -nE "$internal_re" "$ex"; then
+    fail "$ex references a snaca-internal crate; the downstream harness must use the snaca_sdk facade only"
   fi
 done
 
