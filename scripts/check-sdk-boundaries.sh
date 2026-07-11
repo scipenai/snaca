@@ -68,4 +68,17 @@ do
   fi
 done
 
+# Facade-only gate: the downstream-integration harness examples must depend on
+# the public `snaca-sdk` facade alone — importing any snaca-internal crate would
+# mean the zero-source-diff submodule promise no longer holds. This is the
+# machine-checked form of that promise.
+for ex in \
+  examples/sdk/r5_sidecar_downstream.rs \
+  examples/sdk/editor_like_downstream.rs
+do
+  if grep -nE '^[[:space:]]*use[[:space:]]+snaca_(engine|state|tools|tools_api|workspace|skills|mcp|memory|core|agent_api|llm|channel_protocol|channel_host|server)\b' "$ex"; then
+    fail "$ex imports a snaca-internal crate; the downstream harness must use the snaca_sdk facade only"
+  fi
+done
+
 printf 'SDK boundary checks passed.\n'
