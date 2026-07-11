@@ -47,6 +47,7 @@ async fn write_tool_creates_new_file_in_workspace() {
             thread_id: ThreadId::new("chat_w"),
             user_text: "create src/lib.rs".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -101,6 +102,7 @@ async fn edit_tool_updates_existing_file() {
             thread_id: ThreadId::new("chat_e"),
             user_text: "rename main".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -172,6 +174,7 @@ async fn multi_edit_chain_is_atomic_via_engine() {
             thread_id: ThreadId::new("chat_me"),
             user_text: "multi-edit".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -236,6 +239,7 @@ async fn read_tracker_carries_across_turns_on_same_thread() {
             thread_id: thread.clone(),
             user_text: "look at notes".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -248,6 +252,7 @@ async fn read_tracker_carries_across_turns_on_same_thread() {
             thread_id: thread.clone(),
             user_text: "you怎么样了".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -305,6 +310,7 @@ async fn read_tracker_independent_across_threads() {
             thread_id: ThreadId::new("chat_A"),
             user_text: "look".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -318,6 +324,7 @@ async fn read_tracker_independent_across_threads() {
             thread_id: ThreadId::new("chat_B"),
             user_text: "edit".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

@@ -58,6 +58,7 @@ async fn skill_tool_returns_body_through_engine() {
             thread_id: ThreadId::new("chat_skill"),
             user_text: "use the reviewer skill".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -121,6 +122,7 @@ async fn unknown_skill_yields_tool_error_block() {
             thread_id: ThreadId::new("chat_x"),
             user_text: "use missing".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

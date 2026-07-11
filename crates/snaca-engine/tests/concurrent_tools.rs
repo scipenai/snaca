@@ -163,6 +163,7 @@ async fn read_only_tools_run_in_parallel() {
             thread_id: thread,
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -242,6 +243,7 @@ async fn write_tool_serialises_neighbouring_reads() {
             thread_id: thread,
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -316,6 +318,7 @@ async fn tool_result_order_matches_tool_use_order() {
             thread_id: thread,
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

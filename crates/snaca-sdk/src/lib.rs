@@ -7,11 +7,11 @@
 //! and provides safe starter presets.
 
 use async_trait::async_trait;
-use snaca_agent_api::{NoopApprovalGate, NoopQuestionGate};
-use snaca_engine::{Engine, EngineConfig, NoopListener, TurnEventListener, TurnRequest};
+use snaca_agent_api::NoopQuestionGate;
+use snaca_engine::{NoopListener, TurnRequest};
 use snaca_llm::{ContentDelta as LlmDelta, LlmClient};
 use snaca_state::SqliteConversationStore;
-use snaca_workspace::{LocalWorkspaceProvider, WorkspaceLayout};
+use snaca_workspace::LocalWorkspaceProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,8 +20,10 @@ use tokio::sync::mpsc;
 pub mod channel;
 pub mod config;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod runtime;
+pub mod skills;
 pub mod store;
 pub mod tools;
 pub mod workspace;
@@ -32,28 +34,33 @@ pub use snaca_agent_api::{
     ApprovalDecision, ApprovalError, ApprovalGate, ApprovalRequest, ConversationMessage,
     ConversationStore, EnsureThread, HistoryQuery, InMemoryConversationStore, MemoryEntryData,
     MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError, MemoryProviderSlot,
-    MemoryReadRequest, MemoryWriteRequest, QuestionAnswer, QuestionAnswers, QuestionError,
-    QuestionGate, QuestionOption, QuestionRequest, QuestionSpec, StoreError, StoreMessageResult,
-    ToolCallCompletion, ToolCallStart, WorkspaceProvider, WorkspaceProviderError, WorkspaceRequest,
+    MemoryReadRequest, MemoryWriteRequest, NoopApprovalGate, QuestionAnswer, QuestionAnswers,
+    QuestionError, QuestionGate, QuestionOption, QuestionRequest, QuestionSpec, StoreError,
+    StoreMessageResult, ToolCallCompletion, ToolCallStart, WorkspaceProvider,
+    WorkspaceProviderError, WorkspaceRequest,
 };
 pub use snaca_core::{
     ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolSchema,
     ToolUseId, Usage,
 };
 pub use snaca_engine::{
-    MemoryExtractor, RuntimeToolFactory, SharedExtractor, TurnOutcome,
-    TurnRequest as EngineTurnRequest,
+    Engine, EngineConfig, HostContextFactory, MemoryExtractor, RuntimeToolFactory, SharedExtractor,
+    TurnEventListener, TurnOutcome, TurnRequest as EngineTurnRequest,
 };
 pub use snaca_llm::{
     AnthropicClient, ContentBlockStart, ContentDelta, DeepSeekClient, LlmClient as LlmClientTrait,
     LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps, RetryConfig,
     RetryingLlmClient, StopReason, StreamEvent,
 };
-pub use snaca_state::{Database, MessageRow, StateError, StateResult, ThreadRow, ThreadSummaryRow};
-pub use snaca_tools_api::{
-    ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolRegistry,
-    ToolResult,
+pub use snaca_state::{
+    Database, MessageRow, NewMessage, NewThread, StateError, StateResult, ThreadRow,
+    ThreadSummaryRow,
 };
+pub use snaca_tools_api::{
+    ApprovalRequirement, HostContext, HostContextError, Tool, ToolCapabilities, ToolContext,
+    ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
+};
+pub use snaca_workspace::{WorkspaceError, WorkspaceLayout};
 
 pub type Result<T> = std::result::Result<T, SdkError>;
 
@@ -110,6 +117,7 @@ impl Agent {
                     thread_id: input.thread_id,
                     user_text: input.text,
                     message_id: input.message_id,
+                    ephemeral_system: input.ephemeral_system,
                 },
                 Arc::new(NoopApprovalGate),
                 Arc::new(NoopListener),
@@ -139,6 +147,7 @@ impl Agent {
                         thread_id: input.thread_id,
                         user_text: input.text,
                         message_id: input.message_id,
+                        ephemeral_system: input.ephemeral_system,
                     },
                     Arc::new(NoopApprovalGate),
                     listener,
@@ -245,6 +254,9 @@ pub struct AgentInput {
     pub project_id: Option<ProjectId>,
     pub thread_id: Option<ThreadId>,
     pub message_id: Option<String>,
+    /// Volatile per-turn system context (R1), appended after the cacheable
+    /// system prefix. `None` leaves the request identical to omitting it.
+    pub ephemeral_system: Option<String>,
 }
 
 impl AgentInput {
@@ -255,6 +267,7 @@ impl AgentInput {
             project_id: None,
             thread_id: None,
             message_id: None,
+            ephemeral_system: None,
         }
     }
 
@@ -278,6 +291,12 @@ impl AgentInput {
         self
     }
 
+    /// Set the volatile per-turn system context (R1).
+    pub fn ephemeral_system(mut self, ephemeral_system: impl Into<String>) -> Self {
+        self.ephemeral_system = Some(ephemeral_system.into());
+        self
+    }
+
     fn with_defaults(self, defaults: &AgentDefaults) -> ResolvedAgentInput {
         ResolvedAgentInput {
             text: self.text,
@@ -287,6 +306,7 @@ impl AgentInput {
                 .unwrap_or_else(|| defaults.project_id.clone()),
             thread_id: self.thread_id.unwrap_or_else(|| defaults.thread_id.clone()),
             message_id: self.message_id,
+            ephemeral_system: self.ephemeral_system,
         }
     }
 }
@@ -310,6 +330,7 @@ struct ResolvedAgentInput {
     project_id: ProjectId,
     thread_id: ThreadId,
     message_id: Option<String>,
+    ephemeral_system: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -335,8 +356,10 @@ pub struct AgentBuilder {
     conversation_store: Option<SqliteConversationStore>,
     data_root: Option<PathBuf>,
     workspace_provider: Option<LocalWorkspaceProvider>,
+    explicit_workspace: Option<PathBuf>,
     config: Option<EngineConfig>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
+    host_context_factory: Option<HostContextFactory>,
     tenant_id: Option<TenantId>,
     project_id: Option<ProjectId>,
     thread_id: Option<ThreadId>,
@@ -434,6 +457,14 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Pin tool cwd (Read/Write/Bash) to the user's real project directory
+    /// while SNACA metadata (memory/skills/db) stays under `data_root` (R4).
+    /// Overlays on whichever workspace/data-root config is otherwise chosen.
+    pub fn explicit_workspace(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.explicit_workspace = Some(dir.into());
+        self
+    }
+
     pub fn engine_config(mut self, config: EngineConfig) -> Self {
         self.config = Some(config);
         self
@@ -446,6 +477,13 @@ impl AgentBuilder {
 
     pub fn memory_provider_arc(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
         self.memory_provider = Some(provider);
+        self
+    }
+
+    /// Attach a per-turn host reverse-RPC factory (R2). Tools reach the handle
+    /// via `ctx.host_context()`. See [`Engine::with_host_context_factory`].
+    pub fn host_context_factory(mut self, factory: HostContextFactory) -> Self {
+        self.host_context_factory = Some(factory);
         self
     }
 
@@ -505,8 +543,10 @@ impl AgentBuilder {
             conversation_store,
             data_root,
             workspace_provider,
+            explicit_workspace,
             config,
             memory_provider,
+            host_context_factory,
             tenant_id,
             project_id,
             thread_id,
@@ -524,10 +564,15 @@ impl AgentBuilder {
             Some(root) => ensure_absolute(root)?,
             None => std::env::temp_dir().join("snaca-sdk-data"),
         };
-        let workspace = match workspace_provider {
+        let mut workspace = match workspace_provider {
             Some(provider) => provider.into_layout(),
             None => WorkspaceLayout::new(data_root)?,
         };
+        if let Some(dir) = explicit_workspace {
+            // Resolve relatives against cwd, mirroring `data_root` — the two
+            // path setters stay consistent instead of one erroring on relatives.
+            workspace = workspace.with_explicit_workspace(ensure_absolute(dir)?)?;
+        }
         let tools = tools.unwrap_or_else(ToolRegistry::empty);
         let config = config.unwrap_or_else(|| EngineConfig::default_for(model));
         let mut runtime = EngineRuntimeBuilder::new()
@@ -538,6 +583,9 @@ impl AgentBuilder {
             .config(config);
         if let Some(provider) = memory_provider {
             runtime = runtime.memory_provider(provider);
+        }
+        if let Some(factory) = host_context_factory {
+            runtime = runtime.host_context_factory(factory);
         }
         let engine = runtime.build()?;
         Ok(Agent {

@@ -96,6 +96,7 @@ fn turn_request() -> TurnRequest {
         thread_id: ThreadId::new("chat_appr"),
         user_text: "do it".into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 

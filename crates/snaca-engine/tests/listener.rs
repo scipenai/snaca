@@ -33,6 +33,7 @@ fn turn_request(thread_id: &str) -> TurnRequest {
         thread_id: ThreadId::new(thread_id),
         user_text: "stream please".into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 

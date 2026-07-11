@@ -100,7 +100,12 @@ pub struct ThreadSummaryRow {
     /// `MAX(messages.created_at)`; `None` when the thread has no messages.
     pub last_active_at: Option<DateTime<Utc>>,
     pub message_count: u64,
-    /// `COUNT(DISTINCT messages.session_id)` — the upstream turn analog.
+    /// `COUNT(DISTINCT messages.session_id)` — the upstream turn analog. snaca
+    /// stamps one `session_id` per `handle_turn` call, so a host that issues
+    /// multiple `handle_turn` calls per user-visible turn (e.g. an editor
+    /// composer splitting plan + exec) will see this exceed its own turn count.
+    /// Hosts needing an exact turn count should group by their own `turn_id`
+    /// stored in `message_meta`.
     pub turn_count: u64,
     /// Raw `thread_meta.data` JSON; `None` when no metadata was set.
     pub meta: Option<serde_json::Value>,

@@ -84,6 +84,7 @@ async fn external_abort_short_circuits_turn() {
                 thread_id: th,
                 user_text: "go".into(),
                 message_id: None,
+                ephemeral_system: None,
             })
             .await
     });
@@ -124,6 +125,7 @@ async fn wall_clock_timeout_surfaces_turn_timeout() {
             thread_id: thread,
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await;
     let elapsed = started.elapsed();
@@ -164,6 +166,7 @@ async fn double_abort_is_idempotent() {
                 thread_id: th,
                 user_text: "go".into(),
                 message_id: None,
+                ephemeral_system: None,
             })
             .await
     });
@@ -268,6 +271,7 @@ async fn abort_turn_targets_specific_message_id_in_group_chat() {
                 thread_id: th_a,
                 user_text: "A's message".into(),
                 message_id: Some("msg-A".into()),
+                ephemeral_system: None,
             })
             .await
     });
@@ -281,6 +285,7 @@ async fn abort_turn_targets_specific_message_id_in_group_chat() {
                 thread_id: th_b,
                 user_text: "B's message".into(),
                 message_id: Some("msg-B".into()),
+                ephemeral_system: None,
             })
             .await
     });
@@ -331,6 +336,7 @@ async fn abort_thread_sweeps_every_inflight_turn() {
                     thread_id: th,
                     user_text: format!("msg {i}"),
                     message_id: Some(msg_id),
+                    ephemeral_system: None,
                 })
                 .await
         }));

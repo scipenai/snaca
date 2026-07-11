@@ -66,6 +66,13 @@ pub struct TurnRequest {
     /// generate a UUID — external recall can't reach UUID-keyed
     /// turns, only admin's thread-level abort.
     pub message_id: Option<String>,
+    /// Volatile per-turn system fragment, appended AFTER the cacheable
+    /// system prefix so it never busts the prompt cache. Hosts inject
+    /// fast-changing environment context here (e.g. an editor's open
+    /// file / cursor selection). `None` is byte-for-byte equivalent to
+    /// not adding any context — the request is identical to before this
+    /// field existed.
+    pub ephemeral_system: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +199,21 @@ pub struct Engine {
     /// fresh store for every tool call would make the check toothless.
     /// Process-local only; restart trusts the current disk state.
     memory_stores: Arc<Mutex<HashMap<(String, String), snaca_memory::MemoryStore>>>,
+    /// Optional per-turn factory for the host reverse-RPC handle (R2). When
+    /// set, the engine calls it at the start of each turn with the turn id and
+    /// attaches the returned `HostContext` to every tool's `ToolContext`. None
+    /// → `ToolContext::host_context()` returns `None` and tool behaviour is
+    /// unchanged.
+    host_context_factory: Option<HostContextFactory>,
 }
+
+/// Per-turn factory that mints a [`HostContext`](snaca_tools_api::HostContext)
+/// for the reverse-RPC channel to the embedding host (R2). Called once at the
+/// start of every turn with the turn's id; the returned handle is attached to
+/// the tool context so tools can `call(method, params)` back into the host.
+/// The transport lives entirely in the host — snaca only relays.
+pub type HostContextFactory =
+    Arc<dyn Fn(String) -> Arc<dyn snaca_tools_api::HostContext> + Send + Sync>;
 
 /// One-shot hint about a loop_guard trip, injected into the next
 /// turn's system prompt so the model can break out of the loop.
@@ -245,6 +266,7 @@ impl Engine {
             extraction_locks: Arc::new(Mutex::new(HashMap::new())),
             memory_snapshots: Arc::new(Mutex::new(HashMap::new())),
             memory_stores: Arc::new(Mutex::new(HashMap::new())),
+            host_context_factory: None,
         }
     }
 
@@ -304,6 +326,16 @@ impl Engine {
     /// `Engine::new`.
     pub fn with_tool_factory(mut self, factory: Arc<dyn RuntimeToolFactory>) -> Self {
         self.tool_factory = Some(factory);
+        self
+    }
+
+    /// Attach a per-turn host reverse-RPC factory (R2). The engine calls
+    /// `factory(turn_id)` at the start of every turn and attaches the returned
+    /// `HostContext` to each tool's `ToolContext`, reachable via
+    /// `ctx.host_context()`. Without one, tools see no host context and behave
+    /// exactly as before. The transport (stdio, IPC, in-process) is the host's.
+    pub fn with_host_context_factory(mut self, factory: HostContextFactory) -> Self {
+        self.host_context_factory = Some(factory);
         self
     }
 
@@ -441,6 +473,7 @@ impl Engine {
             thread_id,
             user_text,
             message_id,
+            ephemeral_system,
         } = req;
 
         // IM message id is the inner inflight key — recall path looks
@@ -553,6 +586,12 @@ impl Engine {
         tool_ctx = tool_ctx
             .with_question_gate(Arc::new(QuestionGateSlot::new(question_gate.clone()))
                 as Arc<dyn std::any::Any + Send + Sync>);
+        // Host reverse-RPC handle (R2). Minted per turn, keyed on the turn id
+        // so the host can bind telemetry / abort to the exact turn. Absent
+        // factory → tools' `host_context()` stays None.
+        if let Some(factory) = self.host_context_factory.as_ref() {
+            tool_ctx = tool_ctx.with_host_context(factory(turn_message_id.clone()));
+        }
 
         // Wrap the rest of the turn in `tokio::select!` so external
         // abort + wall-clock timeout can short-circuit. The work
@@ -614,6 +653,7 @@ impl Engine {
                     &project_id,
                     &thread_id,
                     &turn_query,
+                    ephemeral_system.as_deref(),
                     loop_guard_hint.as_ref(),
                 )
                 .await;
@@ -1620,6 +1660,7 @@ impl Engine {
         project: &ProjectId,
         thread: &ThreadId,
         _user_query: &str,
+        ephemeral_system: Option<&str>,
         loop_guard_hint: Option<&LoopGuardHint>,
     ) -> Vec<SystemSegment> {
         // Live workspace file listing — recomputed every turn (cheap
@@ -1650,6 +1691,7 @@ impl Engine {
                 &cached,
                 "",
                 &workspace_files,
+                ephemeral_system,
                 loop_guard_hint,
             );
         }
@@ -1665,6 +1707,7 @@ impl Engine {
             &snapshot_text,
             "",
             &workspace_files,
+            ephemeral_system,
             loop_guard_hint,
         )
     }
@@ -2778,6 +2821,7 @@ fn compose_system_segments(
     index: &str,
     _recall: &str,
     workspace_files: &str,
+    ephemeral_system: Option<&str>,
     loop_guard_hint: Option<&LoopGuardHint>,
 ) -> Vec<SystemSegment> {
     let mut stable = current_date_preamble(chrono::Local::now());
@@ -2796,6 +2840,13 @@ fn compose_system_segments(
         stable.push_str(index.trim());
     }
     let mut segs: Vec<SystemSegment> = vec![SystemSegment::cacheable(stable)];
+    // Caller-supplied per-turn context (R1). A VOLATILE segment appended
+    // after the cacheable prefix so it never busts the cache. Passed through
+    // verbatim — the host owns its formatting. Absent/blank → nothing pushed,
+    // keeping the request byte-identical to the pre-field behaviour.
+    if let Some(extra) = ephemeral_system.filter(|s| !s.trim().is_empty()) {
+        segs.push(SystemSegment::volatile(extra.to_string()));
+    }
     // Live workspace file listing — a VOLATILE (non-cacheable) segment
     // recomputed every turn and held out of the cacheable prefix, so the
     // model always sees the current set of files (the durable source of
@@ -2841,7 +2892,7 @@ fn compose_system_segments(
 /// builds since the engine itself only ever speaks segments.
 #[cfg(test)]
 fn compose_system_prompt(base: &str, index: &str, recall: &str) -> String {
-    let segs = compose_system_segments(base, index, recall, "", None);
+    let segs = compose_system_segments(base, index, recall, "", None, None);
     let mut out = String::new();
     for s in segs {
         out.push_str(&s.text);
@@ -4155,7 +4206,7 @@ mod system_prompt_tests {
         // one cacheable segment. Loop-guard hints (tested separately)
         // are the only thing that can ever push a volatile second
         // segment into the prompt now.
-        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", "", None);
+        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", "", None, None);
         assert_eq!(
             segs.len(),
             1,
@@ -4170,7 +4221,7 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_recall() {
-        let segs = compose_system_segments("BASE", "user/foo", "", "", None);
+        let segs = compose_system_segments("BASE", "user/foo", "", "", None, None);
         assert_eq!(segs.len(), 1, "no recall => single segment");
         assert!(segs[0].cacheable);
         assert!(segs[0].text.contains("BASE"));
@@ -4179,10 +4230,46 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_memory_and_no_recall() {
-        let segs = compose_system_segments("BASE", "", "", "", None);
+        let segs = compose_system_segments("BASE", "", "", "", None, None);
         assert_eq!(segs.len(), 1);
         assert!(segs[0].cacheable);
         assert!(!segs[0].text.contains("## Project Memory"));
+    }
+
+    #[test]
+    fn ephemeral_system_appends_a_volatile_segment_without_touching_prefix() {
+        let none = compose_system_segments("BASE", "user/foo", "", "", None, None);
+        let some = compose_system_segments(
+            "BASE",
+            "user/foo",
+            "",
+            "",
+            Some("## Editor\nopen: main.rs"),
+            None,
+        );
+        // None path is unchanged: single cacheable segment.
+        assert_eq!(none.len(), 1);
+        // Some adds exactly one extra VOLATILE segment; cacheable prefix is
+        // byte-identical, so the prompt cache is never busted.
+        assert_eq!(some.len(), 2);
+        assert!(some[0].cacheable);
+        assert_eq!(
+            some[0].text, none[0].text,
+            "cacheable prefix must be byte-identical with and without ephemeral"
+        );
+        assert!(!some[1].cacheable, "ephemeral segment must be volatile");
+        assert_eq!(
+            some[1].text, "## Editor\nopen: main.rs",
+            "ephemeral text is passed through verbatim"
+        );
+        // Blank ephemeral is treated as absent.
+        let blank = compose_system_segments("BASE", "user/foo", "", "", Some("   "), None);
+        assert_eq!(blank.len(), 1);
+        // Non-blank content is pushed verbatim — leading/trailing whitespace the
+        // host included is preserved, not normalized.
+        let padded =
+            compose_system_segments("BASE", "user/foo", "", "", Some("\n  keep me  "), None);
+        assert_eq!(padded[1].text, "\n  keep me  ");
     }
 
     #[test]
@@ -4195,6 +4282,7 @@ mod system_prompt_tests {
             "",
             "- report.pdf (1.2 KB)\n- notes.md (300 B)\n",
             None,
+            None,
         );
         assert_eq!(with_files.len(), 2, "file list adds one segment");
         assert!(with_files[0].cacheable, "memory prefix stays cacheable");
@@ -4204,7 +4292,7 @@ mod system_prompt_tests {
 
         // The cacheable prefix is byte-identical whether or not the file
         // list changes — the whole point of holding it out of the cache.
-        let no_files = compose_system_segments("BASE", "user/foo", "", "", None);
+        let no_files = compose_system_segments("BASE", "user/foo", "", "", None, None);
         assert_eq!(
             with_files[0].text, no_files[0].text,
             "adding/removing files must not change the cacheable prefix"

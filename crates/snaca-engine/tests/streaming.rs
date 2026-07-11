@@ -122,6 +122,7 @@ fn turn_request(thread_id: &str) -> TurnRequest {
         thread_id: ThreadId::new(thread_id),
         user_text: "stream please".into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 
@@ -508,6 +509,7 @@ async fn malformed_streamed_tool_args_falls_back_to_non_streaming() {
             thread_id: ThreadId::new("c_retry"),
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("turn should succeed via non-streaming retry");
@@ -665,6 +667,7 @@ async fn malformed_args_recovers_via_user_feedback_then_continues() {
             thread_id: ThreadId::new("c_malformed_recovery"),
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect("turn should recover via feedback-and-retry");
@@ -725,6 +728,7 @@ async fn malformed_args_recovery_disabled_surfaces_error() {
             thread_id: ThreadId::new("c_no_recovery"),
             user_text: "go".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .expect_err("recovery disabled — error must surface to caller");

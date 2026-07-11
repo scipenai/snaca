@@ -144,7 +144,17 @@ pub fn base_tool_registry() -> ToolRegistry {
     base_tool_registry_builder().build()
 }
 
-fn base_tool_registry_builder() -> ToolRegistryBuilder {
+/// Composable standard tool set (R6). Returns the tenant-agnostic base —
+/// built-in M1+M2 file/shell/memory/task/web tools, no `Skill`, no MCP — as a
+/// [`ToolRegistryBuilder`] so downstream hosts can append their own `Tool`s and
+/// then `.build()`, without editing this crate:
+///
+/// ```ignore
+/// let registry = base_tool_registry_builder()
+///     .add(MyCustomTool)
+///     .build();
+/// ```
+pub fn base_tool_registry_builder() -> ToolRegistryBuilder {
     let b = file_edit_registry_builder();
     let b = add_shell_tools(b);
     let b = add_todo_tools(b);
@@ -162,7 +172,10 @@ fn default_m1_registry_builder() -> ToolRegistryBuilder {
     add_web_tools(b)
 }
 
-fn read_only_registry_builder() -> ToolRegistryBuilder {
+/// Read-only standard set as a composable builder (R6): file inspection +
+/// `WebFetch` (feature-gated), no writes, no Bash. Start here to layer custom
+/// read-only tools on top.
+pub fn read_only_registry_builder() -> ToolRegistryBuilder {
     #[allow(unused_mut)]
     let mut b = ToolRegistryBuilder::default();
     #[cfg(feature = "fs-read")]
@@ -284,4 +297,29 @@ fn add_interactive_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
 #[cfg(not(feature = "interactive"))]
 fn add_interactive_tools(b: ToolRegistryBuilder) -> ToolRegistryBuilder {
     b
+}
+
+#[cfg(test)]
+mod registry_builder_tests {
+    use super::*;
+
+    #[test]
+    fn base_builder_is_public_and_matches_convenience_fn() {
+        // R6: the standard set is reachable as a composable builder and yields
+        // the same registry as the convenience fn — downstream can start here
+        // and `.add(..)` custom tools without editing this crate.
+        let via_builder = base_tool_registry_builder().build();
+        let via_fn = base_tool_registry();
+        assert_eq!(via_builder.names().count(), via_fn.names().count());
+        assert!(via_builder.names().count() > 0);
+    }
+
+    #[test]
+    fn read_only_builder_excludes_writes_and_shell() {
+        let registry = read_only_registry_builder().build();
+        let names: Vec<_> = registry.names().collect();
+        assert!(!names.contains(&"Write"));
+        assert!(!names.contains(&"Bash"));
+        assert!(!names.contains(&"Edit"));
+    }
 }
