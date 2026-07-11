@@ -50,6 +50,7 @@ fn turn_request(text: &str) -> TurnRequest {
         thread_id: ThreadId::new("thr-extract-1"),
         user_text: text.into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 

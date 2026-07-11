@@ -82,6 +82,9 @@ fn map_memory_err(e: MemoryError) -> ToolError {
         // InvalidInput — the input itself was fine; the conflict is
         // outside the LLM's control.
         MemoryError::ExternalDrift { .. } => ToolError::Execution(e.to_string()),
+        // `MemoryError` is `#[non_exhaustive]`; any future variant surfaces as a
+        // structured execution error rather than failing to compile here.
+        _ => ToolError::Execution(e.to_string()),
     }
 }
 

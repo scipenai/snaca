@@ -167,6 +167,7 @@ fn turn_request() -> TurnRequest {
         thread_id: ThreadId::new("thr-loop-1"),
         user_text: "go".into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 

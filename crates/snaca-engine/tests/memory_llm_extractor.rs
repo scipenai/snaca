@@ -75,6 +75,7 @@ async fn llm_extractor_writes_proposed_memory_to_store() {
             thread_id: ThreadId::new("thr-llm-extract"),
             user_text: "stop using emojis please".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -143,6 +144,7 @@ async fn pii_filter_blocks_extractor_proposals() {
             thread_id: ThreadId::new("thr-llm-extract-pii"),
             user_text: "anything".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -198,6 +200,7 @@ async fn extractor_with_garbage_llm_output_is_a_noop() {
             thread_id: ThreadId::new("thr-llm-garbage"),
             user_text: "test".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

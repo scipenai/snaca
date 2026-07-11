@@ -938,6 +938,9 @@ async fn process_message(ctx: &WorkerCtx, params: MessageReceivedParams) {
         // Empty falls back to a UUID inside the engine; admin's
         // thread-level abort still works in that case.
         message_id: Some(params.message_id.clone()),
+        // IM mode injects no per-turn ephemeral context; the editor host
+        // (SDK path) is the caller that populates this.
+        ephemeral_system: None,
     };
 
     // Route every approval gate through the originating plugin so the user
