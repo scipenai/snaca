@@ -40,6 +40,10 @@ path = "../../examples/sdk/memory_live_demo.rs"
 name = "r5_sidecar_downstream"
 path = "../../examples/sdk/r5_sidecar_downstream.rs"
 
+[[example]]
+name = "editor_like_downstream"
+path = "../../examples/sdk/editor_like_downstream.rs"
+
 [dependencies]
 snaca-core.workspace = true
 snaca-agent-api.workspace = true
