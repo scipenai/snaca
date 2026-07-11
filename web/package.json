@@ -11,7 +11,7 @@
   "dependencies": {
     "clsx": "^2.1.1",
     "i18next": "^26.3.3",
-    "lucide-react": "^1.21.0",
+    "lucide-react": "^1.24.0",
     "react": "^19.1.0",
     "react-dom": "^19.2.7",
     "react-i18next": "^17.0.9",
