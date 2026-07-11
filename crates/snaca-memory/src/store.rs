@@ -45,6 +45,7 @@ const INDEX_MAX_BYTES: usize = 25 * 1024;
 const INDEX_FILE: &str = "MEMORY.md";
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MemoryError {
     #[error("invalid memory entry name {name:?}: {reason}")]
     InvalidName { name: String, reason: String },

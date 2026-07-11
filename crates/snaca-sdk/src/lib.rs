@@ -7,11 +7,11 @@
 //! and provides safe starter presets.
 
 use async_trait::async_trait;
-use snaca_agent_api::{NoopApprovalGate, NoopQuestionGate};
-use snaca_engine::{Engine, EngineConfig, NoopListener, TurnEventListener, TurnRequest};
+use snaca_agent_api::NoopQuestionGate;
+use snaca_engine::{NoopListener, TurnRequest};
 use snaca_llm::{ContentDelta as LlmDelta, LlmClient};
 use snaca_state::SqliteConversationStore;
-use snaca_workspace::{LocalWorkspaceProvider, WorkspaceLayout};
+use snaca_workspace::LocalWorkspaceProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,8 +20,10 @@ use tokio::sync::mpsc;
 pub mod channel;
 pub mod config;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod runtime;
+pub mod skills;
 pub mod store;
 pub mod tools;
 pub mod workspace;
@@ -32,28 +34,33 @@ pub use snaca_agent_api::{
     ApprovalDecision, ApprovalError, ApprovalGate, ApprovalRequest, ConversationMessage,
     ConversationStore, EnsureThread, HistoryQuery, InMemoryConversationStore, MemoryEntryData,
     MemoryIndexRequest, MemoryListRequest, MemoryProvider, MemoryProviderError, MemoryProviderSlot,
-    MemoryReadRequest, MemoryWriteRequest, QuestionAnswer, QuestionAnswers, QuestionError,
-    QuestionGate, QuestionOption, QuestionRequest, QuestionSpec, StoreError, StoreMessageResult,
-    ToolCallCompletion, ToolCallStart, WorkspaceProvider, WorkspaceProviderError, WorkspaceRequest,
+    MemoryReadRequest, MemoryWriteRequest, NoopApprovalGate, QuestionAnswer, QuestionAnswers,
+    QuestionError, QuestionGate, QuestionOption, QuestionRequest, QuestionSpec, StoreError,
+    StoreMessageResult, ToolCallCompletion, ToolCallStart, WorkspaceProvider,
+    WorkspaceProviderError, WorkspaceRequest,
 };
 pub use snaca_core::{
     ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolSchema,
     ToolUseId, Usage,
 };
 pub use snaca_engine::{
-    HostContextFactory, MemoryExtractor, RuntimeToolFactory, SharedExtractor, TurnOutcome,
-    TurnRequest as EngineTurnRequest,
+    Engine, EngineConfig, HostContextFactory, MemoryExtractor, RuntimeToolFactory, SharedExtractor,
+    TurnEventListener, TurnOutcome, TurnRequest as EngineTurnRequest,
 };
 pub use snaca_llm::{
     AnthropicClient, ContentBlockStart, ContentDelta, DeepSeekClient, LlmClient as LlmClientTrait,
     LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps, RetryConfig,
     RetryingLlmClient, StopReason, StreamEvent,
 };
-pub use snaca_state::{Database, MessageRow, StateError, StateResult, ThreadRow, ThreadSummaryRow};
+pub use snaca_state::{
+    Database, MessageRow, NewMessage, NewThread, StateError, StateResult, ThreadRow,
+    ThreadSummaryRow,
+};
 pub use snaca_tools_api::{
     ApprovalRequirement, HostContext, HostContextError, Tool, ToolCapabilities, ToolContext,
     ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
 };
+pub use snaca_workspace::{WorkspaceError, WorkspaceLayout};
 
 pub type Result<T> = std::result::Result<T, SdkError>;
 
