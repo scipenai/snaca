@@ -349,6 +349,7 @@ pub struct AgentBuilder {
     conversation_store: Option<SqliteConversationStore>,
     data_root: Option<PathBuf>,
     workspace_provider: Option<LocalWorkspaceProvider>,
+    explicit_workspace: Option<PathBuf>,
     config: Option<EngineConfig>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
     tenant_id: Option<TenantId>,
@@ -448,6 +449,14 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Pin tool cwd (Read/Write/Bash) to the user's real project directory
+    /// while SNACA metadata (memory/skills/db) stays under `data_root` (R4).
+    /// Overlays on whichever workspace/data-root config is otherwise chosen.
+    pub fn explicit_workspace(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.explicit_workspace = Some(dir.into());
+        self
+    }
+
     pub fn engine_config(mut self, config: EngineConfig) -> Self {
         self.config = Some(config);
         self
@@ -519,6 +528,7 @@ impl AgentBuilder {
             conversation_store,
             data_root,
             workspace_provider,
+            explicit_workspace,
             config,
             memory_provider,
             tenant_id,
@@ -538,10 +548,13 @@ impl AgentBuilder {
             Some(root) => ensure_absolute(root)?,
             None => std::env::temp_dir().join("snaca-sdk-data"),
         };
-        let workspace = match workspace_provider {
+        let mut workspace = match workspace_provider {
             Some(provider) => provider.into_layout(),
             None => WorkspaceLayout::new(data_root)?,
         };
+        if let Some(dir) = explicit_workspace {
+            workspace = workspace.with_explicit_workspace(dir)?;
+        }
         let tools = tools.unwrap_or_else(ToolRegistry::empty);
         let config = config.unwrap_or_else(|| EngineConfig::default_for(model));
         let mut runtime = EngineRuntimeBuilder::new()
