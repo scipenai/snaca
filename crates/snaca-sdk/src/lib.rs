@@ -41,7 +41,7 @@ pub use snaca_core::{
     ToolUseId, Usage,
 };
 pub use snaca_engine::{
-    MemoryExtractor, RuntimeToolFactory, SharedExtractor, TurnOutcome,
+    HostContextFactory, MemoryExtractor, RuntimeToolFactory, SharedExtractor, TurnOutcome,
     TurnRequest as EngineTurnRequest,
 };
 pub use snaca_llm::{
@@ -51,8 +51,8 @@ pub use snaca_llm::{
 };
 pub use snaca_state::{Database, MessageRow, StateError, StateResult, ThreadRow, ThreadSummaryRow};
 pub use snaca_tools_api::{
-    ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolRegistry,
-    ToolRegistryBuilder, ToolResult,
+    ApprovalRequirement, HostContext, HostContextError, Tool, ToolCapabilities, ToolContext,
+    ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
 };
 
 pub type Result<T> = std::result::Result<T, SdkError>;
@@ -352,6 +352,7 @@ pub struct AgentBuilder {
     explicit_workspace: Option<PathBuf>,
     config: Option<EngineConfig>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
+    host_context_factory: Option<HostContextFactory>,
     tenant_id: Option<TenantId>,
     project_id: Option<ProjectId>,
     thread_id: Option<ThreadId>,
@@ -472,6 +473,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Attach a per-turn host reverse-RPC factory (R2). Tools reach the handle
+    /// via `ctx.host_context()`. See [`Engine::with_host_context_factory`].
+    pub fn host_context_factory(mut self, factory: HostContextFactory) -> Self {
+        self.host_context_factory = Some(factory);
+        self
+    }
+
     pub fn tenant_id(mut self, tenant_id: TenantId) -> Self {
         self.tenant_id = Some(tenant_id);
         self
@@ -531,6 +539,7 @@ impl AgentBuilder {
             explicit_workspace,
             config,
             memory_provider,
+            host_context_factory,
             tenant_id,
             project_id,
             thread_id,
@@ -565,6 +574,9 @@ impl AgentBuilder {
             .config(config);
         if let Some(provider) = memory_provider {
             runtime = runtime.memory_provider(provider);
+        }
+        if let Some(factory) = host_context_factory {
+            runtime = runtime.host_context_factory(factory);
         }
         let engine = runtime.build()?;
         Ok(Agent {

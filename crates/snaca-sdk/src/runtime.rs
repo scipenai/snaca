@@ -2,7 +2,7 @@
 
 use crate::{Result, SdkError};
 use snaca_agent_api::MemoryProvider;
-use snaca_engine::{Engine, EngineConfig, RuntimeToolFactory, SharedExtractor};
+use snaca_engine::{Engine, EngineConfig, HostContextFactory, RuntimeToolFactory, SharedExtractor};
 use snaca_llm::LlmClient;
 use snaca_state::Database;
 use snaca_tools_api::ToolRegistry;
@@ -21,6 +21,7 @@ pub struct EngineRuntimeBuilder {
     task_registry: Option<Arc<dyn Any + Send + Sync>>,
     extractor: Option<SharedExtractor>,
     memory_provider: Option<Arc<dyn MemoryProvider>>,
+    host_context_factory: Option<HostContextFactory>,
 }
 
 impl EngineRuntimeBuilder {
@@ -78,6 +79,13 @@ impl EngineRuntimeBuilder {
         self
     }
 
+    /// Attach a per-turn host reverse-RPC factory (R2). See
+    /// [`Engine::with_host_context_factory`].
+    pub fn host_context_factory(mut self, factory: HostContextFactory) -> Self {
+        self.host_context_factory = Some(factory);
+        self
+    }
+
     pub fn build(self) -> Result<Engine> {
         let llm = self.llm.ok_or(SdkError::MissingField("llm"))?;
         let tools = self.tools.ok_or(SdkError::MissingField("tools"))?;
@@ -100,6 +108,9 @@ impl EngineRuntimeBuilder {
         }
         if let Some(provider) = self.memory_provider {
             engine = engine.with_memory_provider(provider);
+        }
+        if let Some(factory) = self.host_context_factory {
+            engine = engine.with_host_context_factory(factory);
         }
         Ok(engine)
     }

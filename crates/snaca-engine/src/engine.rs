@@ -199,7 +199,21 @@ pub struct Engine {
     /// fresh store for every tool call would make the check toothless.
     /// Process-local only; restart trusts the current disk state.
     memory_stores: Arc<Mutex<HashMap<(String, String), snaca_memory::MemoryStore>>>,
+    /// Optional per-turn factory for the host reverse-RPC handle (R2). When
+    /// set, the engine calls it at the start of each turn with the turn id and
+    /// attaches the returned `HostContext` to every tool's `ToolContext`. None
+    /// → `ToolContext::host_context()` returns `None` and tool behaviour is
+    /// unchanged.
+    host_context_factory: Option<HostContextFactory>,
 }
+
+/// Per-turn factory that mints a [`HostContext`](snaca_tools_api::HostContext)
+/// for the reverse-RPC channel to the embedding host (R2). Called once at the
+/// start of every turn with the turn's id; the returned handle is attached to
+/// the tool context so tools can `call(method, params)` back into the host.
+/// The transport lives entirely in the host — snaca only relays.
+pub type HostContextFactory =
+    Arc<dyn Fn(String) -> Arc<dyn snaca_tools_api::HostContext> + Send + Sync>;
 
 /// One-shot hint about a loop_guard trip, injected into the next
 /// turn's system prompt so the model can break out of the loop.
@@ -252,6 +266,7 @@ impl Engine {
             extraction_locks: Arc::new(Mutex::new(HashMap::new())),
             memory_snapshots: Arc::new(Mutex::new(HashMap::new())),
             memory_stores: Arc::new(Mutex::new(HashMap::new())),
+            host_context_factory: None,
         }
     }
 
@@ -311,6 +326,16 @@ impl Engine {
     /// `Engine::new`.
     pub fn with_tool_factory(mut self, factory: Arc<dyn RuntimeToolFactory>) -> Self {
         self.tool_factory = Some(factory);
+        self
+    }
+
+    /// Attach a per-turn host reverse-RPC factory (R2). The engine calls
+    /// `factory(turn_id)` at the start of every turn and attaches the returned
+    /// `HostContext` to each tool's `ToolContext`, reachable via
+    /// `ctx.host_context()`. Without one, tools see no host context and behave
+    /// exactly as before. The transport (stdio, IPC, in-process) is the host's.
+    pub fn with_host_context_factory(mut self, factory: HostContextFactory) -> Self {
+        self.host_context_factory = Some(factory);
         self
     }
 
@@ -561,6 +586,12 @@ impl Engine {
         tool_ctx = tool_ctx
             .with_question_gate(Arc::new(QuestionGateSlot::new(question_gate.clone()))
                 as Arc<dyn std::any::Any + Send + Sync>);
+        // Host reverse-RPC handle (R2). Minted per turn, keyed on the turn id
+        // so the host can bind telemetry / abort to the exact turn. Absent
+        // factory → tools' `host_context()` stays None.
+        if let Some(factory) = self.host_context_factory.as_ref() {
+            tool_ctx = tool_ctx.with_host_context(factory(turn_message_id.clone()));
+        }
 
         // Wrap the rest of the turn in `tokio::select!` so external
         // abort + wall-clock timeout can short-circuit. The work
