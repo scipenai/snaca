@@ -52,7 +52,7 @@ pub use snaca_llm::{
 pub use snaca_state::{Database, MessageRow, StateError, StateResult, ThreadRow, ThreadSummaryRow};
 pub use snaca_tools_api::{
     ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolRegistry,
-    ToolResult,
+    ToolRegistryBuilder, ToolResult,
 };
 
 pub type Result<T> = std::result::Result<T, SdkError>;
