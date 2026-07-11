@@ -114,6 +114,7 @@ async fn skill_tool_invocation_returns_tenant_specific_body() {
             thread_id: ThreadId::new("chat_alpha"),
             user_text: "use runbook".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -124,6 +125,7 @@ async fn skill_tool_invocation_returns_tenant_specific_body() {
             thread_id: ThreadId::new("chat_beta"),
             user_text: "use runbook".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();
@@ -212,6 +214,7 @@ async fn engine_without_factory_uses_static_tools() {
             thread_id: ThreadId::new("chat_x"),
             user_text: "no skill".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

@@ -51,6 +51,7 @@ fn turn_request() -> TurnRequest {
         thread_id: ThreadId::new("chat_1"),
         user_text: "hello".into(),
         message_id: None,
+        ephemeral_system: None,
     }
 }
 
@@ -220,6 +221,7 @@ async fn second_turn_reuses_thread() {
             thread_id: ThreadId::new("chat_1"),
             user_text: "again".into(),
             message_id: None,
+            ephemeral_system: None,
         })
         .await
         .unwrap();

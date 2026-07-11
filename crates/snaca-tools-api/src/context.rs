@@ -1,5 +1,6 @@
 //! Per-call context passed to tool implementations.
 
+use crate::host_context::HostContext;
 use snaca_core::{ProjectId, SessionId, TenantId};
 use std::any::Any;
 use std::collections::HashMap;
@@ -60,7 +61,7 @@ pub struct ToolContext {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     tenant_id: TenantId,
     project_id: ProjectId,
@@ -128,6 +129,13 @@ struct Inner {
     /// `snaca-cli memory approve|reject`. Default `false` (write
     /// directly). Mirrors hermes's `write_approval` switch.
     memory_write_approval: bool,
+    /// Typed reverse-RPC handle to the embedding host (R2). Unlike the
+    /// `Arc<dyn Any>` slots above, `HostContext` is defined in this crate, so
+    /// the accessor is typed rather than downcast. `None` (the default) makes
+    /// `host_context()` return `None`; tools that need it surface a clean
+    /// "no host context" error. The engine injects one per turn via its
+    /// `HostContextFactory`; the transport lives entirely in the host.
+    host_context: Option<Arc<dyn HostContext>>,
 }
 
 impl ToolContext {
@@ -152,31 +160,26 @@ impl ToolContext {
                 cancellation_token: None,
                 db_handle: None,
                 memory_write_approval: false,
+                host_context: None,
             }),
         }
+    }
+
+    /// Clone the inner state, apply `mutate`, and swap in the new Arc. Keeps
+    /// every `with_*` setter to three lines and makes adding a new field a
+    /// one-line change instead of touching every setter.
+    fn with_inner(mut self, mutate: impl FnOnce(&mut Inner)) -> Self {
+        let mut inner = (*self.inner).clone();
+        mutate(&mut inner);
+        self.inner = Arc::new(inner);
+        self
     }
 
     /// Attach an outbound file collector. Tools call
     /// `queue_outbound_file(...)` to enqueue; engine drains via
     /// `take_outbound_files()` once the turn ends.
-    pub fn with_outbound_files(mut self, files: Arc<Mutex<Vec<OutboundFile>>>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: Some(files),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_outbound_files(self, files: Arc<Mutex<Vec<OutboundFile>>>) -> Self {
+        self.with_inner(|inner| inner.outbound_files = Some(files))
     }
 
     /// Attach a Read tracker. Production turns inject one per turn so
@@ -184,24 +187,8 @@ impl ToolContext {
     /// stale-view edits. Unit tests that don't care about that
     /// invariant can skip this and Edit will fall through to the old
     /// permissive behaviour.
-    pub fn with_read_tracker(mut self, tracker: ReadTracker) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: Some(tracker),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_read_tracker(self, tracker: ReadTracker) -> Self {
+        self.with_inner(|inner| inner.read_tracker = Some(tracker))
     }
 
     /// Attach a task registry (opaque). Concrete type lives in
@@ -209,24 +196,8 @@ impl ToolContext {
     /// trait surface stays small. Bash's `run_in_background` mode and
     /// the companion TaskOutput / TaskStop tools downcast from this
     /// slot.
-    pub fn with_task_registry(mut self, registry: Arc<dyn Any + Send + Sync>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: Some(registry),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_task_registry(self, registry: Arc<dyn Any + Send + Sync>) -> Self {
+        self.with_inner(|inner| inner.task_registry = Some(registry))
     }
 
     /// Attach a question gate (opaque). The concrete trait lives in
@@ -236,71 +207,23 @@ impl ToolContext {
     /// `None` (the default) makes `AskUserQuestion` return a clean
     /// "no question gate attached" tool_error — useful in tests and in
     /// direct-embed deployments that have no IM channel to ask.
-    pub fn with_question_gate(mut self, gate: Arc<dyn Any + Send + Sync>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: Some(gate),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_question_gate(self, gate: Arc<dyn Any + Send + Sync>) -> Self {
+        self.with_inner(|inner| inner.question_gate = Some(gate))
     }
 
     /// Attach a memory provider (opaque). The concrete trait lives in
     /// `snaca-agent-api`; this crate only stores the typed-erased slot.
     /// MemoryRead / MemoryWrite downcast it to `MemoryProviderSlot`.
-    pub fn with_memory_provider(mut self, provider: Arc<dyn Any + Send + Sync>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: Some(provider),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_memory_provider(self, provider: Arc<dyn Any + Send + Sync>) -> Self {
+        self.with_inner(|inner| inner.memory_provider = Some(provider))
     }
 
     /// Attach the built-in file-tree memory store (opaque). Memory
     /// tools downcast this to `snaca_memory::MemoryStore` and clone it
     /// so drift detection survives across multiple MemoryRead /
     /// MemoryWrite calls in the same tool context.
-    pub fn with_memory_store(mut self, store: Arc<dyn Any + Send + Sync>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: Some(store),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_memory_store(self, store: Arc<dyn Any + Send + Sync>) -> Self {
+        self.with_inner(|inner| inner.memory_store = Some(store))
     }
 
     /// Attach a per-turn cancellation token. The engine fires it when
@@ -310,24 +233,8 @@ impl ToolContext {
     /// enough to terminate child processes (Bash `kill_on_drop`),
     /// abort in-flight HTTP, and roll back file writes that hadn't
     /// flushed.
-    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: Some(token),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_cancellation_token(self, token: CancellationToken) -> Self {
+        self.with_inner(|inner| inner.cancellation_token = Some(token))
     }
 
     /// Attach an opaque SQLite database handle. The concrete type
@@ -335,24 +242,8 @@ impl ToolContext {
     /// slot is `Arc<dyn Any>` and callers downcast on read. The
     /// `session_search` tool reads through this to run BM25 over
     /// the message FTS5 index.
-    pub fn with_db_handle(mut self, db: Arc<dyn Any + Send + Sync>) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: Some(db),
-            memory_write_approval: self.inner.memory_write_approval,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_db_handle(self, db: Arc<dyn Any + Send + Sync>) -> Self {
+        self.with_inner(|inner| inner.db_handle = Some(db))
     }
 
     /// Opaque getter for the attached database handle. Caller
@@ -369,24 +260,15 @@ impl ToolContext {
     /// under `<project>/memory/pending/<id>.json` and return a
     /// placeholder so the LLM can keep going. An operator
     /// approves with `snaca-cli memory approve <id>`.
-    pub fn with_memory_write_approval(mut self, on: bool) -> Self {
-        let inner = Inner {
-            tenant_id: self.inner.tenant_id.clone(),
-            project_id: self.inner.project_id.clone(),
-            session_id: self.inner.session_id,
-            workspace_root: self.inner.workspace_root.clone(),
-            outbound_files: self.inner.outbound_files.clone(),
-            read_tracker: self.inner.read_tracker.clone(),
-            task_registry: self.inner.task_registry.clone(),
-            question_gate: self.inner.question_gate.clone(),
-            memory_provider: self.inner.memory_provider.clone(),
-            memory_store: self.inner.memory_store.clone(),
-            cancellation_token: self.inner.cancellation_token.clone(),
-            db_handle: self.inner.db_handle.clone(),
-            memory_write_approval: on,
-        };
-        self.inner = Arc::new(inner);
-        self
+    pub fn with_memory_write_approval(self, on: bool) -> Self {
+        self.with_inner(|inner| inner.memory_write_approval = on)
+    }
+
+    /// Attach a typed reverse-RPC handle to the embedding host (R2/R3). Tools
+    /// call `host_context()` to reach it. The engine injects one per turn via
+    /// its `HostContextFactory`; the transport lives in the host.
+    pub fn with_host_context(self, host: Arc<dyn HostContext>) -> Self {
+        self.with_inner(|inner| inner.host_context = Some(host))
     }
 
     /// Whether the engine wants `MemoryWrite` calls staged for
@@ -424,6 +306,14 @@ impl ToolContext {
     /// fresh store from `workspace_root`.
     pub fn memory_store_opaque(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.inner.memory_store.clone()
+    }
+
+    /// The reverse-RPC handle to the embedding host (R2/R3), if the engine
+    /// injected one this turn. Typed (not `Arc<dyn Any>`) because `HostContext`
+    /// lives in this crate. `None` when no host context is wired — tools that
+    /// require it should surface a clean "no host context attached" error.
+    pub fn host_context(&self) -> Option<&Arc<dyn HostContext>> {
+        self.inner.host_context.as_ref()
     }
 
     pub fn tenant_id(&self) -> &TenantId {
@@ -530,5 +420,41 @@ impl ToolContext {
             .as_ref()
             .map(|t| t.is_cancelled())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod host_context_tests {
+    use super::*;
+    use crate::host_context::{HostContext, HostContextError};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    #[derive(Debug)]
+    struct Echo;
+
+    #[async_trait]
+    impl HostContext for Echo {
+        async fn call(&self, method: &str, params: Value) -> Result<Value, HostContextError> {
+            Ok(json!({ "method": method, "params": params }))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_context_accessor_roundtrips() {
+        let ctx = ToolContext::new(
+            TenantId::new("t"),
+            ProjectId::from_raw("p"),
+            SessionId::new(),
+            "/tmp".into(),
+        );
+        // Absent by default (R3): tools that need it error cleanly.
+        assert!(ctx.host_context().is_none());
+
+        let ctx = ctx.with_host_context(Arc::new(Echo));
+        let host = ctx.host_context().expect("host context attached");
+        let resp = host.call("zotero.search", json!({"q": "x"})).await.unwrap();
+        assert_eq!(resp["method"], "zotero.search");
+        assert_eq!(resp["params"], json!({"q": "x"}));
     }
 }

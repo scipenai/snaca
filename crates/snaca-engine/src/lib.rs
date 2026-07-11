@@ -30,7 +30,7 @@ pub use approval::{
     DenyAllApprovalGate, NoopApprovalGate,
 };
 pub use config::EngineConfig;
-pub use engine::{Engine, TurnOutcome, TurnRequest};
+pub use engine::{Engine, HostContextFactory, TurnOutcome, TurnRequest};
 pub use error::{EngineError, EngineResult};
 pub use listener::{NoopListener, RecordingListener, TurnEventListener};
 pub use loop_guard::{LoopGuard, LoopGuardConfig};

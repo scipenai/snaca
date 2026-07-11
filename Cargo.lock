@@ -366,9 +366,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cbc"
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-agent-api"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -3242,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-channel-host"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "data-encoding",
  "escargot",
@@ -3259,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-channel-protocol"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-cli"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-core"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-engine"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-llm"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-mcp"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-memory"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-plugin-lark"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-sdk"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -3425,7 +3425,9 @@ dependencies = [
  "snaca-core",
  "snaca-engine",
  "snaca-llm",
+ "snaca-mcp",
  "snaca-memory",
+ "snaca-skills",
  "snaca-state",
  "snaca-tools",
  "snaca-tools-api",
@@ -3438,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-server"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3482,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-skills"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3499,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-state"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3516,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-tools"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3544,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-tools-api"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3557,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "snaca-workspace"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "landlock",

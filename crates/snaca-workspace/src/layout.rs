@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct WorkspaceLayout {
     mode: WorkspaceLayoutMode,
+    /// When set, overrides the tool cwd (`workspace_dir()`) with this absolute
+    /// path while leaving every metadata path (memory/skills/settings/db)
+    /// resolved by `mode`. Lets an editor host point Read/Write/Bash at the
+    /// user's real project directory while SNACA's own state stays under
+    /// `data_root`. `None` = derive cwd from `mode` as before.
+    explicit_workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +37,7 @@ impl WorkspaceLayout {
         }
         Ok(Self {
             mode: WorkspaceLayoutMode::MultiTenant { data_root },
+            explicit_workspace: None,
         })
     }
 
@@ -46,7 +53,24 @@ impl WorkspaceLayout {
         }
         Ok(Self {
             mode: WorkspaceLayoutMode::SingleProject { workspace_root },
+            explicit_workspace: None,
         })
+    }
+
+    /// Pin the tool cwd to an absolute directory, overriding the `workspace_dir()`
+    /// derived from the layout mode. Metadata paths (memory/skills/settings) are
+    /// unaffected — they still resolve under `data_root`. The directory must be
+    /// absolute; path-traversal guards are meaningless otherwise.
+    pub fn with_explicit_workspace(
+        mut self,
+        dir: impl Into<PathBuf>,
+    ) -> Result<Self, WorkspaceError> {
+        let dir = dir.into();
+        if !dir.is_absolute() {
+            return Err(WorkspaceError::RootNotAbsolute(dir.display().to_string()));
+        }
+        self.explicit_workspace = Some(dir);
+        Ok(self)
     }
 
     pub fn data_root(&self) -> &Path {
@@ -85,6 +109,9 @@ impl WorkspaceLayout {
 
     /// Filesystem cwd for tools (Read/Write/Bash etc.).
     pub fn workspace_dir(&self, tenant: &TenantId, project: &ProjectId) -> PathBuf {
+        if let Some(explicit) = &self.explicit_workspace {
+            return explicit.clone();
+        }
         match &self.mode {
             WorkspaceLayoutMode::MultiTenant { .. } => {
                 self.project_root(tenant, project).join("workspace")
@@ -186,6 +213,48 @@ mod tests {
         assert!(l.memory_dir(&t, &p).join("user").is_dir());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_workspace_overrides_cwd_but_not_metadata() {
+        let l = WorkspaceLayout::new("/tmp/snaca-data")
+            .unwrap()
+            .with_explicit_workspace("/home/user/myproject")
+            .unwrap();
+        let t = TenantId::new("tenant_a");
+        let p = ProjectId::from_raw("proj_x");
+        // Tool cwd is the explicit project dir...
+        assert_eq!(
+            l.workspace_dir(&t, &p),
+            PathBuf::from("/home/user/myproject")
+        );
+        // ...but metadata still resolves under data_root, decoupled from cwd.
+        assert_eq!(
+            l.memory_dir(&t, &p),
+            PathBuf::from("/tmp/snaca-data/tenant_a/projects/proj_x/memory")
+        );
+        assert!(l.project_settings(&t, &p).starts_with("/tmp/snaca-data"));
+        assert!(l.project_skills_dir(&t, &p).starts_with("/tmp/snaca-data"));
+    }
+
+    #[test]
+    fn with_explicit_workspace_rejects_relative() {
+        let err = WorkspaceLayout::new("/tmp/x")
+            .unwrap()
+            .with_explicit_workspace("rel/dir")
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::RootNotAbsolute(_)));
+    }
+
+    #[test]
+    fn without_explicit_workspace_cwd_is_unchanged() {
+        let l = layout();
+        let t = TenantId::new("tenant_a");
+        let p = ProjectId::from_raw("proj_x");
+        assert_eq!(
+            l.workspace_dir(&t, &p),
+            PathBuf::from("/tmp/snaca-test-layout/tenant_a/projects/proj_x/workspace")
+        );
     }
 
     fn tempdir() -> PathBuf {
