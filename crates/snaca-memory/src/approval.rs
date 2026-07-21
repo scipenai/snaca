@@ -99,6 +99,14 @@ pub async fn stage(memory_root: &Path, pending: &Pending) -> MemoryResult<PathBu
         .open(&path)
         .await?;
     file.write_all(&body).await?;
+    // `tokio::fs::File` buffers writes and completes them on the
+    // blocking pool; `write_all` returns once the bytes are accepted,
+    // not once they reach disk. Without an explicit flush a reader
+    // that opens the pending file immediately after `stage` returns
+    // (e.g. `approve` in the same process) can observe a zero-length
+    // file and fail to parse it. Flush so the write is durable before
+    // we hand back the path.
+    file.flush().await?;
     Ok(path)
 }
 
