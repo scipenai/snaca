@@ -614,6 +614,21 @@ enum MarkdownMode {
 /// Setext-style headers (`=====` / `-----` underlines) and lazy headers
 /// without a space after `#` are left alone — rare in LLM output.
 fn markdown_for_lark(input: &str, mode: MarkdownMode) -> String {
+    // Read the process-wide `LARK_TABLE_MODE` override once, here at the
+    // edge, then thread it down as a parameter. Keeping the env read out
+    // of the inner logic lets tests inject an override without mutating
+    // global process state — `std::env::set_var` is process-global (and
+    // `unsafe`/unsound with concurrent readers), so tests that set it
+    // used to flake sibling table tests running in parallel.
+    let table_override = std::env::var("LARK_TABLE_MODE").ok();
+    markdown_for_lark_inner(input, mode, table_override.as_deref())
+}
+
+fn markdown_for_lark_inner(
+    input: &str,
+    mode: MarkdownMode,
+    table_override: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(input.len() + 32);
     let mut in_fence = false;
     let lines: Vec<&str> = input.split_inclusive('\n').collect();
@@ -694,7 +709,8 @@ fn markdown_for_lark(input: &str, mode: MarkdownMode) -> String {
                 block.insert(1, sep);
             }
             let block_refs: Vec<&str> = block.iter().map(String::as_str).collect();
-            if convert_tables_for_mode(mode) {
+            let convert = convert_tables_for_mode(mode, table_override);
+            if convert {
                 out.push_str(&render_table_as_list(&block_refs));
             } else {
                 // Native rendering — emit each row verbatim, including
@@ -712,7 +728,7 @@ fn markdown_for_lark(input: &str, mode: MarkdownMode) -> String {
             }
             // For the list-conversion path, mirror the trailing newline
             // of the original block's last line.
-            if convert_tables_for_mode(mode) && lines[end - 1].ends_with('\n') {
+            if convert && lines[end - 1].ends_with('\n') {
                 out.push('\n');
             }
             i = end;
@@ -775,8 +791,8 @@ fn markdown_for_lark(input: &str, mode: MarkdownMode) -> String {
 /// the override is mostly useful when comparing rendering on different
 /// Lark client versions, or when a mobile-heavy audience prefers
 /// list-style scanability even on v2.
-fn convert_tables_for_mode(mode: MarkdownMode) -> bool {
-    match std::env::var("LARK_TABLE_MODE").ok().as_deref() {
+fn convert_tables_for_mode(mode: MarkdownMode, override_mode: Option<&str>) -> bool {
+    match override_mode {
         Some("list") => true,
         Some("native") => false,
         _ => match mode {
@@ -4707,11 +4723,11 @@ let x = 1;
 
     #[test]
     fn table_passthrough_when_native_mode_forced() {
-        // Force-native via env should keep raw pipes even in v1 mode.
-        std::env::set_var("LARK_TABLE_MODE", "native");
+        // Force-native override should keep raw pipes even in v1 mode.
+        // Inject the override as a parameter rather than mutating the
+        // process-global env, which would flake sibling table tests.
         let input = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let out = markdown_for_lark(input, MarkdownMode::V1);
-        std::env::remove_var("LARK_TABLE_MODE");
+        let out = markdown_for_lark_inner(input, MarkdownMode::V1, Some("native"));
         assert!(out.contains("| a | b |\n"));
         assert!(out.contains("| 1 | 2 |\n"));
     }
@@ -4755,10 +4771,10 @@ let x = 1;
 
     #[test]
     fn lark_table_mode_list_forces_conversion_in_v2() {
-        std::env::set_var("LARK_TABLE_MODE", "list");
+        // Inject the `list` override as a parameter rather than mutating
+        // the process-global env (which would flake sibling table tests).
         let input = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let out = markdown_for_lark(input, MarkdownMode::V2);
-        std::env::remove_var("LARK_TABLE_MODE");
+        let out = markdown_for_lark_inner(input, MarkdownMode::V2, Some("list"));
         // Even in v2, an explicit `list` override flattens to bullets.
         assert!(out.contains("**1**: 2\n"));
         assert!(!out.contains("|---"));
