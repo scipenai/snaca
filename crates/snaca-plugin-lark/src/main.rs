@@ -624,7 +624,11 @@ fn markdown_for_lark(input: &str, mode: MarkdownMode) -> String {
     markdown_for_lark_inner(input, mode, table_override.as_deref())
 }
 
-fn markdown_for_lark_inner(input: &str, mode: MarkdownMode, table_override: Option<&str>) -> String {
+fn markdown_for_lark_inner(
+    input: &str,
+    mode: MarkdownMode,
+    table_override: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(input.len() + 32);
     let mut in_fence = false;
     let lines: Vec<&str> = input.split_inclusive('\n').collect();
