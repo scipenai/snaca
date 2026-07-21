@@ -33,13 +33,23 @@ use std::time::{Duration, Instant};
 /// How long the scripted LLM sleeps before yielding events. Picked so
 /// the serial vs parallel gap is unambiguous: serial dispatcher takes
 /// ~2 × LLM_DELAY, parallel takes ~1 × LLM_DELAY.
-const LLM_DELAY: Duration = Duration::from_millis(700);
+///
+/// The measured signal is the wall-clock gap between the two sends.
+/// Under parallel dispatch that gap is just scheduling overhead and is
+/// *independent* of LLM_DELAY; under a serialising regression it grows
+/// to ~LLM_DELAY. So a longer delay only widens the margin between
+/// "parallel" and "serial" — it costs a little wall-clock but makes the
+/// assertion robust against loaded-runner jitter (which was observed
+/// pushing the parallel gap past a tighter 250ms bound and flaking CI).
+const LLM_DELAY: Duration = Duration::from_millis(1500);
 
-/// Max acceptable wall-clock gap between the two recorded sends. Well
-/// below LLM_DELAY (700ms) so any regression that re-serialises the
-/// dispatcher will trip this assertion immediately. Generous enough
-/// that GC pauses / loaded CI runners don't flake.
-const MAX_GAP_MS: u128 = 250;
+/// Max acceptable wall-clock gap between the two recorded sends. Set far
+/// below LLM_DELAY (1500ms) so any regression that re-serialises the
+/// dispatcher (gap ~= LLM_DELAY) trips this assertion immediately, yet
+/// well above the scheduling overhead a contended CI runner adds to the
+/// parallel path (~400ms observed) so healthy parallel dispatch never
+/// flakes.
+const MAX_GAP_MS: u128 = 600;
 
 fn snaca_cli_binary() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
