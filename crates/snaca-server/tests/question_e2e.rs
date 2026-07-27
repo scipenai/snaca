@@ -194,11 +194,21 @@ SNACA_MOCK_RECORD_SENDS = {record_path:?}
     }
 }
 
-async fn wait_for_record(path: &std::path::Path, deadline: Instant) -> String {
+/// Poll the mock's send-record until it contains `needle`.
+///
+/// The needle must be unique to the *final* assistant reply. Waiting on
+/// merely "file is non-empty" is racy: on the text-fallback path the
+/// question prompt is itself a `message.send`, so the first record line
+/// is the prompt — which already echoes the option labels. A caller that
+/// then reads `llm_seen` can observe the run before the tool_result has
+/// round-tripped back to the model. Anchoring on the final reply keeps
+/// the two observations causally ordered, since the engine only calls
+/// the LLM a second time after appending the tool_result.
+async fn wait_for_record(path: &std::path::Path, needle: &str, deadline: Instant) -> String {
     while Instant::now() < deadline {
         if path.exists() {
             let s = std::fs::read_to_string(path).unwrap_or_default();
-            if !s.is_empty() && !s.contains("\"content\":\"(no reply)\"") {
+            if s.contains(needle) && !s.contains("\"content\":\"(no reply)\"") {
                 return s;
             }
         }
@@ -257,8 +267,16 @@ async fn auto_answer_round_trips_through_question_pipeline() {
     ]));
     let fix = build_fixture(r#""--auto-answer", "0","#, llm.clone()).await;
 
-    let record = wait_for_record(&fix.record_path, Instant::now() + Duration::from_secs(20)).await;
-    assert!(!record.is_empty(), "no message.send recorded");
+    let record = wait_for_record(
+        &fix.record_path,
+        "proceeding",
+        Instant::now() + Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        !record.is_empty(),
+        "final reply not recorded before deadline"
+    );
     assert!(
         record.contains("OAuth"),
         "final reply does not mention OAuth pick: {record}"
@@ -307,8 +325,19 @@ async fn text_fallback_intercepts_next_user_message() {
     ]));
     let fix = build_fixture(r#""--reply-to-question", "1","#, llm.clone()).await;
 
-    let record = wait_for_record(&fix.record_path, Instant::now() + Duration::from_secs(25)).await;
-    assert!(!record.is_empty(), "no message.send recorded");
+    // Anchor on the final reply, not on the option labels: the question
+    // prompt this path sends is itself recorded and already contains
+    // "OAuth", so a laxer wait can return before the tool_result exists.
+    let record = wait_for_record(
+        &fix.record_path,
+        "proceeding",
+        Instant::now() + Duration::from_secs(25),
+    )
+    .await;
+    assert!(
+        !record.is_empty(),
+        "final reply not recorded before deadline"
+    );
     assert!(
         record.contains("OAuth"),
         "final reply does not mention OAuth pick: {record}"
