@@ -182,11 +182,17 @@ SNACA_MOCK_RECORD_SENDS = {record_path:?}
     }
 }
 
-async fn wait_for_record(path: &std::path::Path, deadline: Instant) -> String {
+/// Poll the mock's send-record until it contains `needle`.
+///
+/// Waiting on "file is non-empty" would return whatever `message.send`
+/// happens to land first, which need not be the final assistant reply
+/// the caller wants to assert on. Anchoring on a marker unique to that
+/// reply keeps the wait deterministic under CI load.
+async fn wait_for_record(path: &std::path::Path, needle: &str, deadline: Instant) -> String {
     while Instant::now() < deadline {
         if path.exists() {
             let s = std::fs::read_to_string(path).unwrap_or_default();
-            if !s.is_empty() && !s.contains("\"content\":\"(no reply)\"") {
+            if s.contains(needle) && !s.contains("\"content\":\"(no reply)\"") {
                 return s;
             }
         }
@@ -203,8 +209,16 @@ async fn auto_approve_lets_write_tool_run() {
     ]));
     let fix = build_fixture("allow_always", llm).await;
 
-    let record = wait_for_record(&fix.record_path, Instant::now() + Duration::from_secs(15)).await;
-    assert!(!record.is_empty(), "no message.send recorded");
+    let record = wait_for_record(
+        &fix.record_path,
+        "file written",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        !record.is_empty(),
+        "final reply not recorded before deadline"
+    );
     assert!(record.contains("file written"), "got: {record}");
 
     let target = fix.workspace_dir.join("hello.txt");
@@ -223,8 +237,16 @@ async fn auto_deny_blocks_write_tool_with_tool_error() {
     ]));
     let fix = build_fixture("deny", llm).await;
 
-    let record = wait_for_record(&fix.record_path, Instant::now() + Duration::from_secs(15)).await;
-    assert!(!record.is_empty(), "no message.send recorded");
+    let record = wait_for_record(
+        &fix.record_path,
+        "write was blocked",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        !record.is_empty(),
+        "final reply not recorded before deadline"
+    );
     assert!(
         record.contains("blocked"),
         "expected denial reflection in reply: {record}"
