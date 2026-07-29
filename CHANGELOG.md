@@ -11,6 +11,20 @@ git submodule depending on `snaca-sdk` alone. The internal library crates
 (`snaca-engine`, `snaca-state`, `snaca-tools`, …) beyond what the facade
 re-exports are **not** covered by semver and may change between minor versions.
 
+## 0.3.2
+
+### Fixed
+- **Compaction summary anti-pollution.** The thread summariser reuses the main
+  model (DeepSeek), which occasionally slips back into its native tool-call
+  protocol and emits DSML tokens (`<｜｜DSML｜｜tool_calls>`, `invoke name=…`) as
+  plain text. Previously that blob was stored verbatim as the thread summary and
+  re-spliced into the system preamble on every subsequent turn, poisoning the
+  model. `maybe_compact_thread` now runs the summariser output through
+  `sanitize_thread_summary`, which truncates at the earliest tool-call/DSML
+  marker; if nothing substantive survives, compaction is skipped and retried
+  next turn rather than persisting poison. Existing poisoned rows must be cleared
+  out-of-band (delete the affected `thread_compactions` row).
+
 ## 0.3.1
 
 ### Changed

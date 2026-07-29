@@ -1936,14 +1936,23 @@ impl Engine {
         req = req.with_max_tokens(self.config.compact_summary_max_tokens);
 
         let resp = self.llm.create_message(req).await?;
-        let summary = ContentBlock::collect_text(&resp.message.content);
-        if summary.trim().is_empty() {
-            warn!(
-                thread_id = thread_id.as_str(),
-                "summariser returned empty text; skipping compaction"
-            );
-            return Ok(());
-        }
+        let raw_summary = ContentBlock::collect_text(&resp.message.content);
+        // Anti-pollution: never persist a summary that is empty or that
+        // carries leaked tool-call / DSML syntax. A poisoned summary is
+        // spliced back into every subsequent turn's prompt and re-triggers
+        // the very doom-loop compaction is meant to relieve.
+        let summary = match sanitize_thread_summary(&raw_summary) {
+            Some(s) => s,
+            None => {
+                warn!(
+                    thread_id = thread_id.as_str(),
+                    raw_len = raw_summary.len(),
+                    "summariser returned empty or tool-call/DSML-polluted text; \
+                     skipping compaction (thread will retry next turn)"
+                );
+                return Ok(());
+            }
+        };
 
         let saved = self
             .state
@@ -3309,6 +3318,60 @@ const SUMMARY_BLOCK_MAX_BYTES: usize = 16 * 1024;
 /// band holds many mid-sized results. ~256 KiB (~64k tokens) leaves ample
 /// headroom under any modern context window.
 const SUMMARY_TOTAL_MAX_BYTES: usize = 256 * 1024;
+
+/// Substrings that must never appear in a persisted thread summary. When
+/// the summariser model (DeepSeek in particular, which reuses the main
+/// model) slips back into its native tool-call protocol, it emits these
+/// tokens as *literal text* rather than a real tool call — e.g.
+/// `<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="Bash">…`. Storing such a
+/// blob as the thread summary poisons every subsequent turn: `load_history`
+/// splices the summary back in as a system preamble, and the model
+/// pattern-matches on the leaked tool-call syntax instead of answering.
+/// [`sanitize_thread_summary`] truncates at the earliest of these markers.
+const SUMMARY_POISON_MARKERS: &[&str] = &[
+    "DSML",              // `<｜｜DSML｜｜tool_calls>` family
+    "tool_calls",        // OpenAI/DeepSeek tool-call key
+    "tool\u{2581}call",  // DeepSeek native token (U+2581 word-join): `tool▁call`
+    "<\u{ff5c}tool",     // `<｜tool▁calls▁begin｜>` family (full-width bar)
+    "<\u{ff5c}\u{ff5c}", // full-width double-bar DSML delimiter `<｜｜`
+    "invoke name=",      // Anthropic-style tool invocation leak
+    "antml:invoke",
+];
+
+/// Minimum char count a cleaned summary must retain to be worth storing.
+/// Below this, whatever survived marker-stripping is a stub — storing it
+/// still discards the compacted band, so returning `None` (skip
+/// compaction, retry next turn) is strictly better than persisting it.
+const MIN_SUMMARY_CHARS: usize = 24;
+
+/// Clean a raw summariser response before it is persisted as the thread
+/// summary. Truncates at the first tool-call/DSML marker (keeping any
+/// clean prose prefix) and trims. Returns `None` when nothing usable
+/// survives — the caller then skips compaction rather than store poison.
+fn sanitize_thread_summary(raw: &str) -> Option<String> {
+    let mut cleaned = raw;
+    let mut truncated = false;
+    for marker in SUMMARY_POISON_MARKERS {
+        if let Some(idx) = cleaned.find(marker) {
+            // `find` returns the byte offset of the match start, which is a
+            // char boundary, so the slice is always valid UTF-8.
+            cleaned = &cleaned[..idx];
+            truncated = true;
+        }
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // The substance floor applies only when pollution was actually
+    // stripped: a clean (marker-free) short summary is legitimate, but a
+    // stub left after truncating a leading tool-call marker is not worth
+    // storing — it would still discard the compacted band for no gist.
+    if truncated && cleaned.chars().count() < MIN_SUMMARY_CHARS {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
 
 /// Byte size of a `tool_result` body's text blocks — the portion the byte
 /// cap can elide. Mirrors how `message_byte_size` counts a `ToolResult`.
@@ -4868,6 +4931,39 @@ mod history_window_tests {
         // Tail-biased: the newest survives, the oldest is dropped.
         assert!(rendered.contains("MARK99"), "newest kept");
         assert!(!rendered.contains("MARK0 "), "oldest dropped");
+    }
+
+    #[test]
+    fn sanitize_summary_keeps_clean_prose() {
+        let s = "The user asked about customer files; the assistant listed \
+                 three spreadsheets and confirmed the workspace path.";
+        assert_eq!(sanitize_thread_summary(s).as_deref(), Some(s));
+    }
+
+    #[test]
+    fn sanitize_summary_rejects_pure_dsml_blob() {
+        // The exact production shape: an all-tool-call blob with no prose.
+        let poison = "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\
+                      <\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"Bash\">python3 x.py";
+        assert_eq!(sanitize_thread_summary(poison), None);
+    }
+
+    #[test]
+    fn sanitize_summary_truncates_prose_then_dsml() {
+        let mixed = "The assistant summarised the market-department table. \
+                     Then it must run <\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls> junk";
+        let cleaned = sanitize_thread_summary(mixed).expect("prose prefix survives");
+        assert!(cleaned.starts_with("The assistant summarised"));
+        assert!(!cleaned.contains("DSML"));
+        assert!(!cleaned.contains("<\u{ff5c}\u{ff5c}"));
+    }
+
+    #[test]
+    fn sanitize_summary_rejects_short_stub() {
+        // A leading marker leaves only a stub after truncation → not worth storing.
+        let stub = "ok tool_calls: [ ... ]";
+        assert_eq!(sanitize_thread_summary(stub), None);
+        assert_eq!(sanitize_thread_summary("   "), None);
     }
 
     #[test]
