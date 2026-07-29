@@ -1673,6 +1673,9 @@ impl Engine {
         // panic falls back to an empty listing, matching the in-fn error
         // handling.
         let workspace_dir = self.workspace.workspace_dir(tenant, project);
+        // Absolute cwd string, surfaced to the model alongside the listing so
+        // it builds workspace-relative paths instead of guessing a host path.
+        let workspace_root = workspace_dir.display().to_string();
         let workspace_files =
             tokio::task::spawn_blocking(move || render_workspace_files(&workspace_dir))
                 .await
@@ -1691,6 +1694,7 @@ impl Engine {
                 &cached,
                 "",
                 &workspace_files,
+                &workspace_root,
                 ephemeral_system,
                 loop_guard_hint,
             );
@@ -1707,6 +1711,7 @@ impl Engine {
             &snapshot_text,
             "",
             &workspace_files,
+            &workspace_root,
             ephemeral_system,
             loop_guard_hint,
         )
@@ -2821,6 +2826,7 @@ fn compose_system_segments(
     index: &str,
     _recall: &str,
     workspace_files: &str,
+    workspace_root: &str,
     ephemeral_system: Option<&str>,
     loop_guard_hint: Option<&LoopGuardHint>,
 ) -> Vec<SystemSegment> {
@@ -2854,14 +2860,34 @@ fn compose_system_segments(
     // been evicted, and adding/removing a file never busts the memory
     // prefix cache.
     if !workspace_files.trim().is_empty() {
+        // Absolute root of the tool sandbox. Shown so the model can build
+        // correct paths when a tool genuinely needs one (e.g. a shell
+        // command), instead of hallucinating a host path. Omitted when the
+        // caller doesn't supply it (tests), leaving the listing alone.
+        let cwd_line = if workspace_root.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Your working directory — the cwd for `Bash` and the root \
+                 that `Read`/`Write`/`Edit` resolve every path against — is:\n\n\
+                 \u{20}\u{20}\u{20}\u{20}{}\n\n",
+                workspace_root.trim(),
+            )
+        };
         segs.push(SystemSegment::volatile(format!(
             "\n\n---\n\n## Workspace Files\n\n\
-             These files are in your project workspace — the durable \
-             source of truth for anything the user uploaded. Read them \
-             with the `Read` tool (paths are workspace-relative). This \
-             list is current as of THIS turn; before telling the user you \
-             don't have a file, check here first.\n\n{}",
-            workspace_files.trim(),
+             {cwd_line}\
+             The files below are in your project workspace — the durable \
+             source of truth for anything the user uploaded. **Always \
+             reference them by workspace-relative path** (e.g. `report.pdf` \
+             or `sub/dir/data.xlsx`) and read them with the `Read` tool. Do \
+             NOT use absolute paths: anything pointing outside the root above \
+             — a host path like `/home/user/...`, `/root/...` or `/workspace/...`, \
+             or a path from the user's own machine — is rejected by the \
+             sandbox and fails with \"outside workspace root\" or \"No such \
+             file\". This list is current as of THIS turn; before telling the \
+             user you don't have a file, check here first.\n\n{files}",
+            files = workspace_files.trim(),
         )));
     }
     if let Some(hint) = loop_guard_hint {
@@ -2892,7 +2918,7 @@ fn compose_system_segments(
 /// builds since the engine itself only ever speaks segments.
 #[cfg(test)]
 fn compose_system_prompt(base: &str, index: &str, recall: &str) -> String {
-    let segs = compose_system_segments(base, index, recall, "", None, None);
+    let segs = compose_system_segments(base, index, recall, "", "", None, None);
     let mut out = String::new();
     for s in segs {
         out.push_str(&s.text);
@@ -4206,7 +4232,7 @@ mod system_prompt_tests {
         // one cacheable segment. Loop-guard hints (tested separately)
         // are the only thing that can ever push a volatile second
         // segment into the prompt now.
-        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", "", None, None);
+        let segs = compose_system_segments("BASE", "user/foo — bar", "hit one", "", "", None, None);
         assert_eq!(
             segs.len(),
             1,
@@ -4221,7 +4247,7 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_recall() {
-        let segs = compose_system_segments("BASE", "user/foo", "", "", None, None);
+        let segs = compose_system_segments("BASE", "user/foo", "", "", "", None, None);
         assert_eq!(segs.len(), 1, "no recall => single segment");
         assert!(segs[0].cacheable);
         assert!(segs[0].text.contains("BASE"));
@@ -4230,7 +4256,7 @@ mod system_prompt_tests {
 
     #[test]
     fn segments_collapse_when_no_memory_and_no_recall() {
-        let segs = compose_system_segments("BASE", "", "", "", None, None);
+        let segs = compose_system_segments("BASE", "", "", "", "", None, None);
         assert_eq!(segs.len(), 1);
         assert!(segs[0].cacheable);
         assert!(!segs[0].text.contains("## Project Memory"));
@@ -4238,10 +4264,11 @@ mod system_prompt_tests {
 
     #[test]
     fn ephemeral_system_appends_a_volatile_segment_without_touching_prefix() {
-        let none = compose_system_segments("BASE", "user/foo", "", "", None, None);
+        let none = compose_system_segments("BASE", "user/foo", "", "", "", None, None);
         let some = compose_system_segments(
             "BASE",
             "user/foo",
+            "",
             "",
             "",
             Some("## Editor\nopen: main.rs"),
@@ -4263,12 +4290,12 @@ mod system_prompt_tests {
             "ephemeral text is passed through verbatim"
         );
         // Blank ephemeral is treated as absent.
-        let blank = compose_system_segments("BASE", "user/foo", "", "", Some("   "), None);
+        let blank = compose_system_segments("BASE", "user/foo", "", "", "", Some("   "), None);
         assert_eq!(blank.len(), 1);
         // Non-blank content is pushed verbatim — leading/trailing whitespace the
         // host included is preserved, not normalized.
         let padded =
-            compose_system_segments("BASE", "user/foo", "", "", Some("\n  keep me  "), None);
+            compose_system_segments("BASE", "user/foo", "", "", "", Some("\n  keep me  "), None);
         assert_eq!(padded[1].text, "\n  keep me  ");
     }
 
@@ -4281,6 +4308,7 @@ mod system_prompt_tests {
             "user/foo",
             "",
             "- report.pdf (1.2 KB)\n- notes.md (300 B)\n",
+            "/data/t/projects/p/workspace",
             None,
             None,
         );
@@ -4289,10 +4317,13 @@ mod system_prompt_tests {
         assert!(!with_files[1].cacheable, "file list segment is volatile");
         assert!(with_files[1].text.contains("## Workspace Files"));
         assert!(with_files[1].text.contains("report.pdf"));
+        // The absolute cwd is surfaced, and the relative-path rule stated.
+        assert!(with_files[1].text.contains("/data/t/projects/p/workspace"));
+        assert!(with_files[1].text.contains("workspace-relative path"));
 
         // The cacheable prefix is byte-identical whether or not the file
         // list changes — the whole point of holding it out of the cache.
-        let no_files = compose_system_segments("BASE", "user/foo", "", "", None, None);
+        let no_files = compose_system_segments("BASE", "user/foo", "", "", "", None, None);
         assert_eq!(
             with_files[0].text, no_files[0].text,
             "adding/removing files must not change the cacheable prefix"

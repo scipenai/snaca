@@ -11,6 +11,16 @@ git submodule depending on `snaca-sdk` alone. The internal library crates
 (`snaca-engine`, `snaca-state`, `snaca-tools`, …) beyond what the facade
 re-exports are **not** covered by semver and may change between minor versions.
 
+## 0.3.1
+
+### Changed
+- **Workspace Files prompt** now states the absolute workspace root (the tool
+  cwd) and instructs the model to reference uploads by workspace-relative path.
+  Absolute host paths (`/home/user/...`, `/root/...`, a path from the user's own
+  machine) are rejected by the sandbox; surfacing the real root stops the model
+  guessing them and then reporting a file as "not found". Rides the existing
+  volatile segment, so the cacheable prefix is unchanged.
+
 ## 0.3.0
 
 Downstream extension points — a host (e.g. an editor sidecar) can now drive
