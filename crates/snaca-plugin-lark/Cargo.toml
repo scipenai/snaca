@@ -28,10 +28,9 @@ reqwest = { workspace = true }
 # `websocket_echo_bot` example shipping with openlark — `auth` for
 # `app_access_token`, `communication` for the IM_V1_MESSAGES endpoint
 # constant (we POST manually for now), `websocket` for the WS client.
-# Pinned to 0.15 — openlark-auth 0.16 added an exact `uuid = "=1.6.1"`
-# pin that conflicts with the rest of the workspace. Revisit when upstream
-# relaxes the constraint.
-openlark = { version = "0.15", default-features = false, features = ["auth", "communication", "websocket"] }
+# 0.16 briefly carried an exact `uuid = "=1.6.1"` pin in openlark-auth that
+# conflicted with the rest of the workspace; 0.20 has relaxed it again.
+openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
 # rustls is pulled in transitively (via reqwest + tokio-tungstenite via
 # openlark's WS client). Recent rustls releases require the consuming
 # binary to *explicitly* install a CryptoProvider before any TLS use,

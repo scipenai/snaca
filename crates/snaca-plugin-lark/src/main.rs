@@ -3374,9 +3374,10 @@ async fn run_lark_ws(cfg: LarkConfig, tx: mpsc::UnboundedSender<JsonRpcMessage>)
         .app_id(cfg.app_id.clone())
         .app_secret(cfg.app_secret.clone())
         .base_url(cfg.base_url.clone())
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| anyhow::anyhow!("Lark Config build failed: {e}"))?;
+        // openlark 0.20 renamed `timeout` to `req_timeout` and made `build()`
+        // infallible — it now returns `Config` rather than `Result<Config>`.
+        .req_timeout(Duration::from_secs(30))
+        .build();
     let ws_config = Arc::new(ws_config);
 
     let (payload_tx, mut payload_rx) = mpsc::unbounded_channel::<Vec<u8>>();
