@@ -701,6 +701,13 @@ mod tests {
         assert!(out.contains("Cargo.toml"));
     }
 
+    /// Serializes the strict-mode tests against each other. The env var
+    /// is process-global but cargo runs tests on a thread pool, so two
+    /// concurrent guards would race: the first one to drop restores the
+    /// relaxed default out from under the second test, which then sees
+    /// its command *accepted* and fails on `unwrap_err()`.
+    static STRICT_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Force strict mode for the lifetime of the guard. Tests that
     /// exercise the public `BashTool::execute` happy-path through the
     /// strict validator opt in via this RAII helper. Other concurrent
@@ -708,13 +715,23 @@ mod tests {
     /// by the global env mutation.
     struct StrictModeGuard {
         prior: Option<String>,
+        // Held for the guard's lifetime; released on drop after the env
+        // var is restored. `MutexGuard<'static, ()>` because the lock is
+        // a `static`.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl StrictModeGuard {
         fn new() -> Self {
+            // A panicking strict test poisons the lock; the env var is
+            // still restored by this guard's `Drop`, so recovering is
+            // safe and keeps one failure from cascading into the rest.
+            let lock = STRICT_MODE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let prior = std::env::var("SNACA_BASH_RELAXED").ok();
             std::env::set_var("SNACA_BASH_RELAXED", "0");
-            Self { prior }
+            Self { prior, _lock: lock }
         }
     }
 
