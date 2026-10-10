@@ -36,8 +36,9 @@
 //!
 //! ## Scope (M1 of M3-real-test)
 //!
-//! - Inbound: text messages from p2p + group chats. Image/file/etc
-//!   are dropped with a debug log (no attachment plumbing yet).
+//! - Inbound: text, rich-text (`post`), file and image messages from
+//!   p2p + group chats; files and images (including those inside a
+//!   `post`) are fetched as attachments.
 //! - Outbound: text via `message.send`; `message.update` lands as a
 //!   warning + falls back to a fresh send (Lark caps update QPS and
 //!   we don't have message-id correlation wired yet).
@@ -3220,9 +3221,9 @@ fn render_message_content_text(msg_type: &str, content_obj: &Value) -> String {
 }
 
 /// Build the downloadable `Attachment`(s) for a message body. Shared by
-/// the inbound `file`/`image` arms and by quoted-message resolution so a
-/// file or image that the user *replied to* gets imported just like one
-/// they sent directly.
+/// the inbound `file` / `image` / `post` arms and by quoted-message
+/// resolution so a file or image that the user *replied to* gets imported
+/// just like one they sent directly.
 ///
 /// `message_id` is the id of the message that **owns** the resource — the
 /// current message for a direct send, the *parent* for a quote — because
@@ -3280,19 +3281,74 @@ fn extract_message_attachments(
             if image_key.is_empty() {
                 return out;
             }
-            // Images get a synthetic .png filename. The downloader serves
-            // the raw bytes regardless of actual format.
-            let filename = format!("{image_key}.png");
-            out.push(Attachment {
-                id: build_image_id(message_id, image_key, &filename),
-                filename,
-                mime_type: "image/png".to_string(),
-                size: 0,
-            });
+            out.push(image_attachment(message_id, image_key));
+        }
+        // Rich text: images pasted alongside the text arrive as `img` tags
+        // inside the paragraphs, downloadable from the same endpoint as an
+        // image message's.
+        "post" => {
+            let paragraphs = content_obj.get("content").and_then(|v| v.as_array());
+            for item in paragraphs
+                .into_iter()
+                .flatten()
+                .flat_map(|p| p.as_array().map(Vec::as_slice).unwrap_or_default())
+            {
+                if item.get("tag").and_then(|v| v.as_str()) != Some("img") {
+                    continue;
+                }
+                let image_key = item.get("image_key").and_then(|v| v.as_str()).unwrap_or("");
+                let att = image_attachment(message_id, image_key);
+                if !image_key.is_empty() && !out.iter().any(|a: &Attachment| a.id == att.id) {
+                    out.push(att);
+                }
+            }
         }
         _ => {}
     }
     out
+}
+
+/// Text and attachments for an inbound rich-text `post`. Lark `post` is an
+/// envelope with an optional title and a 2D array of inline tags; it is
+/// flattened to plain text (preserving paragraph breaks) so the LLM sees
+/// what the user typed, and embedded images keep an `[img]` marker in
+/// place while being fetched as attachments. A post holding only images
+/// (and @-mentions, as in a group) reads like a plain image upload, so the
+/// host waits for the request the same way it does after an image message.
+fn inbound_post(content_obj: &Value, message_id: &str) -> (String, Vec<Attachment>) {
+    let atts = extract_message_attachments("post", content_obj, message_id);
+    if !atts.is_empty() && !post_has_request_text(content_obj) {
+        return ("[uploaded image]".to_string(), atts);
+    }
+    (flatten_post_to_text(content_obj), atts)
+}
+
+/// Whether a post says anything besides its images and @-mentions. The
+/// host strips a leading mention from the text, so `@bot [img]` would
+/// otherwise run as the request "[img]".
+fn post_has_request_text(content_obj: &Value) -> bool {
+    let mut rest = content_obj.clone();
+    if let Some(paragraphs) = rest.get_mut("content").and_then(Value::as_array_mut) {
+        for paragraph in paragraphs.iter_mut().filter_map(Value::as_array_mut) {
+            paragraph.retain(|item| {
+                !matches!(item.get("tag").and_then(Value::as_str), Some("img" | "at"))
+            });
+        }
+    }
+    !flatten_post_to_text(&rest).trim().is_empty()
+}
+
+/// An image resource owned by `message_id`. Images get a synthetic `.png`
+/// filename: Lark returns none, and the downloader serves the raw bytes
+/// whatever the format (Read sniffs the content, not the extension).
+fn image_attachment(message_id: &str, image_key: &str) -> Attachment {
+    let filename = format!("{image_key}.png");
+    Attachment {
+        id: build_image_id(message_id, image_key, &filename),
+        filename,
+        mime_type: "image/png".to_string(),
+        size: 0,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3608,10 +3664,6 @@ async fn handle_lark_payload(
             attachments.extend(atts);
         }
         "image" => {
-            // Images get a synthetic .png filename. The downloader serves
-            // the raw bytes regardless of actual format; the import
-            // pipeline won't run useful extraction over them until we add
-            // proper image support, but the bytes are captured.
             let atts = extract_message_attachments(message_type, &content_obj, &inbound_msg_id);
             if atts.is_empty() {
                 warn!("image message missing image_key or message_id; dropping");
@@ -3621,13 +3673,9 @@ async fn handle_lark_payload(
             text = "[uploaded image]".to_string();
         }
         "post" => {
-            // Lark `post` is a rich-text envelope with an optional title
-            // and a 2D array of inline tags. We flatten it to plain text
-            // (preserving paragraph breaks) so the LLM sees the same
-            // content the user typed. Embedded images surface as `[image]`
-            // markers — extracting them is M3 territory along with proper
-            // image attachment support.
-            text = flatten_post_to_text(&content_obj);
+            let (post_text, atts) = inbound_post(&content_obj, &inbound_msg_id);
+            text = post_text;
+            attachments.extend(atts);
             if text.trim().is_empty() {
                 debug!("empty post body after flatten; skipping");
                 return Ok(());
@@ -3909,6 +3957,62 @@ mod tests {
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].id, "image:om_parent:img_xyz:img_xyz.png");
         assert_eq!(atts[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn extract_attachments_finds_images_inside_a_post() {
+        // Without this: an image pasted into the same message as its text
+        // (Lark sends that as rich-text `post`) reached the model as a bare
+        // `[img]` marker — the file was never downloaded, so the model was
+        // asked about a picture it could not see.
+        let body = json!({
+            "title": "",
+            "content": [
+                [{"tag": "img", "image_key": "img_a", "width": 800, "height": 600}],
+                [{"tag": "text", "text": "这里说了什么"}],
+                [{"tag": "img", "image_key": "img_b"}, {"tag": "img", "image_key": "img_a"}],
+                [{"tag": "img"}],
+            ]
+        });
+        let atts = extract_message_attachments("post", &body, "om_post");
+        let ids: Vec<&str> = atts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "image:om_post:img_a:img_a.png",
+                "image:om_post:img_b:img_b.png"
+            ],
+            "every image once, in order; keyless tags skipped"
+        );
+        assert!(extract_message_attachments("post", &json!({}), "om_post").is_empty());
+    }
+
+    #[test]
+    fn image_only_post_reads_as_an_image_upload() {
+        // Without this: a post holding just pasted images would go to the
+        // model as the request "[img]" — run at once with nothing to do,
+        // instead of waiting for what the user wants done, as an image
+        // message does.
+        let only_images = json!({"content": [[{"tag": "img", "image_key": "img_a"}]]});
+        let (text, atts) = inbound_post(&only_images, "om_post");
+        assert_eq!(text, "[uploaded image]");
+        assert_eq!(atts.len(), 1);
+
+        let with_text = json!({"content": [
+            [{"tag": "img", "image_key": "img_a"}],
+            [{"tag": "text", "text": "这里说了什么"}],
+        ]});
+        let (text, atts) = inbound_post(&with_text, "om_post");
+        assert_eq!(text, "[img]\n这里说了什么");
+        assert_eq!(atts.len(), 1);
+
+        // In a group the bot is @-mentioned; that alone asks for nothing.
+        let mentioned = json!({"content": [
+            [{"tag": "at", "user_id": "@_user_1", "user_name": "小四"}],
+            [{"tag": "img", "image_key": "img_a"}],
+        ]});
+        let (text, _) = inbound_post(&mentioned, "om_post");
+        assert_eq!(text, "[uploaded image]");
     }
 
     #[test]
