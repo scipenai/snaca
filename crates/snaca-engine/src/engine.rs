@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use snaca_agent_api::{MemoryIndexRequest, MemoryProvider, MemoryProviderSlot, MemoryWriteRequest};
 use snaca_core::{
     ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolUseId,
-    Usage,
+    Usage, ENGINE_FEEDBACK_PREFIX,
 };
 use snaca_llm::{
     ContentBlockStart, ContentDelta, LlmClient, LlmError, MessageRequest, MessageResponse,
@@ -799,19 +799,7 @@ impl Engine {
                             "model emitted invalid JSON tool args; persisting \
                              feedback and retrying turn"
                         );
-                        let feedback = format!(
-                            "Your previous response attempted to call tool `{tool}` \
-                         but the JSON arguments could not be parsed.\n\n\
-                         Parser error: {message}\n\n\
-                         The most common cause is an unescaped `\"` inside a \
-                         JSON string value. Please retry the same tool call, \
-                         making sure every `\"` that appears INSIDE a JSON \
-                         string is escaped as `\\\"`. Chinese curly quotes \
-                         (`\u{201C}` U+201C and `\u{201D}` U+201D) do NOT need \
-                         escaping. Newlines inside string values must be `\\n`, \
-                         not literal line breaks. Backslashes themselves must \
-                         be escaped as `\\\\`."
-                        );
+                        let feedback = malformed_args_feedback(&tool, &message);
                         self.state
                             .append_message(&NewMessage {
                                 thread_id: thread_id.clone(),
@@ -2751,9 +2739,28 @@ fn error_snippet(error: &str) -> String {
     snippet(&lines[start..].join("\n"), 2000)
 }
 
+/// User-role feedback after the model's tool-call arguments failed to
+/// parse, so it can correct them on the retry.
+fn malformed_args_feedback(tool: &str, message: &str) -> String {
+    format!(
+        "{ENGINE_FEEDBACK_PREFIX}Your previous response attempted to call \
+         tool `{tool}` but the JSON arguments could not be parsed.\n\n\
+         Parser error: {message}\n\n\
+         The most common cause is an unescaped `\"` inside a \
+         JSON string value. Please retry the same tool call, \
+         making sure every `\"` that appears INSIDE a JSON \
+         string is escaped as `\\\"`. Chinese curly quotes \
+         (`\u{201C}` U+201C and `\u{201D}` U+201D) do NOT need \
+         escaping. Newlines inside string values must be `\\n`, \
+         not literal line breaks. Backslashes themselves must \
+         be escaped as `\\\\`."
+    )
+}
+
 fn repeated_tool_failure_feedback(failure: &ToolFailureEvent, count: usize) -> String {
     format!(
-        "Your previous identical tool call failed {count} times in this turn.\n\n\
+        "{ENGINE_FEEDBACK_PREFIX}Your previous identical tool call failed \
+         {count} times in this turn.\n\n\
          Tool: `{tool}`\n\
          Input: `{input}`\n\n\
          Latest error excerpt:\n\

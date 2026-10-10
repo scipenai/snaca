@@ -21,6 +21,6 @@ pub mod usage;
 pub use content::{ContentBlock, ImageSource};
 pub use error::{Error, Result};
 pub use ids::{short_uuid, MessageId, ProjectId, SessionId, TenantId, ThreadId, ToolUseId};
-pub use message::{Message, Role};
+pub use message::{current_turn_start, Message, Role, ENGINE_FEEDBACK_PREFIX};
 pub use tool_schema::ToolSchema;
 pub use usage::Usage;
