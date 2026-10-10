@@ -87,8 +87,8 @@ pub enum ContentDelta {
     },
     /// Opaque provider token for a `Thinking` block (`ContentBlock::
     /// Thinking::signature`) that must be replayed verbatim on later
-    /// requests — e.g. Anthropic's extended-thinking signature. Replaces
-    /// any earlier signature on the block.
+    /// requests — e.g. OpenAI Responses' encrypted reasoning. Replaces any
+    /// earlier signature on the block.
     Signature {
         signature: String,
     },
@@ -457,8 +457,9 @@ mod tests {
 
     #[test]
     fn thinking_signature_survives_synthesize_and_accumulate() {
-        // Without this: signed thinking lost its signature between the
-        // stream and history, so the tool loop could not replay it.
+        // Without this: signed thinking (Anthropic signatures, Responses
+        // encrypted reasoning) lost its signature between the stream and
+        // history, so the tool loop could not replay it.
         let block = ContentBlock::Thinking {
             text: "plan".into(),
             signature: Some("sig-123".into()),

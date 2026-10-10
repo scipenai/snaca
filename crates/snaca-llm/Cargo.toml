@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "SNACA LLM provider abstraction (DeepSeek + Anthropic)"
+description = "SNACA LLM provider abstraction (DeepSeek, Anthropic, OpenAI Responses)"
 
 [dependencies]
 snaca-core.workspace = true
@@ -26,4 +26,5 @@ chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 wiremock = "0.6"

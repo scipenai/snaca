@@ -17,7 +17,9 @@ data_root = "./data"
 id = "default"
 
 [llm]
-# Only `deepseek` is wired up in M1.
+# `"deepseek"` (OpenAI Chat Completions compatible — any compatible
+# endpoint works via `base_url`), `"anthropic"` (Messages API), or
+# `"openai-responses"` (OpenAI Responses API, native for GPT-5 / o-series).
 provider = "deepseek"
 
 # `${VAR}` placeholders are expanded from the environment at startup.
@@ -31,16 +33,20 @@ provider = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
 
 # DeepSeek default model. Set to `deepseek-reasoner` to use R1 (reasoning).
+# Required for `anthropic` / `openai-responses` (startup fails without it),
+# e.g. model = "gpt-5-mini" with api_key = "${OPENAI_API_KEY}".
 model = "deepseek-chat"
 
 # Override only if you're using a proxy or a self-hosted compatible endpoint.
+# `deepseek` / `anthropic` take the bare host; `openai-responses` takes the
+# root including `/v1`, as the OpenAI SDKs do (https://api.openai.com/v1).
 # base_url = "https://api.deepseek.com"
 
 # Embed images so vision-capable models can see them (user-message images
-# and tool-returned pixels). Defaults: true for `anthropic`, false for
-# `deepseek` (hosted DeepSeek models are text-only — flip to true if
-# `base_url` points at a vision-capable OpenAI-compatible endpoint).
-# When off, images degrade to
+# and tool-returned pixels). Defaults: true for `anthropic` /
+# `openai-responses`, false for `deepseek` (hosted DeepSeek models are
+# text-only — flip to true if `base_url` points at a vision-capable
+# OpenAI-compatible endpoint). When off, images degrade to
 # `[image omitted: …]` placeholder text.
 # supports_vision = false
 

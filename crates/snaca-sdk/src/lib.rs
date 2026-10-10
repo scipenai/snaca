@@ -48,8 +48,9 @@ pub use snaca_engine::{
     TurnEventListener, TurnOutcome, TurnRequest as EngineTurnRequest,
 };
 pub use snaca_llm::{
-    AnthropicClient, ContentBlockStart, ContentDelta, DeepSeekClient, LlmClient as LlmClientTrait,
-    LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps, RetryConfig,
+    AnthropicClient, AnthropicConfig, ContentBlockStart, ContentDelta, DeepSeekClient,
+    DeepSeekConfig, LlmClient as LlmClientTrait, LlmError, LlmResult, MessageRequest,
+    MessageResponse, OpenAiResponsesClient, OpenAiResponsesConfig, ProviderCaps, RetryConfig,
     RetryingLlmClient, StopReason, StreamEvent,
 };
 pub use snaca_state::{

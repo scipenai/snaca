@@ -11,7 +11,9 @@
 //! - [`request`]  — `MessageRequest` + `ToolSchema` + `StopSequence`
 //! - [`response`] — `MessageResponse` + `StopReason`
 //! - [`client`]   — `LlmClient` trait + `ProviderCaps`
-//! - [`deepseek`] — DeepSeek client (OpenAI-compatible) + canonical conversions
+//! - [`deepseek`] — DeepSeek client (OpenAI Chat Completions compatible)
+//! - [`anthropic`] — Anthropic Messages API client
+//! - [`openai_responses`] — OpenAI Responses API client (GPT-5 / o-series)
 //! - `images` — shared image-block helpers for provider converters (crate-private)
 
 pub mod anthropic;
@@ -20,6 +22,7 @@ pub mod client;
 pub mod deepseek;
 pub mod error;
 mod images;
+pub mod openai_responses;
 pub mod request;
 pub mod response;
 pub mod retry;
@@ -31,6 +34,7 @@ pub use classify::classify_http_error;
 pub use client::{LlmClient, ProviderCaps};
 pub use deepseek::{DeepSeekClient, DeepSeekConfig};
 pub use error::{LlmError, LlmResult};
+pub use openai_responses::{OpenAiResponsesClient, OpenAiResponsesConfig};
 pub use request::{MessageRequest, SystemSegment, ToolSchema};
 pub use response::{MessageResponse, StopReason};
 pub use retry::{RetryConfig, RetryingLlmClient};

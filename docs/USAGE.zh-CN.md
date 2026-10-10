@@ -14,7 +14,7 @@
 | Node.js | ≥22；想用 admin Web UI 或走 OpenClaw sidecar 路径就需要 | 纯后端 + 飞书插件可以不装 |
 | protoc | 3.x | 需要构建 gRPC / protobuf 相关依赖时安装；通常可通过系统包管理器或 `protobuf` 发行包获得 |
 | SQLite | ≥3.35 | sqlx 自带 driver，系统不需要额外安装 |
-| LLM API key | DeepSeek 或 Anthropic 任一 | `${DEEPSEEK_API_KEY}` / `${ANTHROPIC_API_KEY}` |
+| LLM API key | DeepSeek、Anthropic 或 OpenAI Responses 任一 | `${DEEPSEEK_API_KEY}` / `${ANTHROPIC_API_KEY}` / `${OPENAI_API_KEY}` |
 | 飞书自建应用 | 拥有 `im:message`、`im:resource`、`im:message:send_as_bot` 权限 | 用于 `snaca-plugin-lark` |
 | Tavily API key | 可选 | 启用 `WebSearch` 工具时填，否则只有 `WebFetch` 可用 |
 
@@ -145,7 +145,7 @@ data_root = "./data"
 id = "default"
 
 [llm]
-provider = "deepseek"           # 或 "anthropic"
+provider = "deepseek"           # 或 "anthropic"、"openai-responses"
 api_key = "${DEEPSEEK_API_KEY}" # 启动时从环境读取
 model = "deepseek-chat"         # R1：deepseek-reasoner
 # base_url   = "https://api.deepseek.com"
@@ -216,7 +216,13 @@ RUST_LOG = "info,snaca_plugin_lark=debug,open_lark=info"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/some/path"]
 ```
 
-图片默认对 `anthropic` 嵌入请求（视觉模型可直接读取）；`deepseek` 默认纯文本（其官方
+支持三种 provider：`"deepseek"`（OpenAI Chat Completions 兼容，可用 `base_url`
+指向任意兼容端点）、`"anthropic"`（Messages API）与 `"openai-responses"`（OpenAI
+Responses API，GPT-5 / o 系列的原生协议）。只有 `deepseek` 可以不写 `model`（默认
+`deepseek-chat`），另外两种不写会在启动时报错。`base_url` 的写法因 provider 而异：
+`deepseek` 和 `anthropic` 只填主机地址（`https://api.deepseek.com`），`openai-responses`
+要填到 `/v1`（`https://api.openai.com/v1`），和 OpenAI SDK 一样。图片默认对 `anthropic` 和
+`openai-responses` 嵌入请求（视觉模型可直接读取）；`deepseek` 默认纯文本（其官方
 模型不接受图片）——当 `base_url` 指向具备视觉能力的 OpenAI 兼容端点时，把
 `supports_vision` 设为 `true` 即可。视觉关闭时，图片会降级为 `[image omitted: …]`
 占位文本，模型至少知道有附件存在。
@@ -238,8 +244,16 @@ RUST_LOG = "info,snaca_plugin_lark=debug,open_lark=info"
 
 文字密集的截图或扫描件可以调大 `image_max_bytes`；如果预算放不进历史字节上限，
 启动时会直接报错并说明原因（未配置时会自动缩小到合适的值）。如果 `base_url` 把
-`anthropic` 指向纯文本接口，请设置 `supports_vision = false`
+`anthropic` 或 `openai-responses` 指向纯文本接口，请设置 `supports_vision = false`
 （未设置时启动会打印一条警告）。
+
+```toml
+[llm]
+provider = "openai-responses"
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-5-mini"
+# supports_vision = true
+```
 
 ### 配置要点
 

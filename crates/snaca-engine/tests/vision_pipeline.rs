@@ -22,7 +22,9 @@
 //! (e.g. a *small* BMP still converted), not here.
 //!
 //! Two legs: Chat Completions at the default budget, Anthropic under a
-//! configured edge cap.
+//! configured edge cap. The Responses wire adds nothing to the chain; its
+//! tool-result images are pinned by `snaca-llm`'s `openai_responses`
+//! converter and HTTP tests.
 //!
 //! The engine always streams; the mock speaks plain JSON, so the real
 //! client is wrapped in [`NonStreaming`], which drops back to the

@@ -434,7 +434,7 @@ impl Runtime {
     }
 
     /// Convenience: build a runtime from a config alone. Selects the
-    /// configured provider; only `deepseek` is supported in M1.
+    /// configured provider (`llm.provider`).
     pub async fn build(config: Config) -> Result<Self> {
         let llm = build_llm(&config)?;
         Self::build_with_llm(config, llm).await
@@ -925,5 +925,135 @@ supports_vision = false
         let options = build_llm_options(&cfg).unwrap();
         assert_eq!(options.provider, LlmProvider::DeepSeek);
         assert_eq!(options.supports_vision, Some(true));
+    }
+
+    #[test]
+    fn openai_responses_provider_builds_client() {
+        // Without this: provider = "openai-responses" could build the wrong
+        // client or ignore llm.model, and every turn hit the wrong API or
+        // model. The model id is deliberately not the client's default.
+        let cfg = config_from_toml(
+            r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "openai-responses"
+api_key = "test-key"
+model = "gpt-test-model"
+"#,
+        );
+        let client = build_llm(&cfg).unwrap();
+        assert_eq!(client.provider_name(), "openai-responses");
+        assert_eq!(client.model(), "gpt-test-model");
+    }
+
+    /// 64x64 solid red PNG. The send-time gate sniffs magic bytes, so the
+    /// payload has to be a real image.
+    const RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
+
+    /// A local stand-in for every provider: records each request body and
+    /// answers with a minimal reply in the wire shape the path implies.
+    /// Returns the stub's root URL and the recorded bodies.
+    async fn provider_stub() -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let recorded = bodies.clone();
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, body: axum::body::Bytes| async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                let reply = match uri.path() {
+                    p if p.ends_with("/chat/completions") => serde_json::json!({
+                        "id": "chat_1", "object": "chat.completion", "model": "m",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant", "content": "red"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                    p if p.ends_with("/messages") => serde_json::json!({
+                        "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                        "content": [{"type": "text", "text": "red"}], "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }),
+                    _ => serde_json::json!({
+                        "id": "resp_1", "model": "m", "status": "completed",
+                        "output": [{"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "red"}]}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    }),
+                };
+                axum::Json(reply)
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (root, bodies)
+    }
+
+    /// The `[llm]` path end to end: real TOML → `build_llm` → the provider
+    /// client → the request body a local stub receives.
+    #[tokio::test]
+    async fn supports_vision_reaches_the_built_client() {
+        // Without this: llm.supports_vision could stop at LlmOptions (where
+        // the tests above stop) and never reach the client, so a vision model
+        // behind provider = "deepseek" only got "[image omitted]" text, and a
+        // text-only endpoint behind anthropic / openai-responses still got
+        // images it rejects.
+        let (root, bodies) = provider_stub().await;
+        // Each case flips the provider's default, so the image goes out (or
+        // not) only if the setting reached the client. The Responses root
+        // carries the version segment; the other two add it themselves.
+        for (provider, base_url, vision) in [
+            ("deepseek", root.clone(), true),
+            ("anthropic", root.clone(), false),
+            ("openai-responses", format!("{root}/v1"), false),
+        ] {
+            let cfg = config_from_toml(&format!(
+                r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "{provider}"
+api_key = "test-key"
+model = "m"
+base_url = "{base_url}"
+supports_vision = {vision}
+"#
+            ));
+            let request =
+                snaca_llm::MessageRequest::new("m").with_messages(vec![snaca_core::Message::new(
+                    snaca_core::Role::User,
+                    vec![
+                        snaca_core::ContentBlock::text("what colour is this?"),
+                        snaca_core::ContentBlock::Image {
+                            source: snaca_core::ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: RED_PNG_BASE64.into(),
+                            },
+                        },
+                    ],
+                )]);
+            build_llm(&cfg)
+                .unwrap()
+                .create_message(request)
+                .await
+                .unwrap_or_else(|e| panic!("{provider}: {e}"));
+            let body = bodies
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("request reached the stub")
+                .to_string();
+            assert_eq!(body.contains(RED_PNG_BASE64), vision, "{provider}: {body}");
+        }
     }
 }

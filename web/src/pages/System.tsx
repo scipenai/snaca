@@ -327,12 +327,12 @@ export function System() {
                   label={t("system.provider")}
                   value={form.llmProvider}
                   onChange={(v) => updateField("llmProvider", v)}
-                  options={["deepseek", "anthropic"]}
+                  options={["deepseek", "anthropic", "openai-responses"]}
                   hint={t("system.help.provider")}
                 />
-                <TextField label={t("system.model")} value={form.llmModel} onChange={(v) => updateField("llmModel", v)} hint={t("system.help.model")} />
-                <TextField label={t("system.api_key")} value={form.llmApiKey} onChange={(v) => updateField("llmApiKey", v)} placeholder="${DEEPSEEK_API_KEY}" hint={t("system.help.api_key")} />
-                <TextField label={t("system.base_url")} value={form.llmBaseUrl} onChange={(v) => updateField("llmBaseUrl", v)} placeholder="https://api.deepseek.com" hint={t("system.help.base_url")} />
+                <TextField label={t("system.model")} value={form.llmModel} onChange={(v) => updateField("llmModel", v)} placeholder={providerDefaults(form.llmProvider).model} hint={t("system.help.model")} />
+                <TextField label={t("system.api_key")} value={form.llmApiKey} onChange={(v) => updateField("llmApiKey", v)} placeholder={providerDefaults(form.llmProvider).apiKey} hint={t("system.help.api_key")} />
+                <TextField label={t("system.base_url")} value={form.llmBaseUrl} onChange={(v) => updateField("llmBaseUrl", v)} placeholder={providerDefaults(form.llmProvider).baseUrl} hint={t("system.help.base_url")} />
                 <SelectField
                   label={t("system.supports_vision")}
                   value={form.llmSupportsVision}
@@ -664,9 +664,9 @@ function formFromToml(toml: string): FormState {
     typingUpdateIntervalMs: getScalar(toml, "server", "typing_update_interval_ms") ?? "",
     mcpIdleTtlSecs: getScalar(toml, "server", "mcp_idle_ttl_secs") ?? "",
     mcpReaperPeriodSecs: getScalar(toml, "server", "mcp_reaper_period_secs") ?? "",
-    llmProvider: getString(toml, "llm", "provider") ?? "deepseek",
+    llmProvider: canonicalProvider(getString(toml, "llm", "provider") ?? "deepseek"),
     llmApiKey: getString(toml, "llm", "api_key") ?? "",
-    llmModel: getString(toml, "llm", "model") ?? "deepseek-chat",
+    llmModel: getString(toml, "llm", "model") ?? "",
     llmBaseUrl: getString(toml, "llm", "base_url") ?? "",
     llmSupportsVision: String(getBoolean(toml, "llm", "supports_vision") ?? "auto"),
     llmTimeoutSecs: getScalar(toml, "llm", "timeout_secs") ?? "",
@@ -735,7 +735,7 @@ function applyFormField(
     case "llmApiKey":
       return setTomlValue(toml, "llm", "api_key", quote(String(value)));
     case "llmModel":
-      return setTomlValue(toml, "llm", "model", quote(String(value)));
+      return setTomlValue(toml, "llm", "model", optionalString(value));
     case "llmBaseUrl":
       return setTomlValue(toml, "llm", "base_url", optionalString(value));
     case "llmSupportsVision":
@@ -938,6 +938,23 @@ function stripComment(value: string): string {
     if (ch === "#" && !inString) return value.slice(0, i);
   }
   return value;
+}
+
+/** The spelling the provider select uses, for the alias the server also accepts. */
+function canonicalProvider(provider: string): string {
+  return provider === "openai_responses" ? "openai-responses" : provider;
+}
+
+/** Placeholders for a provider's fields: its default where the server has one, else an example. */
+function providerDefaults(provider: string): { model: string; apiKey: string; baseUrl: string } {
+  switch (provider) {
+    case "anthropic":
+      return { model: "claude-sonnet-4-5", apiKey: "${ANTHROPIC_API_KEY}", baseUrl: "https://api.anthropic.com" };
+    case "openai-responses":
+      return { model: "gpt-5-mini", apiKey: "${OPENAI_API_KEY}", baseUrl: "https://api.openai.com/v1" };
+    default:
+      return { model: "deepseek-chat", apiKey: "${DEEPSEEK_API_KEY}", baseUrl: "https://api.deepseek.com" };
+  }
 }
 
 function quote(value: string): string {

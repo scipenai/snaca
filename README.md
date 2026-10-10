@@ -48,7 +48,7 @@ SNACA server
 | `snaca-agent-api` | Runtime contracts such as approval and questions |
 | `snaca-sdk` | Embeddable Agent / AgentBuilder facade |
 | `snaca-tools-api` | Tool trait and registry |
-| `snaca-llm` | LLM client trait plus DeepSeek / Anthropic-compatible clients |
+| `snaca-llm` | LLM client trait plus DeepSeek (OpenAI-compatible) / Anthropic / OpenAI Responses clients |
 | `snaca-tools` | Built-in tools |
 | `snaca-mcp` | MCP client manager and transports |
 | `snaca-skills` | Markdown skill loading |
@@ -78,7 +78,7 @@ Prerequisites:
 
 - Rust 1.88+
 - Node.js 22+ and npm, only needed for the admin Web UI build
-- An LLM API key, currently DeepSeek or Anthropic-compatible
+- An LLM API key: DeepSeek (or any OpenAI-compatible endpoint), Anthropic, or OpenAI Responses API
 
 Build and test:
 

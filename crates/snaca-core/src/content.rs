@@ -19,8 +19,12 @@ pub enum ContentBlock {
     /// Plain text. The most common block.
     Text { text: String },
 
-    /// Reasoning trace from a thinking-capable model. `signature` is
-    /// Anthropic's redacted-thinking signature; `None` for DeepSeek R1.
+    /// Reasoning trace from a thinking-capable model. `signature` is an
+    /// opaque, provider-specific token that must be persisted verbatim and
+    /// replayed only to the provider that issued it: Anthropic's thinking
+    /// signature, or OpenAI Responses' encrypted reasoning (prefixed
+    /// `openai-responses:`). `None` when the provider issues none (DeepSeek
+    /// R1, reasoning summaries without encrypted content).
     Thinking {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]

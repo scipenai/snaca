@@ -41,7 +41,7 @@ SNACA 仍处于早期阶段。引擎、工具、MCP、Skills、记忆、admin UI
 
 - Rust 1.88+
 - Node.js 22+ 和 npm，仅构建 admin Web UI 时需要
-- LLM API key，目前支持 DeepSeek 或 Anthropic-compatible provider
+- LLM API key，目前支持 DeepSeek（或任意 OpenAI 兼容端点）、Anthropic 或 OpenAI Responses API provider
 
 构建和测试：
 

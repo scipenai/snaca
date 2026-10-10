@@ -185,6 +185,20 @@ impl SseLineBuffer {
         }
         Some(String::from_utf8_lossy(&line).into_owned())
     }
+
+    /// Residual bytes after the stream ends (a final line with no `\n`),
+    /// `\r`-stripped. `None` when nothing is buffered.
+    pub(crate) fn take_rest(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        self.scanned = 0;
+        let mut rest = std::mem::take(&mut self.buf);
+        if rest.last() == Some(&b'\r') {
+            rest.pop();
+        }
+        Some(String::from_utf8_lossy(&rest).into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +221,19 @@ mod sse_line_buffer_tests {
             Some("data: {\"text\":\"你好\"}")
         );
         assert_eq!(buf.next_line(), None);
+        assert_eq!(buf.take_rest(), None);
+    }
+
+    #[test]
+    fn splits_multiple_lines_and_keeps_residual() {
+        // Without this: `take_rest` loses a final line with no trailing
+        // newline, and the Responses parser — the one that flushes it at
+        // EOF — drops a terminal event some servers send unterminated.
+        let mut buf = SseLineBuffer::default();
+        buf.push(b"event: a\n\ndata: tail\r");
+        assert_eq!(buf.next_line().as_deref(), Some("event: a"));
+        assert_eq!(buf.next_line().as_deref(), Some(""));
+        assert_eq!(buf.next_line(), None);
+        assert_eq!(buf.take_rest().as_deref(), Some("data: tail"));
     }
 }

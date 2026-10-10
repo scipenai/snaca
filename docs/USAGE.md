@@ -13,7 +13,7 @@ SNACA. For the IM plugin wire protocol, see [im-plugin-protocol.md](./im-plugin-
 | Node.js | 22+ | Needed for building the admin Web UI |
 | protoc | 3.x | Needed by protobuf/gRPC dependencies |
 | SQLite | 3.35+ | Runtime state is stored in `state.sqlite` |
-| LLM API key | DeepSeek or Anthropic-compatible | Use environment variables |
+| LLM API key | DeepSeek, Anthropic-compatible or OpenAI Responses | Use environment variables |
 | Lark/Feishu app | Optional | Needed for `snaca-plugin-lark` |
 | Tavily API key | Optional | Enables `WebSearch` |
 
@@ -86,13 +86,22 @@ api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-chat"
 ```
 
-Images are embedded for vision-capable models by default on `anthropic`;
-the `deepseek` provider defaults to text-only (its hosted models don't
-accept images). Override with `supports_vision = true|false` — e.g. set
-it to `true` when `base_url` points the `deepseek` provider at a
-vision-capable OpenAI-compatible endpoint. With vision off, images
-degrade to `[image omitted: …]` placeholder text so the model still knows
-an attachment was present.
+Three providers are supported: `"deepseek"` (OpenAI Chat Completions
+compatible — point `base_url` at any compatible endpoint), `"anthropic"`
+(Messages API), and `"openai-responses"` (OpenAI Responses API, the native
+protocol for GPT-5 / o-series models). `model` may be omitted only for
+`deepseek` (it defaults to `deepseek-chat`); the other two fail at startup
+without it. `base_url` differs by provider: `deepseek` and `anthropic` take
+the bare host (`https://api.deepseek.com`), `openai-responses` takes the
+root including `/v1` (`https://api.openai.com/v1`), as the OpenAI SDKs do.
+
+Images are embedded for vision-capable models by default on
+`anthropic` and `openai-responses`; the `deepseek` provider defaults to
+text-only (its hosted models don't accept images). Override with
+`supports_vision = true|false` — e.g. set it to `true` when `base_url`
+points the `deepseek` provider at a vision-capable OpenAI-compatible
+endpoint. With vision off, images degrade to `[image omitted: …]`
+placeholder text so the model still knows an attachment was present.
 
 `Read` normalises images before they enter history: PNG / JPEG / static
 GIF / WebP up to 256 KiB (base64) and 1568 px pass through unchanged;
@@ -115,9 +124,17 @@ again. Both limits are configurable under
 
 Raise `image_max_bytes` for text-heavy screenshots or scans; startup fails
 with a clear error if the budget would not fit the history byte cap (when
-unset, it shrinks automatically to fit). If `base_url` points `anthropic` at a
-text-only endpoint, set `supports_vision = false` (startup logs a warning
-when it is left unset).
+unset, it shrinks automatically to fit). If `base_url` points `anthropic` or
+`openai-responses` at a text-only endpoint, set `supports_vision = false`
+(startup logs a warning when it is left unset).
+
+```toml
+[llm]
+provider = "openai-responses"
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-5-mini"
+# supports_vision = true
+```
 
 Useful container/local differences:
 

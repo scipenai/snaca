@@ -24,10 +24,12 @@ use snaca_sdk::{
     Engine, EngineConfig, HostContextFactory, RuntimeToolFactory, TurnEventListener, TurnOutcome,
 };
 
-// LLM provider surface (R7).
+// LLM provider surface (R7 + openai-responses provider).
 use snaca_sdk::{
-    LlmClientTrait, LlmError, LlmResult, MessageRequest, MessageResponse, ProviderCaps,
-    RetryConfig, RetryingLlmClient, StopReason, StreamEvent,
+    AnthropicClient, AnthropicConfig, ContentBlockStart, ContentDelta, DeepSeekClient,
+    DeepSeekConfig, LlmClientTrait, LlmError, LlmResult, MessageRequest, MessageResponse,
+    OpenAiResponsesClient, OpenAiResponsesConfig, ProviderCaps, RetryConfig, RetryingLlmClient,
+    StopReason, StreamEvent,
 };
 
 // Tool + host reverse-RPC surface (R2/R3/R6).
@@ -47,6 +49,14 @@ use snaca_sdk::{WorkspaceError, WorkspaceLayout};
 
 // Approval / question / memory-provider contracts.
 use snaca_sdk::{ApprovalGate, ConversationStore, MemoryProvider, NoopApprovalGate, QuestionGate};
+
+// Provider-agnostic client construction (`snaca_sdk::llm`). `LlmOptions` /
+// `LlmProvider` live in the module, not at the root — pinned here so a
+// provider added to the enum stays a deliberate, CHANGELOG-visible change.
+use snaca_sdk::llm::{
+    anthropic, anthropic_from_env, boxed, deepseek, deepseek_from_env, openai_responses,
+    openai_responses_from_env, LlmOptions, LlmProvider,
+};
 
 // Subsystem modules (M1 uplift): skills, narrowed mcp, memory store side.
 use snaca_sdk::mcp::{McpManager, McpServerConfig, McpTransport};

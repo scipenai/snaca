@@ -3,7 +3,7 @@
 use crate::{Result, SdkError};
 use snaca_llm::{
     AnthropicClient, AnthropicConfig, DeepSeekClient, DeepSeekConfig, LlmClient, LlmError,
-    RetryConfig, RetryingLlmClient,
+    OpenAiResponsesClient, OpenAiResponsesConfig, RetryConfig, RetryingLlmClient,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +37,21 @@ pub fn anthropic_from_env(model: impl Into<String>) -> Result<AnthropicClient> {
     anthropic(api_key, model)
 }
 
+pub fn openai_responses(
+    api_key: impl Into<String>,
+    model: impl Into<String>,
+) -> Result<OpenAiResponsesClient> {
+    let config = OpenAiResponsesConfig::new(api_key).with_model(model);
+    Ok(OpenAiResponsesClient::new(config)?)
+}
+
+pub fn openai_responses_from_env(model: impl Into<String>) -> Result<OpenAiResponsesClient> {
+    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| SdkError::MissingEnv {
+        name: "OPENAI_API_KEY",
+    })?;
+    openai_responses(api_key, model)
+}
+
 pub fn boxed(client: impl LlmClient + 'static) -> Arc<dyn LlmClient> {
     Arc::new(client)
 }
@@ -54,8 +69,8 @@ pub struct LlmOptions {
     pub timeout: Option<Duration>,
     pub anthropic_version: Option<String>,
     /// Override the provider default for image embedding. `None` keeps
-    /// the per-provider default (`true` for anthropic, `false` for
-    /// deepseek).
+    /// the per-provider default (`true` for anthropic /
+    /// openai-responses, `false` for deepseek).
     pub supports_vision: Option<bool>,
     pub retry: RetryConfig,
 }
@@ -84,6 +99,10 @@ impl LlmOptions {
 
     pub fn anthropic(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(LlmProvider::Anthropic, api_key, model)
+    }
+
+    pub fn openai_responses(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::new(LlmProvider::OpenAiResponses, api_key, model)
     }
 
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -144,6 +163,20 @@ impl LlmOptions {
                 let raw = AnthropicClient::new(cfg)?;
                 Ok(Arc::new(RetryingLlmClient::new(raw, self.retry)))
             }
+            LlmProvider::OpenAiResponses => {
+                let mut cfg = OpenAiResponsesConfig::new(self.api_key).with_model(self.model);
+                if let Some(url) = self.base_url {
+                    cfg = cfg.with_base_url(url);
+                }
+                if let Some(timeout) = self.timeout {
+                    cfg = cfg.with_timeout(timeout);
+                }
+                if let Some(vision) = self.supports_vision {
+                    cfg = cfg.with_vision(vision);
+                }
+                let raw = OpenAiResponsesClient::new(cfg)?;
+                Ok(Arc::new(RetryingLlmClient::new(raw, self.retry)))
+            }
         }
     }
 }
@@ -152,6 +185,7 @@ impl LlmOptions {
 pub enum LlmProvider {
     DeepSeek,
     Anthropic,
+    OpenAiResponses,
 }
 
 impl std::str::FromStr for LlmProvider {
@@ -161,6 +195,7 @@ impl std::str::FromStr for LlmProvider {
         match raw {
             "deepseek" => Ok(Self::DeepSeek),
             "anthropic" => Ok(Self::Anthropic),
+            "openai-responses" | "openai_responses" => Ok(Self::OpenAiResponses),
             other => Err(LlmError::InvalidConfig(format!(
                 "unsupported llm.provider: {other}"
             ))),
@@ -173,6 +208,7 @@ impl std::fmt::Display for LlmProvider {
         match self {
             Self::DeepSeek => f.write_str("deepseek"),
             Self::Anthropic => f.write_str("anthropic"),
+            Self::OpenAiResponses => f.write_str("openai-responses"),
         }
     }
 }

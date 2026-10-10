@@ -6,7 +6,8 @@
 
 mod convert;
 mod sse;
-mod wire;
+// `pub(crate)`: the Responses client reuses the OpenAI error envelope.
+pub(crate) mod wire;
 
 #[cfg(test)]
 pub use convert::{build_chat_request, parse_chat_response};

@@ -240,14 +240,24 @@ pub struct TenantSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmSection {
-    /// `"deepseek"` (OpenAI-compatible) or `"anthropic"` (Messages API).
+    /// `"deepseek"` (OpenAI Chat Completions compatible), `"anthropic"`
+    /// (Messages API) or `"openai-responses"` (OpenAI Responses API).
     #[serde(default = "default_provider")]
     pub provider: String,
     /// API key. Use `${VAR}` to interpolate from environment, e.g.
     /// `api_key = "${DEEPSEEK_API_KEY}"`.
     pub api_key: String,
-    #[serde(default = "default_model")]
+    /// Model id. Optional only for `deepseek` (defaults to
+    /// `deepseek-chat`): no other provider has a name that is safe to
+    /// assume, so leaving it out is a startup error there rather than
+    /// DeepSeek's model name sent to Anthropic or OpenAI.
+    #[serde(default)]
     pub model: String,
+    /// Endpoint override. `deepseek` and `anthropic` take the bare host
+    /// (`https://api.deepseek.com`) and add the `/v1/...` path themselves;
+    /// `openai-responses` takes the root *including* the version segment,
+    /// as the OpenAI SDKs do (`https://api.openai.com/v1`), and adds only
+    /// `/responses`.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Max wait for one LLM round trip, in seconds.
@@ -258,10 +268,10 @@ pub struct LlmSection {
     #[serde(default)]
     pub anthropic_version: Option<String>,
     /// Embed images (user messages, tool results) so vision-capable
-    /// models can see them. Defaults: `true` for `anthropic`, `false`
-    /// for `deepseek` (whose hosted models are text-only — flip to
-    /// `true` when `base_url` points at a vision-capable
-    /// OpenAI-compatible endpoint). With this off,
+    /// models can see them. Defaults: `true` for `anthropic` and
+    /// `openai-responses`, `false` for `deepseek` (whose hosted models
+    /// are text-only — flip to `true` when `base_url` points at a
+    /// vision-capable OpenAI-compatible endpoint). With this off,
     /// images degrade to `[image omitted: …]` placeholder text.
     #[serde(default)]
     pub supports_vision: Option<bool>,
@@ -290,7 +300,7 @@ pub struct LlmSection {
 
 impl LlmSection {
     /// `supports_vision` as the client applies it: unset means on for
-    /// `anthropic` and off for `deepseek`.
+    /// `anthropic` / `openai-responses` and off for `deepseek`.
     pub fn effective_supports_vision(&self) -> bool {
         self.supports_vision
             .unwrap_or(!matches!(self.provider.parse(), Ok(LlmProvider::DeepSeek)))
@@ -300,9 +310,7 @@ impl LlmSection {
 fn default_provider() -> String {
     "deepseek".into()
 }
-fn default_model() -> String {
-    "deepseek-chat".into()
-}
+const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EngineSection {
@@ -579,6 +587,7 @@ impl Config {
 
         cfg.resolve_env()?;
         cfg.resolve_paths(path);
+        cfg.apply_provider_defaults();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -593,8 +602,19 @@ impl Config {
             toml::from_str(raw).with_context(|| format!("parsing config {}", path.display()))?;
 
         cfg.resolve_paths(path);
+        cfg.apply_provider_defaults();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Defaults that depend on `llm.provider`: only DeepSeek has a model
+    /// name safe to fill in (see `LlmSection::model`).
+    fn apply_provider_defaults(&mut self) {
+        if self.llm.model.is_empty()
+            && matches!(self.llm.provider.parse(), Ok(LlmProvider::DeepSeek))
+        {
+            self.llm.model = DEFAULT_DEEPSEEK_MODEL.into();
+        }
     }
 
     fn resolve_env(&mut self) -> Result<()> {
@@ -747,9 +767,18 @@ impl Config {
         if self.llm.api_key.is_empty() {
             anyhow::bail!("llm.api_key resolved to an empty string");
         }
-        if self.llm.provider != "deepseek" && self.llm.provider != "anthropic" {
+        // Same parser `build_llm` uses, so the accepted names (and
+        // aliases) can't drift from what the runtime can construct.
+        if self.llm.provider.parse::<LlmProvider>().is_err() {
             anyhow::bail!(
-                "llm.provider = {:?} is not supported; valid values are 'deepseek' or 'anthropic'",
+                "llm.provider = {:?} is not supported; valid values are 'deepseek', \
+                 'anthropic' or 'openai-responses'",
+                self.llm.provider
+            );
+        }
+        if self.llm.model.trim().is_empty() {
+            anyhow::bail!(
+                "llm.model must be set for llm.provider = {:?}",
                 self.llm.provider
             );
         }
@@ -1052,6 +1081,80 @@ api_key = "x"
             cfg.engine.effective_image_max_bytes(),
             ImageLimits::DEFAULT_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn model_is_required_except_for_deepseek() {
+        // Without this: `provider = "anthropic"` / `"openai-responses"`
+        // without `model` silently ran with DeepSeek's `deepseek-chat`, and
+        // every turn failed at the provider with an unknown-model error.
+        for provider in ["anthropic", "openai-responses"] {
+            let f = write_temp(&format!(
+                r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "{provider}"
+api_key = "test-key"
+"#
+            ));
+            let err = Config::load(f.path()).unwrap_err();
+            assert!(err.to_string().contains("llm.model"), "{provider}: {err}");
+        }
+        let f = write_temp(
+            r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "anthropic"
+api_key = "test-key"
+model = "claude-sonnet-4-5"
+"#,
+        );
+        assert_eq!(
+            Config::load(f.path()).unwrap().llm.model,
+            "claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn effective_supports_vision_follows_the_provider_default() {
+        // Without this: the admin snapshot would report the raw setting,
+        // and "unset" can't tell an operator whether images are sent.
+        let load = |provider: &str, vision: &str| {
+            let f = write_temp(&format!(
+                r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "{provider}"
+api_key = "test-key"
+model = "m"
+{vision}
+"#
+            ));
+            Config::load(f.path())
+                .unwrap()
+                .llm
+                .effective_supports_vision()
+        };
+        assert!(!load("deepseek", ""));
+        assert!(load("anthropic", ""));
+        assert!(load("openai-responses", ""));
+        assert!(load("deepseek", "supports_vision = true"));
+        assert!(!load("anthropic", "supports_vision = false"));
     }
 
     #[test]
