@@ -923,3 +923,125 @@ async fn streamed_plain_text_is_unchanged_by_scrubber() {
         "just a normal answer with a < less-than sign"
     );
 }
+
+/// A stream that ends without stopping its text block (a relay that
+/// sends no `ContentBlockStop`) must still deliver the tail the scrubber
+/// held back as a possible fence opener.
+#[tokio::test]
+async fn text_held_by_the_scrubber_survives_a_stream_without_block_stop() {
+    // Without this: "… x <" keeps its trailing "<" in the scrubber until a
+    // block stop that never comes, so the reply and the transcript lose it.
+    let llm = Arc::new(StreamingMockLlm::new());
+    llm.enqueue(vec![
+        StreamEvent::MessageStart {
+            message_id: "m".into(),
+            model: None,
+        },
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            block: ContentBlockStart::Text,
+        },
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::Text {
+                text: "answer: x <".into(),
+            },
+        },
+        StreamEvent::MessageStop,
+    ]);
+
+    let (engine, _db, _tmp) = fixture(llm).await;
+    let listener = Arc::new(TextRecordingListener::default());
+    let outcome = engine
+        .handle_turn_full(
+            turn_request("c_no_stop"),
+            Arc::new(NoopApprovalGate),
+            listener.clone(),
+            Arc::new(NoopQuestionGate),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.assistant_text, "answer: x <");
+    assert_eq!(listener.text.lock().unwrap().clone(), "answer: x <");
+}
+
+/// Thinking is stored as the provider sent it when signed — the
+/// signature covers the exact text and the block is replayed within the
+/// tool loop — and scrubbed of protected fences when unsigned.
+#[tokio::test]
+async fn signed_thinking_is_stored_verbatim_unsigned_is_scrubbed() {
+    // Without this: the stream scrubber cut a fence the model quoted in its
+    // reasoning out of a signed block, the stored text no longer matched
+    // its signature, and the next request in the loop was rejected.
+    let thinking_stream = |signed: bool| {
+        let mut events = vec![
+            StreamEvent::MessageStart {
+                message_id: "m".into(),
+                model: None,
+            },
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStart::Thinking,
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::Thinking {
+                    text: "the <memory-context>x</memory-context> block".into(),
+                },
+            },
+        ];
+        if signed {
+            events.push(StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::Signature {
+                    signature: "sig".into(),
+                },
+            });
+        }
+        events.extend([
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                block: ContentBlockStart::Text,
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: ContentDelta::Text { text: "ok".into() },
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+            StreamEvent::MessageStop,
+        ]);
+        events
+    };
+    for (signed, expected) in [
+        (true, "the <memory-context>x</memory-context> block"),
+        (false, "the  block"),
+    ] {
+        let llm = Arc::new(StreamingMockLlm::new());
+        llm.enqueue(thinking_stream(signed));
+        let (engine, db, _tmp) = fixture(llm).await;
+        engine
+            .handle_turn_full(
+                turn_request("c_think"),
+                Arc::new(NoopApprovalGate),
+                Arc::new(TextRecordingListener::default()),
+                Arc::new(NoopQuestionGate),
+            )
+            .await
+            .unwrap();
+        let msgs = db
+            .recent_messages(&ThreadId::new("c_think"), 10)
+            .await
+            .unwrap();
+        let thinking = msgs
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("thinking persisted");
+        assert_eq!(thinking, expected, "signed={signed}");
+    }
+}

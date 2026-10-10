@@ -5,10 +5,10 @@
 //! - `Role::System` messages in history → concatenated into `system`.
 //! - `Role::Tool` messages → become `role:"user"` wire messages whose
 //!   content is just `tool_result` blocks (Anthropic convention).
-//! - `Role::Assistant` content blocks: `Text` / `Thinking` / `ToolUse` map
-//!   1:1 to wire blocks. `Thinking { signature: Some }` round-trips so
-//!   the model can read its prior reasoning trace if `extended_thinking`
-//!   is enabled.
+//! - `Role::Assistant` content blocks: `Text` / `ToolUse` map 1:1 to wire
+//!   blocks. Signed `Thinking` round-trips within the current tool loop,
+//!   where Anthropic requires it for a tool-use continuation; earlier
+//!   turns', unsigned and OpenAI-encrypted blocks are dropped.
 //! - `Role::User` text → single `text` block; `Image` blocks are passed
 //!   through 1:1 (base64 or URL source). With images present, an empty
 //!   text block is dropped so the API never sees `text: ""`.
@@ -33,7 +33,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::images::{omitted_placeholder, split_images, ImagePolicy};
 use crate::request::{MessageRequest, SystemSegment, ToolSchema};
 use crate::response::{MessageResponse, StopReason};
-use snaca_core::{ContentBlock, Message, MessageId, Role, ToolUseId};
+use snaca_core::{current_turn_start, ContentBlock, Message, MessageId, Role, ToolUseId};
 use std::time::SystemTime;
 
 /// Anthropic requires `max_tokens` — we have no way to "let the provider pick".
@@ -184,8 +184,9 @@ fn split_system_and_messages(
 ) -> LlmResult<(Option<String>, Vec<WireMessage>)> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut wire: Vec<WireMessage> = Vec::new();
+    let turn_start = current_turn_start(messages);
     let images = ImagePolicy::anthropic(supports_vision);
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::System => {
                 let text = ContentBlock::collect_text(&msg.content);
@@ -217,15 +218,27 @@ fn split_system_and_messages(
                         ContentBlock::Text { text } => {
                             blocks.push(WireContentBlock::Text { text: text.clone() });
                         }
-                        ContentBlock::Thinking { text, signature } => {
-                            // Pass-through: signed thinking blocks must be
-                            // returned verbatim if the next request is
-                            // continuation with extended_thinking enabled.
+                        // Signed thinking is replayed verbatim within the
+                        // current tool loop: Anthropic requires it there
+                        // (tool-use continuation with thinking) and strips
+                        // earlier turns' anyway. Unsigned blocks (DeepSeek
+                        // reasoning, Responses summaries — a thread that
+                        // switched providers) and OpenAI's encrypted
+                        // reasoning would be rejected outright.
+                        ContentBlock::Thinking {
+                            text,
+                            signature: Some(signature),
+                        } if i >= turn_start
+                            && !signature.starts_with(
+                                crate::openai_responses::REASONING_SIGNATURE_PREFIX,
+                            ) =>
+                        {
                             blocks.push(WireContentBlock::Thinking {
                                 text: text.clone(),
-                                signature: signature.clone(),
+                                signature: Some(signature.clone()),
                             });
                         }
+                        ContentBlock::Thinking { .. } => {}
                         ContentBlock::ToolUse { id, name, input } => {
                             blocks.push(WireContentBlock::ToolUse {
                                 id: id.as_str().to_string(),
@@ -380,7 +393,7 @@ pub fn parse_messages_response(resp: MessagesResponse) -> LlmResult<MessageRespo
 mod tests {
     use super::*;
     use serde_json::json;
-    use snaca_core::{ContentBlock, Message, Role, ToolUseId};
+    use snaca_core::{ContentBlock, Message, Role, ToolUseId, ENGINE_FEEDBACK_PREFIX};
 
     fn user(text: &str) -> Message {
         Message::user_text(text)
@@ -604,22 +617,87 @@ mod tests {
         );
     }
 
+    fn signed(text: &str, signature: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            text: text.into(),
+            signature: Some(signature.into()),
+        }
+    }
+
     #[test]
     fn assistant_blocks_round_trip() {
         let r = req(vec![assistant(vec![
-            ContentBlock::thinking("planning"),
+            signed("planning", "sig-1"),
             ContentBlock::text("let me check"),
             ContentBlock::tool_use("call_1", "Read", json!({"path": "x"})),
         ])]);
         let wire = build_messages_request(&r, false).unwrap();
         let blocks = &wire.messages[0].content;
         assert_eq!(blocks.len(), 3);
-        assert!(
-            matches!(&blocks[0], WireContentBlock::Thinking { text, .. } if text == "planning")
-        );
+        assert!(matches!(
+            &blocks[0],
+            WireContentBlock::Thinking { text, signature: Some(sig) }
+                if text == "planning" && sig == "sig-1"
+        ));
         assert!(matches!(&blocks[1], WireContentBlock::Text { text } if text == "let me check"));
         assert!(
             matches!(&blocks[2], WireContentBlock::ToolUse { id, name, .. } if id == "call_1" && name == "Read")
+        );
+    }
+
+    #[test]
+    fn signed_thinking_is_replayed_for_the_current_tool_loop_only() {
+        // Without this: an unsigned thinking block (DeepSeek reasoning or a
+        // Responses summary, in a thread that switched to Anthropic) goes
+        // out with no signature and Anthropic rejects every request in the
+        // thread; earlier turns' signed thinking is resent for nothing; and
+        // the loop's earlier steps — even across engine feedback injected
+        // mid-loop — would lose the reasoning Anthropic asks to see.
+        let feedback = format!("{ENGINE_FEEDBACK_PREFIX}fix the JSON");
+        let r = req(vec![
+            assistant(vec![
+                signed("old plan", "sig-old"),
+                ContentBlock::text("a1"),
+            ]),
+            user("next"),
+            assistant(vec![
+                ContentBlock::thinking("unsigned"),
+                signed("step 1", "sig-1"),
+                ContentBlock::tool_use("call_1", "Read", json!({})),
+            ]),
+            tool_msg("call_1", "body"),
+            user(&feedback),
+            assistant(vec![
+                signed("step 2", "sig-2"),
+                ContentBlock::tool_use("call_2", "Read", json!({})),
+            ]),
+        ]);
+        let wire = build_messages_request(&r, false).unwrap();
+        let thinking: Vec<Vec<String>> = wire
+            .messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        WireContentBlock::Thinking { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            thinking,
+            [
+                empty.clone(),
+                empty.clone(),
+                vec!["step 1".to_string()],
+                empty.clone(),
+                empty,
+                vec!["step 2".to_string()],
+            ],
+            "earlier turn and unsigned stripped; whole loop replayed"
         );
     }
 
@@ -824,6 +902,31 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn foreign_openai_reasoning_is_not_replayed() {
+        // Without this: a thread that switched from openai-responses sends
+        // OpenAI's encrypted reasoning as a thinking signature, Anthropic
+        // rejects it, and every later request in the thread fails too.
+        let assistant = Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    text: String::new(),
+                    signature: Some(format!(
+                        "{}gAAA",
+                        crate::openai_responses::REASONING_SIGNATURE_PREFIX
+                    )),
+                },
+                ContentBlock::text("answer"),
+            ],
+        );
+        let wire = build_messages_request(&req(vec![assistant]), false).unwrap();
+        assert!(matches!(
+            wire.messages[0].content.as_slice(),
+            [WireContentBlock::Text { text }] if text == "answer"
+        ));
     }
 
     #[test]

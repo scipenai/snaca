@@ -2074,6 +2074,12 @@ impl Engine {
 
         while let Some(ev) = stream.next().await {
             let ev = ev?;
+            // Thinking reaches the accumulator as the provider sent it: a
+            // signed block is replayed within the tool loop and must match
+            // its signature byte for byte. Only the listener gets the
+            // scrubbed copy; unsigned blocks are scrubbed once the message
+            // is complete (`scrub_unsigned_thinking`).
+            let raw_thinking = is_thinking_delta(&ev).then(|| ev.clone());
             for ev in scrub_stream_event(&mut text_scrubbers, ev) {
                 listener.on_event(&ev).await;
 
@@ -2128,6 +2134,20 @@ impl Engine {
                     }
                 }
 
+                if !is_thinking_delta(&ev) {
+                    acc.ingest(ev);
+                }
+            }
+            if let Some(ev) = raw_thinking {
+                acc.ingest(ev);
+            }
+        }
+        // A stream that ended without stopping a block (a provider or
+        // relay that sends no `ContentBlockStop`) still owes the text its
+        // scrubber held back as a possible fence opener.
+        for ev in flush_stream_scrubbers(&mut text_scrubbers) {
+            listener.on_event(&ev).await;
+            if !is_thinking_delta(&ev) {
                 acc.ingest(ev);
             }
         }
@@ -2151,7 +2171,10 @@ impl Engine {
         }
 
         let resp = match acc.finalize() {
-            Ok(r) => r,
+            Ok(mut r) => {
+                scrub_unsigned_thinking(&mut r.message.content);
+                r
+            }
             Err(LlmError::MalformedToolArgs {
                 tool,
                 args_len,
@@ -3089,6 +3112,52 @@ fn scrub_stream_event(
     }
 }
 
+fn is_thinking_delta(ev: &StreamEvent) -> bool {
+    matches!(
+        ev,
+        StreamEvent::ContentBlockDelta {
+            delta: ContentDelta::Thinking { .. },
+            ..
+        }
+    )
+}
+
+/// Strip protected fences from unsigned `Thinking` text — what the stream
+/// scrubber does for display, applied to the stored copy. Signed blocks
+/// keep the exact text their signature covers.
+fn scrub_unsigned_thinking(content: &mut [ContentBlock]) {
+    for block in content {
+        if let ContentBlock::Thinking {
+            text,
+            signature: None,
+        } = block
+        {
+            *text = crate::memory_fence::sanitize_context(text);
+        }
+    }
+}
+
+/// The text every still-open scrubber holds back, as deltas in block
+/// order — what `scrub_stream_event` would emit on each block's stop.
+fn flush_stream_scrubbers(
+    scrubbers: &mut HashMap<u32, (crate::memory_fence::StreamingScrubber, FenceTextKind)>,
+) -> Vec<StreamEvent> {
+    let mut open: Vec<_> = scrubbers.drain().collect();
+    open.sort_by_key(|(index, _)| *index);
+    open.into_iter()
+        .filter_map(|(index, (mut scrubber, kind))| {
+            let tail = scrubber.flush();
+            (!tail.is_empty()).then_some(StreamEvent::ContentBlockDelta {
+                index,
+                delta: match kind {
+                    FenceTextKind::Text => ContentDelta::Text { text: tail },
+                    FenceTextKind::Thinking => ContentDelta::Thinking { text: tail },
+                },
+            })
+        })
+        .collect()
+}
+
 fn stream_retry_delay(attempt: u8) -> Duration {
     let exp = attempt.saturating_sub(1).min(5);
     Duration::from_millis(500u64.saturating_mul(1u64 << exp))
@@ -3300,14 +3369,18 @@ const BYTE_CAP_CLEARED_MARKER: &str = "[Old tool result content cleared to fit c
 const IMAGE_CLEARED_MARKER: &str = "[image removed to fit context budget]";
 
 /// The load-time context defences, in order, applied to every history
-/// before it is sent: retire stale images by count, enforce the byte cap,
-/// then collapse old read-only results.
+/// before it is sent: drop replay-only reasoning the request won't carry,
+/// retire stale images by count, enforce the byte cap, then collapse old
+/// read-only results.
 ///
 /// Order matters: byte-cap runs before collapse. A byte-cap marker is
 /// intentionally tiny (well under `collapse_tool_results_threshold`), so
 /// collapse leaves it alone and the two elision markers never fight.
 fn bound_history(messages: Vec<Message>, cfg: &EngineConfig) -> Vec<Message> {
-    let messages = retire_stale_tool_images(messages, MAX_KEEP_TOOL_IMAGES);
+    let messages = retire_stale_tool_images(
+        drop_stale_thinking_signatures(messages),
+        MAX_KEEP_TOOL_IMAGES,
+    );
     let bounded = enforce_history_byte_cap(
         messages,
         cfg.history_max_bytes,
@@ -3319,6 +3392,24 @@ fn bound_history(messages: Vec<Message>, cfg: &EngineConfig) -> Vec<Message> {
         cfg.compact_keep_recent,
         cfg.collapse_tool_results_threshold,
     )
+}
+
+/// Clear the signature of every `Thinking` block before the current turn
+/// (`current_turn_start`). No provider sends those: Anthropic and Responses
+/// replay only the current tool loop's reasoning, DeepSeek only the text.
+/// Yet an encrypted Responses blob runs to tens of KB, and counted by the
+/// byte cap it would push out real conversation for bytes that never reach
+/// the wire. In memory only — the stored row keeps it.
+fn drop_stale_thinking_signatures(mut messages: Vec<Message>) -> Vec<Message> {
+    let turn_start = current_turn_start(&messages);
+    for msg in &mut messages[..turn_start] {
+        for block in &mut msg.content {
+            if let ContentBlock::Thinking { signature, .. } = block {
+                *signature = None;
+            }
+        }
+    }
+    messages
 }
 
 /// Tool-result images kept from earlier turns (hermes keeps the newest 3
@@ -3777,7 +3868,14 @@ fn message_byte_size(m: &Message) -> usize {
     for b in &m.content {
         match b {
             ContentBlock::Text { text } => n += text.len(),
-            ContentBlock::Thinking { text, .. } => n += text.len(),
+            // A signature (Anthropic's, or OpenAI's encrypted reasoning,
+            // often tens of KB) is replayed alongside the text within the
+            // current tool loop; older ones were cleared at load
+            // (`drop_stale_thinking_signatures`), so whatever is left here
+            // really is sent.
+            ContentBlock::Thinking { text, signature } => {
+                n += text.len() + signature.as_ref().map_or(0, String::len)
+            }
             ContentBlock::ToolUse { name, input, .. } => {
                 n += name.len();
                 n += serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
@@ -4180,8 +4278,14 @@ fn render_for_summary(rows: &[Message], max_block_bytes: usize, total_max: usize
             match block {
                 ContentBlock::Text { text } => push_capped(&mut out, text, max_block_bytes),
                 ContentBlock::Thinking { text, .. } => {
+                    // Signed thinking is stored unscrubbed (its signature
+                    // covers the exact text); keep fences out of the summary.
                     out.push_str("[thinking] ");
-                    push_capped(&mut out, text, max_block_bytes);
+                    push_capped(
+                        &mut out,
+                        &crate::memory_fence::sanitize_context(text),
+                        max_block_bytes,
+                    );
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
                     let input = serde_json::to_string(input).unwrap_or_default();
@@ -5076,6 +5180,21 @@ mod history_window_tests {
     }
 
     #[test]
+    fn thinking_signatures_count_toward_byte_accounting() {
+        // Without this: replayed signatures (OpenAI encrypted reasoning is
+        // often tens of KB) are invisible to the byte cap, which reports
+        // the history as fitting while the real request is far larger.
+        let msg = Message::new(
+            Role::Assistant,
+            vec![ContentBlock::Thinking {
+                text: "plan".into(),
+                signature: Some("s".repeat(40_000)),
+            }],
+        );
+        assert_eq!(message_byte_size(&msg), 4 + 40_000);
+    }
+
+    #[test]
     fn render_for_summary_caps_each_block() {
         // Layer ②: a large tool_error body (which collapse never shrinks)
         // must not blow the summary render.
@@ -5363,6 +5482,53 @@ mod history_window_tests {
                 .all(has_image),
             "all four current-loop images kept: {out:#?}"
         );
+    }
+
+    #[test]
+    fn stale_thinking_signatures_do_not_cost_history() {
+        // Without this: every finished turn's encrypted reasoning (tens of
+        // KB, never sent again) counts against the byte cap, which drops
+        // real conversation to make room for bytes that never reach the
+        // wire. The current loop's signature must survive: it is replayed.
+        let signed = |sig: String| ContentBlock::Thinking {
+            text: "plan".into(),
+            signature: Some(sig),
+        };
+        let msgs = vec![
+            u("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![signed("x".repeat(900_000)), ContentBlock::text("a1")],
+            ),
+            u("q2"),
+            Message::new(
+                Role::Assistant,
+                vec![signed("x".repeat(900_000)), ContentBlock::text("a2")],
+            ),
+            u("q3"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    signed("current".into()),
+                    ContentBlock::tool_use("c1", "Read", json!({})),
+                ],
+            ),
+        ];
+        let cfg = EngineConfig {
+            history_max_bytes: 1_500_000,
+            ..EngineConfig::default_for("m")
+        };
+        let out = bound_history(msgs, &cfg);
+        assert_eq!(out.len(), 6, "nothing dropped: {out:#?}");
+        let signatures: Vec<Option<&str>> = out
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { signature, .. } => Some(signature.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, [None, None, Some("current")]);
     }
 
     #[test]
