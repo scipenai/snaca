@@ -239,6 +239,8 @@ mod tests {
 
     #[test]
     fn translate_message_start() {
+        // Without this: Anthropic's message_start failed to parse — failing
+        // every streamed turn — or lost the provider message id and model.
         let data = json!({
             "type": "message_start",
             "message": {"id": "msg_01", "model": "claude-test"}
@@ -256,6 +258,8 @@ mod tests {
 
     #[test]
     fn translate_text_delta() {
+        // Without this: text_delta stopped producing text deltas, so every
+        // streamed Anthropic reply arrived empty.
         let data =
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#;
         let ev = translate_event("content_block_delta", data)
@@ -272,6 +276,8 @@ mod tests {
 
     #[test]
     fn translate_thinking_delta_uses_thinking_field() {
+        // Without this: thinking_delta was read from `text` (absent there),
+        // so every streamed extended-thinking block came out empty.
         let data = r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#;
         let ev = translate_event("content_block_delta", data)
             .unwrap()
@@ -287,6 +293,9 @@ mod tests {
 
     #[test]
     fn translate_tool_use_start_and_input_json() {
+        // Without this: a streamed tool_use lost its id / name or its
+        // input_json_delta fragments, so the tool could not be paired or
+        // ran with `{}` input.
         let start = r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tu_1","name":"Read"}}"#;
         let ev = translate_event("content_block_start", start)
             .unwrap()
@@ -317,6 +326,9 @@ mod tests {
 
     #[test]
     fn translate_message_delta_carries_stop_reason_and_usage() {
+        // Without this: message_delta lost its stop_reason or usage, so a
+        // max_tokens cut-off never triggered output-cap escalation and
+        // token accounting (and auto-compaction) read 0.
         let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#;
         let ev = translate_event("message_delta", data).unwrap().unwrap();
         match ev {
@@ -330,6 +342,9 @@ mod tests {
 
     #[test]
     fn translate_error_event() {
+        // Without this: a mid-stream `error` event (e.g. overloaded_error)
+        // was dropped or lost its message, so a cut-off reply passed as a
+        // normal one or the turn failed without saying why.
         let data =
             r#"{"type":"error","error":{"type":"overloaded_error","message":"server is busy"}}"#;
         let ev = translate_event("error", data).unwrap().unwrap();
@@ -368,8 +383,19 @@ mod tests {
         })
     }
 
+    fn collect_results(bytes: &[u8]) -> Vec<LlmResult<StreamEvent>> {
+        use futures::executor::block_on;
+        use futures::stream;
+        let owned: Vec<u8> = bytes.to_vec();
+        let s = stream::once(async move { Ok::<_, LlmError>(Bytes::from(owned)) });
+        block_on(parse_byte_stream(s).collect::<Vec<_>>())
+    }
+
     #[test]
     fn end_to_end_byte_stream() {
+        // Without this: a well-formed Anthropic stream could lose, merge or
+        // reorder events between SSE framing and translation, garbling the
+        // streamed reply.
         let raw = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"c\"}}\n\
@@ -418,8 +444,37 @@ data: {\"type\":\"message_stop\"}\n\
     }
 
     #[test]
+    fn ping_is_dropped() {
+        // Without this: a keep-alive `ping` frame leaked its data into the
+        // next frame, so the next content delta failed to parse and the
+        // whole Anthropic turn errored.
+        let frames = [
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"c\"}}\n\n",
+            "event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let ping = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+        // Anthropic interleaves pings between real frames mid-stream.
+        let pinged: String = frames.iter().flat_map(|f| [ping, *f]).collect();
+        let results = collect_results(pinged.as_bytes());
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let events: Vec<StreamEvent> = results.into_iter().map(Result::unwrap).collect();
+        let expected = collect_events(frames.concat().as_bytes());
+        assert_eq!(expected.len(), frames.len());
+        assert_eq!(events, expected);
+    }
+
+    #[test]
     fn split_chunks_assemble_correctly() {
-        // Same payload as above but split into two chunks mid-line.
+        // Without this: an SSE line split across two network chunks was
+        // parsed in halves, failing the stream whenever TCP split mid-line.
         use futures::executor::block_on;
         use futures::stream;
 
@@ -443,6 +498,8 @@ data: {\"type\":\"message_stop\"}\n\
 
     #[test]
     fn malformed_data_propagates_error() {
+        // Without this: a corrupt data payload was silently skipped, so the
+        // reply lost content with no error for the engine to act on.
         use futures::executor::block_on;
         use futures::stream;
 

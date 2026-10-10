@@ -349,6 +349,9 @@ mod tests {
 
     #[test]
     fn first_chunk_emits_message_start() {
+        // Without this: DeepSeek streams (no start event on the wire) never
+        // emitted MessageStart, so the reply lost its id and a stream ending
+        // without finish_reason got no closing MessageStop.
         let mut state = StreamState::new();
         let chunk = from_json(json!({
             "id": "chat_1",
@@ -361,6 +364,8 @@ mod tests {
 
     #[test]
     fn text_deltas_accumulate_into_one_block() {
+        // Without this: each DeepSeek content chunk opened a new text block,
+        // splitting one streamed reply into many blocks.
         let mut state = StreamState::new();
         process_chunk(
             from_json(json!({
@@ -389,6 +394,8 @@ mod tests {
 
     #[test]
     fn reasoning_then_content_closes_thinking_block() {
+        // Without this: R1's reasoning_content and the answer shared one
+        // block, so chain-of-thought leaked into the visible reply.
         let mut state = StreamState::new();
         process_chunk(
             from_json(json!({
@@ -420,6 +427,9 @@ mod tests {
 
     #[test]
     fn tool_call_with_args_streamed_in_pieces() {
+        // Without this: a DeepSeek tool call lost its id / name header or the
+        // argument fragments in later chunks, so the tool could not be
+        // paired or ran with `{}` input.
         let mut state = StreamState::new();
         // Header: id + name, no args yet.
         let evs = process_chunk(
@@ -493,6 +503,9 @@ mod tests {
 
     #[test]
     fn finish_reason_emits_message_delta_and_stop() {
+        // Without this: finish_reason left the open block unclosed or lost
+        // the stop reason and usage, so token accounting (and
+        // auto-compaction) read 0 and a length cut-off went unnoticed.
         let mut state = StreamState::new();
         process_chunk(
             from_json(json!({
@@ -539,6 +552,9 @@ mod tests {
 
     #[test]
     fn end_to_end_byte_stream_terminated_by_done() {
+        // Without this: a well-formed DeepSeek stream could lose, merge or
+        // reorder events between SSE framing and chunk translation,
+        // garbling the streamed reply.
         let raw = b"\
 data: {\"id\":\"x\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\
 \n\
@@ -576,6 +592,9 @@ data: [DONE]\n\
 
     #[test]
     fn split_chunk_mid_data_line_resumes_correctly() {
+        // Without this: a data line split across two network chunks was
+        // parsed in halves, failing the DeepSeek stream whenever TCP split
+        // mid-line.
         use futures::executor::block_on;
         use futures::stream;
 

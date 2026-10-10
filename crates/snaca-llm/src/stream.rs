@@ -409,6 +409,9 @@ mod tests {
 
     #[test]
     fn synthesize_text_only() {
+        // Without this: a client on the default (non-native) stream path
+        // emitted a malformed event sequence, so listeners and the
+        // accumulator lost the text or the stop reason.
         let events =
             synthesize_events(resp(vec![ContentBlock::text("hello")], StopReason::EndTurn));
         assert!(matches!(events[0], StreamEvent::MessageStart { .. }));
@@ -439,6 +442,9 @@ mod tests {
 
     #[test]
     fn accumulator_text_only_round_trip() {
+        // Without this: a reply replayed through the default stream path
+        // came back with a different id, stop reason or text than the
+        // provider returned.
         let mut acc = StreamAccumulator::new();
         let resp_in = resp(vec![ContentBlock::text("Hello world")], StopReason::EndTurn);
         let id = resp_in.id.clone();
@@ -473,6 +479,9 @@ mod tests {
 
     #[test]
     fn accumulator_concatenates_text_deltas() {
+        // Without this: streamed text fragments were not joined into one
+        // block, or the reply lost its id or usage, so history stored a
+        // truncated answer.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m1".into(),
@@ -512,6 +521,8 @@ mod tests {
 
     #[test]
     fn accumulator_assembles_tool_use_args_from_fragments() {
+        // Without this: tool-argument JSON split across deltas was not
+        // reassembled, so the tool ran with partial or `{}` input.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m".into(),
@@ -553,6 +564,8 @@ mod tests {
 
     #[test]
     fn accumulator_thinking_then_text_preserves_order() {
+        // Without this: thinking and text came back merged or reordered, so
+        // reasoning showed up as (or ahead of) the visible answer.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m".into(),
@@ -595,6 +608,8 @@ mod tests {
 
     #[test]
     fn accumulator_error_event_propagates_to_finalize() {
+        // Without this: a provider error mid-stream (e.g. overloaded) was
+        // swallowed and the partial reply returned as a success.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m".into(),
@@ -615,6 +630,9 @@ mod tests {
 
     #[test]
     fn accumulator_invalid_tool_args_fails_finalize() {
+        // Without this: corrupt streamed tool JSON did not surface as
+        // MalformedToolArgs, so the engine never fell back to its
+        // non-streaming retry and the tool call was lost.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m".into(),
@@ -640,6 +658,9 @@ mod tests {
 
     #[test]
     fn accumulator_infers_tool_use_when_stop_reason_missing() {
+        // Without this: a stream that sent no stop reason finished as
+        // EndTurn despite its tool call, so the engine ended the turn
+        // without running the tool.
         let mut acc = StreamAccumulator::new();
         acc.ingest(StreamEvent::MessageStart {
             message_id: "m".into(),
@@ -665,6 +686,8 @@ mod tests {
 
     #[test]
     fn synthesize_tool_use() {
+        // Without this: tool calls on the default (non-native) stream path
+        // lost their id or name, so the engine could not run or pair them.
         let events = synthesize_events(resp(
             vec![ContentBlock::ToolUse {
                 id: ToolUseId::new("tu_1"),
