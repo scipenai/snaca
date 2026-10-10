@@ -42,8 +42,8 @@ use snaca_core::Usage;
 
 /// Translate one Anthropic SSE event (already split into `event:` line
 /// and accumulated `data:` payload) into a canonical [`StreamEvent`].
-/// Returns `Ok(None)` for events we deliberately drop (`ping`,
-/// `signature_delta`, unknown types).
+/// Returns `Ok(None)` for events we deliberately drop (`ping`, unknown
+/// types).
 pub fn translate_event(event_type: &str, data: &str) -> LlmResult<Option<StreamEvent>> {
     if data.is_empty() {
         return Ok(None);
@@ -98,10 +98,12 @@ pub fn translate_event(event_type: &str, data: &str) -> LlmResult<Option<StreamE
                 "input_json_delta" => ContentDelta::ToolInputJson {
                     partial_json: as_str(delta, "partial_json").unwrap_or_default(),
                 },
-                // signature_delta carries the encrypted signature for an
-                // extended-thinking block; useful for replaying a turn but
-                // not interesting for the engine's deltas. Drop silently.
-                "signature_delta" => return Ok(None),
+                // The signature for an extended-thinking block. Kept so the
+                // block can be replayed verbatim on the next request, which
+                // Anthropic requires for thinking blocks.
+                "signature_delta" => ContentDelta::Signature {
+                    signature: as_str(delta, "signature").unwrap_or_default(),
+                },
                 _ => return Ok(None),
             };
             Ok(Some(StreamEvent::ContentBlockDelta {
@@ -338,12 +340,18 @@ mod tests {
     }
 
     #[test]
-    fn ping_and_signature_delta_are_dropped() {
-        assert!(translate_event("ping", "{}").unwrap().is_none());
+    fn signature_delta_is_kept_for_replay() {
+        // Without this: a streamed extended-thinking block reaches history
+        // unsigned, and Anthropic rejects it when the next tool-loop
+        // request replays it.
         let sig = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#;
-        assert!(translate_event("content_block_delta", sig)
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            translate_event("content_block_delta", sig).unwrap(),
+            Some(StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::Signature { signature }
+            }) if signature == "abc"
+        ));
     }
 
     fn collect_events(bytes: &[u8]) -> Vec<StreamEvent> {

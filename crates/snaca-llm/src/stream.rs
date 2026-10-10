@@ -85,6 +85,13 @@ pub enum ContentDelta {
     ToolInputJson {
         partial_json: String,
     },
+    /// Opaque provider token for a `Thinking` block (`ContentBlock::
+    /// Thinking::signature`) that must be replayed verbatim on later
+    /// requests — e.g. Anthropic's extended-thinking signature. Replaces
+    /// any earlier signature on the block.
+    Signature {
+        signature: String,
+    },
 }
 
 /// Convert a non-streaming `MessageResponse` into a synthetic event
@@ -101,22 +108,23 @@ pub fn synthesize_events(resp: MessageResponse) -> Vec<StreamEvent> {
 
     for (idx, block) in resp.message.content.into_iter().enumerate() {
         let index = idx as u32;
-        let (start, delta) = match block {
+        let (start, deltas) = match block {
             ContentBlock::Text { text } => {
-                (ContentBlockStart::Text, Some(ContentDelta::Text { text }))
+                (ContentBlockStart::Text, vec![ContentDelta::Text { text }])
             }
-            ContentBlock::Thinking { text, .. } => (
-                ContentBlockStart::Thinking,
-                Some(ContentDelta::Thinking { text }),
-            ),
+            ContentBlock::Thinking { text, signature } => {
+                let mut deltas = vec![ContentDelta::Thinking { text }];
+                deltas.extend(signature.map(|signature| ContentDelta::Signature { signature }));
+                (ContentBlockStart::Thinking, deltas)
+            }
             ContentBlock::ToolUse { id, name, input } => (
                 ContentBlockStart::ToolUse {
                     id: id.as_str().to_string(),
                     name,
                 },
-                Some(ContentDelta::ToolInputJson {
+                vec![ContentDelta::ToolInputJson {
                     partial_json: serde_json::to_string(&input).unwrap_or_default(),
-                }),
+                }],
             ),
             // ToolResult / Image don't appear in assistant responses.
             _ => continue,
@@ -125,8 +133,8 @@ pub fn synthesize_events(resp: MessageResponse) -> Vec<StreamEvent> {
             index,
             block: start,
         });
-        if let Some(d) = delta {
-            events.push(StreamEvent::ContentBlockDelta { index, delta: d });
+        for delta in deltas {
+            events.push(StreamEvent::ContentBlockDelta { index, delta });
         }
         events.push(StreamEvent::ContentBlockStop { index });
     }
@@ -208,6 +216,10 @@ impl PartialBlock {
             (PartialBlock::Thinking { text: buf, .. }, ContentDelta::Thinking { text }) => {
                 buf.push_str(&text)
             }
+            (
+                PartialBlock::Thinking { signature, .. },
+                ContentDelta::Signature { signature: s },
+            ) => *signature = Some(s),
             (PartialBlock::ToolUse { args, .. }, ContentDelta::ToolInputJson { partial_json }) => {
                 args.push_str(&partial_json)
             }
@@ -441,6 +453,21 @@ mod tests {
             ContentBlock::Text { text } => assert_eq!(text, "Hello world"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn thinking_signature_survives_synthesize_and_accumulate() {
+        // Without this: signed thinking lost its signature between the
+        // stream and history, so the tool loop could not replay it.
+        let block = ContentBlock::Thinking {
+            text: "plan".into(),
+            signature: Some("sig-123".into()),
+        };
+        let mut acc = StreamAccumulator::new();
+        for ev in synthesize_events(resp(vec![block.clone()], StopReason::EndTurn)) {
+            acc.ingest(ev);
+        }
+        assert_eq!(acc.finalize().unwrap().message.content, vec![block]);
     }
 
     #[test]
