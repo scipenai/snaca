@@ -11,6 +11,33 @@ git submodule depending on `snaca-sdk` alone. The internal library crates
 (`snaca-engine`, `snaca-state`, `snaca-tools`, …) beyond what the facade
 re-exports are **not** covered by semver and may change between minor versions.
 
+## 0.4.0
+
+### Added
+
+- **OpenAI Responses API.** Native `openai-responses` provider with streaming,
+  tool calls and encrypted reasoning replay.
+- **Vision.** User and tool-result images reach supported providers. Read
+  normalises images under configurable budgets, exposed in the admin UI.
+
+### Fixed
+
+- **Streaming.** Preserve split UTF-8 characters, trailing text and thinking
+  signatures; replay signed thinking only within the current tool loop.
+- **Lark images.** Rich-text messages and quoted posts retain image attachments.
+- **Memory extraction.** Raise the output budget from 512 to 4096 tokens so
+  thinking models have room to return memories.
+
+### Changed
+
+- **SDK (breaking).** Add `LlmProvider::OpenAiResponses`,
+  `ContentDelta::Signature`, `LlmOptions::supports_vision` and image-budget
+  fields in `EngineConfig`. Update exhaustive matches and struct literals.
+- **History budget.** Count image payloads and thinking signatures; retire
+  older tool-result images while prioritising the current tool loop.
+- **Provider defaults.** Vision is enabled for Anthropic/Responses by default;
+  both require an explicit `llm.model`.
+
 ## 0.3.2
 
 ### Fixed
