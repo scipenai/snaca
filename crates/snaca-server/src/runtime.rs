@@ -5,7 +5,7 @@
 //! real binary.
 
 use crate::admin;
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_HISTORY_MAX_BYTES};
 use crate::dispatch::InputAssemblyConfig;
 use crate::outbox;
 use crate::plugin_registry::{PluginRegistry, PluginSpawner};
@@ -32,6 +32,7 @@ use snaca_sdk::{
 use snaca_skills::{LayoutSkillProvider, SkillProvider};
 use snaca_state::Database;
 use snaca_tools::base_tool_registry;
+use snaca_tools_api::ImageLimits;
 use snaca_workspace::WorkspaceLayout;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,7 +43,7 @@ use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Components produced from a [`Config`] — owned by the running server.
 pub struct Runtime {
@@ -241,7 +242,10 @@ impl Runtime {
                 .engine
                 .repeated_tool_failure_feedback
                 .unwrap_or(true),
-            history_max_bytes: config.engine.history_max_bytes.unwrap_or(1_500_000),
+            history_max_bytes: config
+                .engine
+                .history_max_bytes
+                .unwrap_or(DEFAULT_HISTORY_MAX_BYTES),
             // None keeps the engine-default behaviour (no wall-clock
             // cap). Operators opt in by setting a positive value.
             turn_timeout_secs: config.engine.turn_timeout_secs.filter(|s| *s > 0),
@@ -278,6 +282,12 @@ impl Runtime {
                 .filter(|n| *n > 0)
                 .unwrap_or(32_768),
             memory_write_approval: config.engine.memory_write_approval.unwrap_or(false),
+            // Range-checked against history_max_bytes in Config::validate.
+            image_max_bytes: config.engine.effective_image_max_bytes(),
+            image_max_edge_px: config
+                .engine
+                .image_max_edge_px
+                .unwrap_or(ImageLimits::DEFAULT_MAX_EDGE_PX),
         };
         // The static `tools` parameter on `Engine::new` is the fallback
         // registry — used only if no factory is attached. We always attach
@@ -457,7 +467,10 @@ impl Runtime {
     }
 }
 
-fn build_llm(config: &Config) -> Result<Arc<dyn LlmClient>> {
+/// Map the `[llm]` config section onto provider-agnostic
+/// [`LlmOptions`]. Split from [`build_llm`] so the config mapping is
+/// unit-testable without constructing network clients.
+fn build_llm_options(config: &Config) -> Result<LlmOptions> {
     let provider = config
         .llm
         .provider
@@ -478,7 +491,25 @@ fn build_llm(config: &Config) -> Result<Arc<dyn LlmClient>> {
     if let Some(v) = &config.llm.anthropic_version {
         options = options.anthropic_version(v.clone());
     }
-    options.build().map_err(|e| anyhow!(e.to_string()))
+    if let Some(vision) = config.llm.supports_vision {
+        options = options.supports_vision(vision);
+    } else if provider != LlmProvider::DeepSeek && config.llm.base_url.is_some() {
+        // Vision defaults on for these providers, which suits the official
+        // hosts — but a text-only compatible endpoint behind `base_url`
+        // would reject every request that carries a Read image.
+        warn!(
+            provider = %provider,
+            "llm.supports_vision is unset, so images are sent to the custom base_url; \
+             set llm.supports_vision = false if that endpoint is text-only"
+        );
+    }
+    Ok(options)
+}
+
+fn build_llm(config: &Config) -> Result<Arc<dyn LlmClient>> {
+    build_llm_options(config)?
+        .build()
+        .map_err(|e| anyhow!(e.to_string()))
 }
 
 fn build_input_assembly_config(config: &Config) -> InputAssemblyConfig {
@@ -648,6 +679,9 @@ impl ConfigSnapshot {
                 "model": cfg.llm.model,
                 "base_url": cfg.llm.base_url,
                 "api_key_set": !cfg.llm.api_key.is_empty(),
+                // What an operator checks first when a model "can't see"
+                // images — resolved, since unset means a provider default.
+                "supports_vision": cfg.llm.effective_supports_vision(),
             },
             "engine": {
                 "max_iterations": cfg.engine.max_iterations,
@@ -655,6 +689,8 @@ impl ConfigSnapshot {
                 "compact_after_input_tokens": cfg.engine.compact_after_input_tokens,
                 "memory_extractor": cfg.engine.memory_extractor.unwrap_or(true),
                 "memory_write_approval": cfg.engine.memory_write_approval.unwrap_or(false),
+                "image_max_bytes": cfg.engine.effective_image_max_bytes(),
+                "image_max_edge_px": cfg.engine.image_max_edge_px.unwrap_or(ImageLimits::DEFAULT_MAX_EDGE_PX),
             },
             "im_input": {
                 "assembly_enabled": cfg.im_input.assembly_enabled.unwrap_or(true),
@@ -818,4 +854,76 @@ async fn abort_thread(
         StatusCode::OK,
         Json(serde_json::json!({"aborted": count > 0, "count": count})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn config_from_toml(raw: &str) -> Config {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(raw.as_bytes()).unwrap();
+        Config::load(f.path()).unwrap()
+    }
+
+    fn minimal_llm_toml(extra: &str) -> String {
+        format!(
+            r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "deepseek"
+api_key = "test-key"
+model = "deepseek-chat"
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn llm_options_carry_base_url_timeout_and_version() {
+        // Without this: llm.base_url / timeout_secs / anthropic_version /
+        // supports_vision were dropped: requests went to the official host
+        // with defaults, and a vision model behind provider = "deepseek"
+        // only ever got "[image omitted]" text.
+        let cfg = config_from_toml(
+            r#"
+[server]
+data_root = "./data"
+
+[tenant]
+id = "default"
+
+[llm]
+provider = "anthropic"
+api_key = "test-key"
+model = "claude-test"
+base_url = "https://proxy.example.com"
+timeout_secs = 42
+anthropic_version = "2099-01-01"
+supports_vision = false
+"#,
+        );
+        let options = build_llm_options(&cfg).unwrap();
+        assert_eq!(options.provider, LlmProvider::Anthropic);
+        assert_eq!(
+            options.base_url.as_deref(),
+            Some("https://proxy.example.com")
+        );
+        assert_eq!(options.timeout, Some(Duration::from_secs(42)));
+        assert_eq!(options.anthropic_version.as_deref(), Some("2099-01-01"));
+        assert_eq!(options.supports_vision, Some(false));
+
+        // DeepSeek defaults to text-only, so turning vision on is the
+        // operator's case for a vision model behind a compatible endpoint.
+        let cfg = config_from_toml(&minimal_llm_toml("supports_vision = true"));
+        let options = build_llm_options(&cfg).unwrap();
+        assert_eq!(options.provider, LlmProvider::DeepSeek);
+        assert_eq!(options.supports_vision, Some(true));
+    }
 }

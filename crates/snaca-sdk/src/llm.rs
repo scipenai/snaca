@@ -53,6 +53,10 @@ pub struct LlmOptions {
     pub base_url: Option<String>,
     pub timeout: Option<Duration>,
     pub anthropic_version: Option<String>,
+    /// Override the provider default for image embedding. `None` keeps
+    /// the per-provider default (`true` for anthropic, `false` for
+    /// deepseek).
+    pub supports_vision: Option<bool>,
     pub retry: RetryConfig,
 }
 
@@ -69,6 +73,7 @@ impl LlmOptions {
             base_url: None,
             timeout: None,
             anthropic_version: None,
+            supports_vision: None,
             retry: RetryConfig::default(),
         }
     }
@@ -96,6 +101,11 @@ impl LlmOptions {
         self
     }
 
+    pub fn supports_vision(mut self, enabled: bool) -> Self {
+        self.supports_vision = Some(enabled);
+        self
+    }
+
     pub fn retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self
@@ -111,6 +121,9 @@ impl LlmOptions {
                 if let Some(timeout) = self.timeout {
                     cfg = cfg.with_timeout(timeout);
                 }
+                if let Some(vision) = self.supports_vision {
+                    cfg = cfg.with_vision(vision);
+                }
                 let raw = DeepSeekClient::new(cfg)?;
                 Ok(Arc::new(RetryingLlmClient::new(raw, self.retry)))
             }
@@ -124,6 +137,9 @@ impl LlmOptions {
                 }
                 if let Some(version) = self.anthropic_version {
                     cfg = cfg.with_anthropic_version(version);
+                }
+                if let Some(vision) = self.supports_vision {
+                    cfg = cfg.with_vision(vision);
                 }
                 let raw = AnthropicClient::new(cfg)?;
                 Ok(Arc::new(RetryingLlmClient::new(raw, self.retry)))

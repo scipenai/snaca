@@ -127,7 +127,7 @@ pub async fn list_messages(
                     thread_id: m.thread_id.as_str().to_string(),
                     session_id: m.session_id.to_string(),
                     role: role_str(m.role),
-                    content: m.content,
+                    content: elide_images(m.content),
                     created_at: m.created_at.to_rfc3339(),
                 })
                 .collect();
@@ -135,6 +135,34 @@ pub async fn list_messages(
         }
         Err(e) => internal_err(e),
     }
+}
+
+/// Replace image payloads with a one-line label for the admin view. A
+/// stored Read result carries up to `image_max_bytes` (5 MiB max) of base64,
+/// and this endpoint returns up to 500 messages — raw, that is hundreds of
+/// MB the web UI would try to render.
+fn elide_images(content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    content
+        .into_iter()
+        .map(|block| match block {
+            ContentBlock::Image { source } => ContentBlock::text(match source {
+                snaca_core::ImageSource::Base64 { media_type, data } => {
+                    format!("[image: {media_type}, {} bytes base64]", data.len())
+                }
+                snaca_core::ImageSource::Url { url } => format!("[image: {url}]"),
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => ContentBlock::ToolResult {
+                tool_use_id,
+                content: elide_images(content),
+                is_error,
+            },
+            other => other,
+        })
+        .collect()
 }
 
 pub async fn abort(
@@ -160,4 +188,31 @@ fn internal_err(e: impl std::fmt::Display) -> axum::response::Response {
         Json(serde_json::json!({"error": e.to_string()})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snaca_core::{ImageSource, ToolUseId};
+
+    #[test]
+    fn admin_view_elides_image_payloads() {
+        // Without this: the messages endpoint returns every stored image's
+        // base64 (up to 500 rows × up to 5 MiB), and the web UI dumps it
+        // into the page.
+        let image = || ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "A".repeat(300_000),
+            },
+        };
+        let out = elide_images(vec![
+            image(),
+            ContentBlock::tool_result(ToolUseId::new("c1"), vec![ContentBlock::text("x"), image()]),
+        ]);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.len() < 1_000, "payload leaked: {} bytes", json.len());
+        assert!(json.contains("[image: image/png, 300000 bytes base64]"));
+        assert!(json.contains("\"x\""), "surrounding text kept");
+    }
 }

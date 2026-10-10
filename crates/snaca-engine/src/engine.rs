@@ -33,8 +33,8 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use snaca_agent_api::{MemoryIndexRequest, MemoryProvider, MemoryProviderSlot, MemoryWriteRequest};
 use snaca_core::{
-    ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId, ToolUseId,
-    Usage, ENGINE_FEEDBACK_PREFIX,
+    current_turn_start, ContentBlock, Message, MessageId, ProjectId, Role, SessionId, TenantId,
+    ThreadId, ToolUseId, Usage, ENGINE_FEEDBACK_PREFIX,
 };
 use snaca_llm::{
     ContentBlockStart, ContentDelta, LlmClient, LlmError, MessageRequest, MessageResponse,
@@ -42,8 +42,8 @@ use snaca_llm::{
 };
 use snaca_state::{Database, NewMessage, NewThread, PersistedDecision};
 use snaca_tools_api::{
-    ApprovalRequirement, OutboundFile, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry,
-    ToolResult,
+    ApprovalRequirement, ImageLimits, OutboundFile, Tool, ToolContext, ToolError, ToolOutput,
+    ToolRegistry, ToolResult,
 };
 use snaca_workspace::WorkspaceLayout;
 use std::collections::{HashMap, HashSet};
@@ -544,7 +544,11 @@ impl Engine {
         .with_read_tracker(read_tracker)
         .with_cancellation_token(cancel_token.clone())
         .with_db_handle(Arc::new(self.state.clone()) as Arc<dyn std::any::Any + Send + Sync>)
-        .with_memory_write_approval(self.config.memory_write_approval);
+        .with_memory_write_approval(self.config.memory_write_approval)
+        .with_image_limits(ImageLimits {
+            max_bytes: self.config.image_max_bytes,
+            max_edge_px: self.config.image_max_edge_px,
+        });
         let shared_memory_store = {
             let key = (
                 tenant_id.as_str().to_string(),
@@ -1271,38 +1275,16 @@ impl Engine {
                 ))],
                 created_at: comp.compacted_at,
             });
-            let live_msgs: Vec<Message> = live.into_iter().map(message_from_persisted).collect();
-            // Apply the byte cap to the live tail too — the summary
-            // preamble already shrinks the history by definition, but
-            // a single oversized post-compaction message (e.g. a
-            // tool_result carrying a freshly extracted PDF body) can
-            // still blow the window.
-            let bounded = enforce_history_byte_cap(
-                live_msgs,
-                self.config.history_max_bytes,
-                self.config.compact_keep_recent,
-                self.config.max_tool_result_bytes,
-            );
-            // Collapse old read-only tool_results so the model
-            // doesn't re-pay token budget for stale Read/Grep
-            // output on every turn after compaction. The kept tail
-            // matches `compact_keep_recent` so the model still
-            // sees its most recent tool work verbatim. Pairing repair
-            // happens once at the request boundary
-            // (`ensure_tool_result_pairing` in `call_llm_and_prerun`)
-            // over the whole `head ++ summary ++ live` assembly.
-            //
-            // Order matters: byte-cap runs before collapse. A byte-cap
-            // marker is intentionally tiny (well under
-            // `collapse_tool_results_threshold`), so collapse leaves it
-            // alone and the two elision markers never fight.
-            let collapsed = collapse_old_tool_results(
-                bounded,
-                self.config.compact_keep_recent,
-                self.config.collapse_tool_results_threshold,
-            );
-            out.extend(collapsed);
-            return Ok(out);
+            out.extend(live.into_iter().map(message_from_persisted));
+            // The whole assembly goes through the defences, head included:
+            // a preserved head can hold an early Read image or a big result
+            // as easily as the live tail can, and it's re-sent every turn
+            // too. As the oldest messages, the head and then the summary
+            // are what the byte cap drops first — only once every old body
+            // and image is already gone. Pairing repair happens once at the
+            // request boundary (`ensure_tool_result_pairing` in
+            // `call_llm_and_prerun`).
+            return Ok(bound_history(out, &self.config));
         }
         // Dual window: pull a generous candidate pool of raw rows, then
         // size the kept window by *conversational* (User+Assistant)
@@ -1314,19 +1296,9 @@ impl Engine {
         let messages: Vec<Message> = rows.into_iter().map(message_from_persisted).collect();
         let windowed =
             trim_to_conversation_window(messages, self.config.conversation_history_limit as usize);
-        let bounded = enforce_history_byte_cap(
-            windowed,
-            self.config.history_max_bytes,
-            self.config.compact_keep_recent,
-            self.config.max_tool_result_bytes,
-        );
         // Pairing repair is deferred to the request boundary
         // (`ensure_tool_result_pairing` in `call_llm_and_prerun`).
-        Ok(collapse_old_tool_results(
-            bounded,
-            self.config.compact_keep_recent,
-            self.config.collapse_tool_results_threshold,
-        ))
+        Ok(bound_history(windowed, &self.config))
     }
 
     /// One localize-and-redact round for a `LlmError::ContentFiltered`.
@@ -3207,7 +3179,9 @@ fn is_collapsible_tool(name: &str) -> bool {
 /// Replace the body of `ToolResult` blocks for old read-only tool
 /// calls with a short marker. Preserves the `tool_use_id` and
 /// `is_error` flag so the assistant → tool pairing the providers
-/// require stays well-formed; only the inner text content is shrunk.
+/// require stays well-formed; only the text is replaced. Images are kept:
+/// which of them may go is decided by `retire_stale_tool_images` (count)
+/// and the byte cap (budget), which know what the current turn still needs.
 ///
 /// `keep_recent` messages at the tail are left verbatim — the model
 /// usually references the most recent results in the very next turn.
@@ -3291,7 +3265,7 @@ fn collapse_block_if_old_read(
             is_error,
         };
     }
-    let total = tool_result_text_len(&content);
+    let total = text_bytes(&content);
     if total < threshold {
         return ContentBlock::ToolResult {
             tool_use_id,
@@ -3299,12 +3273,18 @@ fn collapse_block_if_old_read(
             is_error,
         };
     }
+    let mut collapsed = vec![ContentBlock::text(format!(
+        "<{tool_name} result: {total} bytes elided to save context; \
+         call again if you need the full body>"
+    ))];
+    collapsed.extend(
+        content
+            .into_iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. })),
+    );
     ContentBlock::ToolResult {
         tool_use_id,
-        content: vec![ContentBlock::text(format!(
-            "<{tool_name} result: {total} bytes elided to save context; \
-             call again if you need the full body>"
-        ))],
+        content: collapsed,
         is_error,
     }
 }
@@ -3313,6 +3293,68 @@ fn collapse_block_if_old_read(
 /// clears it. The block and its `tool_use_id` are kept so pairing stays
 /// intact — only the payload is elided.
 const BYTE_CAP_CLEARED_MARKER: &str = "[Old tool result content cleared to fit context budget]";
+
+/// Marker substituted for an image payload when the byte cap strips it
+/// (Phases 1 / 2). Only the pixels go; surrounding text and block pairing
+/// stay.
+const IMAGE_CLEARED_MARKER: &str = "[image removed to fit context budget]";
+
+/// The load-time context defences, in order, applied to every history
+/// before it is sent: retire stale images by count, enforce the byte cap,
+/// then collapse old read-only results.
+///
+/// Order matters: byte-cap runs before collapse. A byte-cap marker is
+/// intentionally tiny (well under `collapse_tool_results_threshold`), so
+/// collapse leaves it alone and the two elision markers never fight.
+fn bound_history(messages: Vec<Message>, cfg: &EngineConfig) -> Vec<Message> {
+    let messages = retire_stale_tool_images(messages, MAX_KEEP_TOOL_IMAGES);
+    let bounded = enforce_history_byte_cap(
+        messages,
+        cfg.history_max_bytes,
+        cfg.compact_keep_recent,
+        cfg.max_tool_result_bytes,
+    );
+    collapse_old_tool_results(
+        bounded,
+        cfg.compact_keep_recent,
+        cfg.collapse_tool_results_threshold,
+    )
+}
+
+/// Tool-result images kept from earlier turns (hermes keeps the newest 3
+/// too). Each one is re-sent — and billed — on every request, and the model
+/// rarely needs more than the last few; it can Read a file again.
+const MAX_KEEP_TOOL_IMAGES: usize = 3;
+
+/// Marker for a tool-result image retired by `retire_stale_tool_images`.
+const IMAGE_RETIRED_MARKER: &str =
+    "[earlier image removed from context; Read the file again to see it]";
+
+/// Replace tool-result images beyond the newest `keep` with
+/// `IMAGE_RETIRED_MARKER`, regardless of byte budget. Images in the current
+/// turn's tool loop (`current_turn_start`) are never retired — a turn that
+/// Reads several images to compare them still sees them all — but they do
+/// count toward `keep`, so they push earlier turns' images out first.
+fn retire_stale_tool_images(mut messages: Vec<Message>, keep: usize) -> Vec<Message> {
+    let current_loop_from = current_turn_start(&messages);
+    let mut seen = 0usize;
+    for (i, msg) in messages.iter_mut().enumerate().rev() {
+        for block in msg.content.iter_mut().rev() {
+            let ContentBlock::ToolResult { content, .. } = block else {
+                continue;
+            };
+            for inner in content.iter_mut().rev() {
+                if matches!(inner, ContentBlock::Image { .. }) {
+                    seen += 1;
+                    if seen > keep && i < current_loop_from {
+                        *inner = ContentBlock::text(IMAGE_RETIRED_MARKER);
+                    }
+                }
+            }
+        }
+    }
+    messages
+}
 
 /// Per-block byte cap when rendering the compaction-summary input
 /// (`render_for_summary`). Bounds each message's contribution so no single
@@ -3380,9 +3422,25 @@ fn sanitize_thread_summary(raw: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
-/// Byte size of a `tool_result` body's text blocks — the portion the byte
-/// cap can elide. Mirrors how `message_byte_size` counts a `ToolResult`.
-fn tool_result_text_len(content: &[ContentBlock]) -> usize {
+/// Byte size of a `tool_result` body as it sits in serialized history:
+/// text by UTF-8 length plus images at their wire size — a base64 payload
+/// is re-sent verbatim on every later request, so it must count against
+/// every byte-based defence. Mirrors how `message_byte_size` counts a
+/// `ToolResult`.
+fn tool_result_content_bytes(content: &[ContentBlock]) -> usize {
+    text_bytes(content)
+        + content
+            .iter()
+            .map(|c| match c {
+                ContentBlock::Image { source } => image_wire_bytes(source),
+                _ => 0,
+            })
+            .sum::<usize>()
+}
+
+/// Text-only share of a `tool_result` body — the part the per-result
+/// clamp can actually preview away.
+fn text_bytes(content: &[ContentBlock]) -> usize {
     content
         .iter()
         .map(|c| match c {
@@ -3390,6 +3448,16 @@ fn tool_result_text_len(content: &[ContentBlock]) -> usize {
             _ => 0,
         })
         .sum()
+}
+
+/// Actual bytes an Image block adds to serialized history. Token cost
+/// for vision models is lower than raw bytes — this is a byte-cap
+/// safety net, so overestimating images is the safe direction.
+fn image_wire_bytes(source: &snaca_core::ImageSource) -> usize {
+    match source {
+        snaca_core::ImageSource::Base64 { data, .. } => data.len(),
+        snaca_core::ImageSource::Url { url } => url.len(),
+    }
 }
 
 /// Largest byte prefix of `s` that ends on a UTF-8 char boundary and is
@@ -3410,14 +3478,27 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 /// oversized-result defence — applied at capture time so no single result
 /// can dominate the model context or the compaction-summary request.
 /// `max == 0` disables it.
+///
+/// Only the *text* is measured against `max`: images are never destroyed
+/// here — a freshly captured image is exactly what a vision model needs
+/// this turn — so a result whose text fits passes through untouched
+/// however large its pixels are. Byte pressure from images is relieved by
+/// `retire_stale_tool_images` (count) and the byte cap (budget): Phase 2
+/// once the result is earlier history, Phase 1 before Phase 4 would drop
+/// the conversation around the user's request.
 fn cap_tool_result_content(content: Vec<ContentBlock>, max: usize) -> Vec<ContentBlock> {
-    if max == 0 || tool_result_text_len(&content) <= max {
+    // Overflow driven purely by images (an image-only Read result, or a
+    // small caption beside a large render) is left whole: truncating would
+    // only wrap the caption in a bogus "0 bytes truncated" notice while the
+    // pixels — the part actually over the cap — stay put.
+    if max == 0 || text_bytes(&content) <= max {
         return content;
     }
     // Split text from non-text (image) blocks. Avoid materialising the
     // whole body in the common single-text-block case (a Bash dump is one
     // `Text` block) — borrow it directly; only concatenate when the text
-    // is genuinely spread across several blocks.
+    // is genuinely spread across several blocks. `texts` is non-empty
+    // here: `text_bytes > max >= 1`.
     let mut texts: Vec<String> = Vec::new();
     let mut others: Vec<ContentBlock> = Vec::new();
     for b in content {
@@ -3472,29 +3553,45 @@ fn cap_tool_result_block(block: ContentBlock, max: usize) -> ContentBlock {
 }
 
 /// Bring `messages` under `max_bytes` while keeping the wire format
-/// pairing-safe.
+/// pairing-safe, giving up the least useful bytes first.
 ///
-/// Phase A — clear content, keep blocks: walk the messages oldest→newest,
-/// excluding the most recent `keep_recent`, and replace each
-/// `tool_result` body with `BYTE_CAP_CLEARED_MARKER`. The block and its
-/// `tool_use_id` survive, so no `tool_use` is ever orphaned by this pass.
-/// This is the common case — a single oversized `tool_result` (a freshly
+/// What must survive is the current turn's request (`current_turn_start`)
+/// plus the *kept tail*: of the most recent `keep_recent` messages (at
+/// least one), those in the current turn. Everything before the kept tail
+/// is earlier history — recent messages from earlier turns included,
+/// since they matter less than the images the user is asking about now.
+///
+/// Phase 1 — kept tail overflow: if the kept tail and the request alone
+/// are over the cap, no trimming of earlier history can fit them, so strip
+/// tail images (oldest first) just until they fit. Run after Phases 2–3,
+/// those would clear all earlier history chasing a total out of reach.
+///
+/// Phase 2 — earlier images: replace image payloads before the kept tail
+/// with `IMAGE_CLEARED_MARKER`, oldest first, stopping as soon as we fit.
+/// Pixels go before text: they are the bulk, and the marker tells the
+/// model it can look again.
+///
+/// Phase 3 — earlier tool results: replace each `tool_result` body before
+/// the kept tail with `BYTE_CAP_CLEARED_MARKER`, oldest first. The block
+/// and its `tool_use_id` survive, so no `tool_use` is ever orphaned. This
+/// is the common case — a single oversized `tool_result` (a freshly
 /// extracted PDF/xlsx body) is what usually blows the cap.
 ///
-/// Phase B — fallback drop: if clearing every eligible body still leaves
-/// us over the cap (bulk sits in text / thinking / tool_use args), drop
-/// whole leading messages as a last resort. Any forward-orphan this
-/// creates is repaired by `ensure_tool_result_pairing` at the request
-/// boundary; a leading `Role::Tool` left at the new head is stripped here
-/// so the fallback alone never emits a leading tool message.
+/// Phase 4 — drop messages: drop whole leading messages until the history
+/// fits, but never the request — once it leads, the message after it goes
+/// instead. Phase 1 made the kept tail fit beside the request whenever
+/// stripping images could, so this reaches into the tail only as a last
+/// resort, when its bulk is text / thinking / tool_use args. A tool
+/// message orphaned by a drop is removed by `ensure_tool_result_pairing`
+/// at the request boundary; a leading `Role::Tool` left at the new head is
+/// stripped here so this function never emits a leading tool message.
 ///
 /// Layer ③ (`per_result_max`): before the total-cap phases, clamp *any*
 /// single `tool_result` body larger than `per_result_max` to a head+tail
-/// preview — even one inside the protected `keep_recent` tail. A single
-/// oversized recent result (a legacy row from before the capture-time cap,
-/// or one written by another path) would otherwise dominate the window
-/// while Phase A's `keep_recent` protection deliberately skips it. `0`
-/// disables this clamp.
+/// preview — even one inside the kept tail. A single oversized recent
+/// result (a legacy row from before the capture-time cap, or one written
+/// by another path) would otherwise dominate the window while the kept
+/// tail's protection deliberately skips it. `0` disables this clamp.
 pub(crate) fn enforce_history_byte_cap(
     mut messages: Vec<Message>,
     max_bytes: usize,
@@ -3514,7 +3611,10 @@ pub(crate) fn enforce_history_byte_cap(
             }
             for block in msg.content.iter_mut() {
                 if let ContentBlock::ToolResult { content, .. } = block {
-                    if tool_result_text_len(content) > per_result_max {
+                    // Text-only, like the clamp itself: an image-heavy
+                    // result would otherwise be taken and rebuilt unchanged
+                    // on every history load.
+                    if text_bytes(content) > per_result_max {
                         *content = cap_tool_result_content(std::mem::take(content), per_result_max);
                     }
                 }
@@ -3523,62 +3623,86 @@ pub(crate) fn enforce_history_byte_cap(
     }
 
     let mut total = messages_byte_size(&messages);
+    let request = current_turn_start(&messages).checked_sub(1);
+    let protect_from = messages.len().saturating_sub(keep_recent.max(1));
+    let keep_from = protect_from.max(request.unwrap_or(0));
+    // Outside the kept tail (a loop longer than `keep_recent`), the request
+    // still has to fit beside it.
+    let request_bytes = request
+        .filter(|&r| r < keep_from)
+        .map_or(0, |r| message_byte_size(&messages[r]));
 
-    // Phase A: clear old tool_result bodies (only when over cap).
-    // Protect the most recent `keep_recent` messages (floored at 1) so
-    // the model still sees its latest tool work verbatim. Single pass per
-    // message: only clear a body that is actually LARGER than the marker
-    // (so clearing always shrinks, never grows a tiny body), and account
-    // the freed bytes incrementally.
+    // Phase 1: the kept tail and the request alone overflow — strip tail
+    // images (oldest first) until they fit, before earlier history is
+    // trimmed for a total it could never reach.
+    let mut kept_total = request_bytes + messages_byte_size(&messages[keep_from..]);
+    let mut images_cleared = 0usize;
+    if kept_total > max_bytes {
+        let before = kept_total;
+        images_cleared =
+            strip_images_until_fit(&mut messages[keep_from..], &mut kept_total, max_bytes);
+        total -= before - kept_total;
+    }
+
+    // Phase 2: strip earlier images.
+    images_cleared += strip_images_until_fit(&mut messages[..keep_from], &mut total, max_bytes);
+
+    // Phase 3: clear earlier tool_result bodies. Single pass per message:
+    // only clear a body that is actually LARGER than the marker (so
+    // clearing always shrinks, never grows a tiny body), and account the
+    // freed bytes incrementally.
     const MARKER_LEN: usize = BYTE_CAP_CLEARED_MARKER.len();
     let mut cleared = 0usize;
-    if total > max_bytes {
-        let protect_from = messages.len().saturating_sub(keep_recent.max(1));
-        for msg in messages.iter_mut().take(protect_from) {
-            if total <= max_bytes {
-                break;
-            }
-            if !matches!(msg.role, Role::Tool) {
-                continue;
-            }
-            let mut freed = 0usize;
-            for block in msg.content.iter_mut() {
-                if let ContentBlock::ToolResult {
-                    content, is_error, ..
-                } = block
-                {
-                    // Errors are small and load-bearing; leave them.
-                    if *is_error {
-                        continue;
-                    }
-                    let body = tool_result_text_len(content);
-                    // Skip bodies no larger than the marker — that covers
-                    // already-cleared results and anything too small to be
-                    // worth eliding (clearing would only add bytes).
-                    if body <= MARKER_LEN {
-                        continue;
-                    }
-                    *content = vec![ContentBlock::text(BYTE_CAP_CLEARED_MARKER)];
-                    freed += body - MARKER_LEN;
+    for msg in messages.iter_mut().take(keep_from) {
+        if total <= max_bytes {
+            break;
+        }
+        if !matches!(msg.role, Role::Tool) {
+            continue;
+        }
+        let mut freed = 0usize;
+        for block in msg.content.iter_mut() {
+            if let ContentBlock::ToolResult {
+                content, is_error, ..
+            } = block
+            {
+                // Errors are small and load-bearing; leave them.
+                if *is_error {
+                    continue;
                 }
+                let body = tool_result_content_bytes(content);
+                // Skip bodies no larger than the marker — that covers
+                // already-cleared results and anything too small to be
+                // worth eliding (clearing would only add bytes).
+                if body <= MARKER_LEN {
+                    continue;
+                }
+                *content = vec![ContentBlock::text(BYTE_CAP_CLEARED_MARKER)];
+                freed += body - MARKER_LEN;
             }
-            if freed > 0 {
-                total = total.saturating_sub(freed);
-                cleared += 1;
-            }
+        }
+        if freed > 0 {
+            total = total.saturating_sub(freed);
+            cleared += 1;
         }
     }
 
-    // Phase B: still over cap — drop whole leading messages.
+    // Phase 4: drop leading messages until it fits, keeping the request —
+    // the model must still see the question it is answering.
     let original_len = messages.len();
+    let mut request_at = request;
     while total > max_bytes && messages.len() > 1 {
-        let dropped = messages.remove(0);
+        let victim = usize::from(request_at == Some(0));
+        let dropped = messages.remove(victim);
         total = total.saturating_sub(message_byte_size(&dropped));
+        if victim == 0 {
+            request_at = request_at.map(|r| r - 1);
+        }
     }
     // On every path (even when already under cap) the head must NOT be a
     // `Role::Tool` message — providers reject `tool` messages that don't
     // follow an assistant `tool_use`. Drop leading orphans regardless of
-    // whether Phase B ran, so this function never returns a leading tool.
+    // whether Phase 4 ran, so this function never returns a leading tool.
     while messages
         .first()
         .map(|m| matches!(m.role, Role::Tool))
@@ -3587,16 +3711,61 @@ pub(crate) fn enforce_history_byte_cap(
         messages.remove(0);
     }
     let dropped = original_len - messages.len();
-    if cleared > 0 || dropped > 0 {
+    if cleared > 0 || images_cleared > 0 || dropped > 0 {
         warn!(
             cleared,
+            images_cleared,
             dropped,
             kept = messages.len(),
             cap_bytes = max_bytes,
-            "history-load: enforced byte cap (cleared old tool_result bodies, then dropped oldest)"
+            "history-load: enforced byte cap (cleared old tool_result bodies / images, then dropped oldest)"
         );
     }
     messages
+}
+
+/// Replace image payloads in `messages` with `IMAGE_CLEARED_MARKER`,
+/// oldest first, until `total` fits `max_bytes` (a no-op if it already
+/// does). Returns how many images were cleared.
+fn strip_images_until_fit(messages: &mut [Message], total: &mut usize, max_bytes: usize) -> usize {
+    let mut cleared = 0usize;
+    for msg in messages.iter_mut() {
+        for block in msg.content.iter_mut() {
+            // Images sit either top-level (user attachments) or inside a
+            // tool_result body, which can hold several.
+            let candidates: &mut [ContentBlock] = match block {
+                ContentBlock::ToolResult { content, .. } => content.as_mut_slice(),
+                other => std::slice::from_mut(other),
+            };
+            for candidate in candidates {
+                // Checked per image, not per block, so a multi-image result
+                // loses only as many images as the cap requires.
+                if *total <= max_bytes {
+                    return cleared;
+                }
+                if let Some(freed) = clear_image_block(candidate) {
+                    *total = total.saturating_sub(freed);
+                    cleared += 1;
+                }
+            }
+        }
+    }
+    cleared
+}
+
+/// Replace an `Image` block with `IMAGE_CLEARED_MARKER`, returning the
+/// bytes freed. `None` for non-images and for images no larger than the
+/// marker (a short URL) — swapping those would only grow the history.
+fn clear_image_block(block: &mut ContentBlock) -> Option<usize> {
+    let ContentBlock::Image { source } = block else {
+        return None;
+    };
+    let size = image_wire_bytes(source);
+    if size <= IMAGE_CLEARED_MARKER.len() {
+        return None;
+    }
+    *block = ContentBlock::text(IMAGE_CLEARED_MARKER);
+    Some(size - IMAGE_CLEARED_MARKER.len())
 }
 
 fn messages_byte_size(msgs: &[Message]) -> usize {
@@ -3613,13 +3782,8 @@ fn message_byte_size(m: &Message) -> usize {
                 n += name.len();
                 n += serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
             }
-            ContentBlock::ToolResult { content, .. } => n += tool_result_text_len(content),
-            ContentBlock::Image { .. } => {
-                // Synthetic constant — image references don't carry
-                // bytes inline, but tokens count differently. Pick a
-                // safe estimate.
-                n += 1024;
-            }
+            ContentBlock::ToolResult { content, .. } => n += tool_result_content_bytes(content),
+            ContentBlock::Image { source } => n += image_wire_bytes(source),
         }
     }
     n
@@ -4223,8 +4387,8 @@ enum ProbeOutcome {
 /// Assemble a probe history from raw rows, neutralizing every row in
 /// `redact_ids` (the in-memory trial set) as well as rows already marked
 /// redacted in the DB. Mirrors `load_history`'s non-compaction pipeline
-/// (window → byte-cap → collapse) so a probe's shape matches what a real
-/// turn would send; pairing repair is applied by the caller.
+/// (window → `bound_history`) so a probe's shape matches what a real turn
+/// would send; pairing repair is applied by the caller.
 fn build_probe_history(
     rows: &[snaca_state::MessageRow],
     redact_ids: &HashSet<MessageId>,
@@ -4248,17 +4412,7 @@ fn build_probe_history(
         })
         .collect();
     let windowed = trim_to_conversation_window(msgs, cfg.conversation_history_limit as usize);
-    let bounded = enforce_history_byte_cap(
-        windowed,
-        cfg.history_max_bytes,
-        cfg.compact_keep_recent,
-        cfg.max_tool_result_bytes,
-    );
-    collapse_old_tool_results(
-        bounded,
-        cfg.compact_keep_recent,
-        cfg.collapse_tool_results_threshold,
-    )
+    bound_history(windowed, cfg)
 }
 
 #[cfg(test)]
@@ -4750,7 +4904,7 @@ mod history_window_tests {
     #[test]
     fn byte_cap_falls_back_to_drop_when_bulk_not_clearable() {
         // Oversized bulk sits in a user text block — nothing to clear, so
-        // Phase B drops leading messages.
+        // Phase 4 drops leading messages.
         let big = "x".repeat(5000);
         let msgs = vec![u(&big), a("small"), u("q2"), a("keep")];
         let out = enforce_history_byte_cap(msgs, 300, 1, 0);
@@ -4863,7 +5017,7 @@ mod history_window_tests {
                 ..
             } => {
                 assert_eq!(tool_use_id.as_str(), "c1");
-                let len = tool_result_text_len(content);
+                let len = tool_result_content_bytes(content);
                 assert!(len <= 100_000 + 256, "truncated to ~max, got {len}");
                 assert!(result_body_text(&capped).contains("bytes truncated"));
             }
@@ -4882,6 +5036,43 @@ mod history_window_tests {
             vec![ContentBlock::text("x".repeat(50_000))],
         );
         assert_eq!(cap_tool_result_block(big.clone(), 0), big);
+    }
+
+    #[test]
+    fn cap_tool_result_keeps_small_caption_beside_large_image() {
+        // Without this: a Read result whose pixels alone exceed the cap had
+        // its caption wrapped in a bogus "0 bytes truncated, re-run the
+        // tool" notice, sending the model back to Read the file again.
+        let block = ContentBlock::tool_result(
+            ToolUseId::new("c1"),
+            vec![ContentBlock::text("cat.png:"), png_block(400_000)],
+        );
+        let capped = cap_tool_result_block(block.clone(), 100_000);
+        assert_eq!(capped, block, "text under the cap must pass through");
+        // With no caption at all there is nothing to truncate either.
+        let image_only = ContentBlock::tool_result(ToolUseId::new("c1"), vec![png_block(400_000)]);
+        let capped = cap_tool_result_block(image_only.clone(), 100_000);
+        assert_eq!(capped, image_only, "image-only result must pass through");
+    }
+
+    #[test]
+    fn cap_tool_result_still_truncates_text_beside_an_image() {
+        // Without this: a tool result carrying an image could skip the clamp,
+        // letting hundreds of KB of text beside a thumbnail into the context
+        // unbounded — or lose the image once its text was previewed.
+        let block = ContentBlock::tool_result(
+            ToolUseId::new("c1"),
+            vec![ContentBlock::text("x".repeat(300_000)), png_block(1000)],
+        );
+        let capped = cap_tool_result_block(block, 100_000);
+        match &capped {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.len(), 2, "preview + image");
+                assert!(result_body_text(&capped).contains("bytes truncated"));
+                assert!(matches!(&content[1], ContentBlock::Image { .. }));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4992,13 +5183,297 @@ mod history_window_tests {
         ];
         let out = enforce_history_byte_cap(msgs, 1_500_000, 6, 200 * 1024);
         let tool_msg = out.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
-        let len = tool_result_text_len(&tool_msg.content);
+        let len = tool_result_content_bytes(&tool_msg.content);
         assert!(
             len <= 200 * 1024 + 256,
             "recent oversized result clamped, got {len}"
         );
         // tool_use_id preserved → still answers c1.
         assert_eq!(answered_ids(tool_msg), vec!["c1".to_string()]);
+    }
+
+    /// A base64 PNG image block whose payload is `b64_len` bytes.
+    fn png_block(b64_len: usize) -> ContentBlock {
+        ContentBlock::Image {
+            source: snaca_core::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "A".repeat(b64_len),
+            },
+        }
+    }
+
+    fn image_result(id: &str, b64_len: usize) -> Message {
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new(id),
+                vec![png_block(b64_len)],
+            )],
+        )
+    }
+
+    fn has_image(m: &Message) -> bool {
+        m.content.iter().any(|b| match b {
+            ContentBlock::Image { .. } => true,
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Image { .. })),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn byte_cap_stops_mid_result_once_under() {
+        // Without this: fresh images over the cap in the protected tail made
+        // the drop pass remove the prompt, the tool_use and the result —
+        // the model got an empty history — and with the budget checked only
+        // between blocks, one result carrying two 900 KB images lost both,
+        // though clearing the first already fit the 1.5 MB cap.
+        let msgs = vec![
+            u("compare these"),
+            a_call("c1", "Screenshot"),
+            Message::new(
+                Role::Tool,
+                vec![ContentBlock::tool_result(
+                    ToolUseId::new("c1"),
+                    vec![png_block(900_000), png_block(900_000)],
+                )],
+            ),
+        ];
+        let out = enforce_history_byte_cap(msgs, 1_500_000, 6, 200 * 1024);
+        assert_eq!(out.len(), 3, "nothing dropped: {out:#?}");
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "compare these")
+        );
+        assert_eq!(answered_ids(&out[2]), vec!["c1".to_string()]);
+        let ContentBlock::ToolResult { content, .. } = &out[2].content[0] else {
+            panic!("expected tool_result");
+        };
+        assert!(matches!(&content[0], ContentBlock::Text { text } if text == IMAGE_CLEARED_MARKER));
+        assert!(
+            matches!(&content[1], ContentBlock::Image { .. }),
+            "second image kept"
+        );
+    }
+
+    #[test]
+    fn tail_overflow_trims_earlier_history_only_as_far_as_needed() {
+        // Without this (tail images stripped only after the old-history
+        // phases): with the tail alone over the cap, the total can't fit
+        // until the tail shrinks, so every earlier tool result is cleared
+        // first — though stripping one tail image was all it took.
+        let msgs = vec![
+            u("goal"),
+            a_call("c0", "Bash"),
+            tr("c0", &"x".repeat(100_000)),
+            u("compare these two"),
+            a_call("c1", "Read"),
+            image_result("c1", 900_000),
+            a_call("c2", "Read"),
+            image_result("c2", 900_000),
+        ];
+        let out = enforce_history_byte_cap(msgs, 1_500_000, 4, 0);
+        assert_eq!(out.len(), 8, "nothing dropped: {out:#?}");
+        assert_eq!(
+            result_body_text(&out[2].content[0]).len(),
+            100_000,
+            "earlier result kept"
+        );
+        assert!(!has_image(&out[5]), "older tail image stripped");
+        assert!(has_image(&out[7]), "newest image kept");
+    }
+
+    #[test]
+    fn retire_keeps_newest_tool_images_but_never_the_current_loop() {
+        // Without this: every image a thread ever Read is re-sent (and
+        // billed) on every request until the byte cap bites — while a turn
+        // that just Read four images to compare must still see all four.
+        let mut msgs = Vec::new();
+        for i in 0..4 {
+            let id = format!("old{i}");
+            msgs.push(u("look"));
+            msgs.push(a_call(&id, "Read"));
+            msgs.push(image_result(&id, 10));
+        }
+        msgs.push(u("compare four"));
+        for i in 0..4 {
+            let id = format!("new{i}");
+            msgs.push(a_call(&id, "Read"));
+            msgs.push(image_result(&id, 10));
+        }
+        let out = retire_stale_tool_images(msgs, MAX_KEEP_TOOL_IMAGES);
+        let images: Vec<bool> = out
+            .iter()
+            .filter(|m| matches!(m.role, Role::Tool))
+            .map(has_image)
+            .collect();
+        // Four earlier-turn images all retired (the current loop already
+        // fills the newest-3 budget); the current loop's four all kept.
+        assert_eq!(images, [false, false, false, false, true, true, true, true]);
+        let retired = out.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
+        assert!(result_body_text(&retired.content[0]).contains("Read the file again"));
+    }
+
+    #[test]
+    fn engine_feedback_messages_do_not_start_a_turn() {
+        // Without this: either feedback message could lose its prefix and
+        // pass for the user's next request, splitting the tool loop it was
+        // injected into (see `current_turn_start`).
+        let failure = ToolFailureEvent {
+            tool: "Read".into(),
+            input: json!({}),
+            input_signature: String::new(),
+            error: "boom".into(),
+        };
+        for text in [
+            malformed_args_feedback("Read", "expected `,`"),
+            repeated_tool_failure_feedback(&failure, 2),
+        ] {
+            assert!(!u(&text).starts_turn(), "{text}");
+        }
+    }
+
+    #[test]
+    fn retire_does_not_treat_engine_feedback_as_a_new_turn() {
+        // Without this: retry feedback the engine injects mid-loop (a
+        // Role::User message) would pass for the turn start, and an image
+        // the loop Read before it would be retired while the model is still
+        // comparing it.
+        let mut msgs = vec![u("compare these four")];
+        for i in 0..4 {
+            let id = format!("c{i}");
+            msgs.push(a_call(&id, "Read"));
+            msgs.push(image_result(&id, 10));
+            if i == 0 {
+                msgs.push(u(&repeated_tool_failure_feedback(
+                    &ToolFailureEvent {
+                        tool: "Read".into(),
+                        input: json!({}),
+                        input_signature: String::new(),
+                        error: "boom".into(),
+                    },
+                    2,
+                )));
+            }
+        }
+        let out = retire_stale_tool_images(msgs, MAX_KEEP_TOOL_IMAGES);
+        assert!(
+            out.iter()
+                .filter(|m| matches!(m.role, Role::Tool))
+                .all(has_image),
+            "all four current-loop images kept: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn retire_keeps_the_newest_three_from_earlier_turns() {
+        // Without this: an off-by-one in the newest-3 rule kept one image too
+        // few (gone a turn after the model saw it) or one too many (a stale
+        // image re-sent and billed on every request).
+        let mut msgs = Vec::new();
+        for i in 0..5 {
+            let id = format!("t{i}");
+            msgs.push(u("look"));
+            msgs.push(a_call(&id, "Read"));
+            msgs.push(image_result(&id, 10));
+        }
+        msgs.push(u("thanks"));
+        let out = retire_stale_tool_images(msgs, MAX_KEEP_TOOL_IMAGES);
+        let images: Vec<bool> = out
+            .iter()
+            .filter(|m| matches!(m.role, Role::Tool))
+            .map(has_image)
+            .collect();
+        assert_eq!(images, [false, false, true, true, true]);
+    }
+
+    #[test]
+    fn byte_cap_drops_stale_text_before_touching_a_fresh_image() {
+        // Without this (images stripped, tail included, before any old
+        // message is dropped): ~1.4 MB of stale chat costs the user the
+        // image they just asked about. With the default keep_recent = 6 a
+        // short thread is all "recent", so the earlier turn has to count
+        // as earlier history even inside that window.
+        for keep_recent in [3, 6] {
+            let msgs = vec![
+                u(&"old ".repeat(350_000)),
+                u("look at cat.png"),
+                a_call("c1", "Read"),
+                image_result("c1", 200_000),
+            ];
+            let out = enforce_history_byte_cap(msgs, 1_500_000, keep_recent, 0);
+            assert_eq!(out.len(), 3, "keep_recent={keep_recent}: {out:#?}");
+            assert!(
+                matches!(&out[0].content[0], ContentBlock::Text { text } if text == "look at cat.png")
+            );
+            assert!(
+                has_image(&out[2]),
+                "keep_recent={keep_recent}: fresh image kept"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_cap_never_drops_the_request_being_answered() {
+        // Without this: once a tool loop outgrows keep_recent, the tail was
+        // only made to fit on its own, so dropping leading messages took the
+        // user's request first — the model kept the images and lost the
+        // question it was answering.
+        let msgs = vec![
+            u(&format!("compare these {}", "x".repeat(5_000))),
+            a_call("c1", "Read"),
+            image_result("c1", 600_000),
+            a_call("c2", "Read"),
+            image_result("c2", 999_000),
+        ];
+        let out = enforce_history_byte_cap(msgs, 1_000_000, 2, 0);
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text { text } if text.starts_with("compare these")),
+            "{out:#?}"
+        );
+        // Stripping the newest image is what makes the request fit beside
+        // the tail; nothing else needs to go.
+        assert_eq!(out.len(), 5, "nothing dropped: {out:#?}");
+        assert!(has_image(&out[2]) && !has_image(&out[4]));
+    }
+
+    #[test]
+    fn earlier_images_go_before_earlier_text() {
+        // Without this: the old result's notes were cleared along with its
+        // pixels, though dropping the pixels alone already fit — the model
+        // loses text it can't get back by looking at the file again.
+        let msgs = vec![
+            u("look"),
+            a_call("c1", "Read"),
+            Message::new(
+                Role::Tool,
+                vec![ContentBlock::tool_result(
+                    ToolUseId::new("c1"),
+                    vec![ContentBlock::text("x".repeat(50_000)), png_block(900_000)],
+                )],
+            ),
+            a("done"),
+            u("next"),
+            a("ok"),
+        ];
+        let out = enforce_history_byte_cap(msgs, 900_000, 2, 0);
+        assert!(!has_image(&out[2]), "old image stripped");
+        assert!(
+            result_body_text(&out[2].content[0]).contains(&"x".repeat(50_000)),
+            "old text kept"
+        );
+    }
+
+    #[test]
+    fn dropping_past_the_request_takes_what_follows_it() {
+        // Without this: with the request pinned, the drop loop must remove
+        // the message after it rather than stall or drop the request.
+        let big = "x".repeat(5_000);
+        let msgs = vec![u("q"), a(&big), a(&big), a("keep")];
+        let out = enforce_history_byte_cap(msgs, 6_000, 1, 0);
+        assert!(has_text(&out, "q"), "request kept: {out:#?}");
+        assert!(has_text(&out, "keep"), "tail kept: {out:#?}");
+        assert_eq!(out.len(), 3);
     }
 }
 

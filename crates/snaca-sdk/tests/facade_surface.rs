@@ -32,8 +32,8 @@ use snaca_sdk::{
 
 // Tool + host reverse-RPC surface (R2/R3/R6).
 use snaca_sdk::{
-    ApprovalRequirement, HostContext, HostContextError, Tool, ToolCapabilities, ToolContext,
-    ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
+    ApprovalRequirement, HostContext, HostContextError, ImageLimits, Tool, ToolCapabilities,
+    ToolContext, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
 };
 
 // State surface incl. R5 sidecar row + write inputs (M1 uplift).

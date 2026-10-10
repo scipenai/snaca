@@ -6,6 +6,8 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use snaca_sdk::llm::LlmProvider;
+use snaca_tools_api::ImageLimits;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -255,6 +257,14 @@ pub struct LlmSection {
     /// Defaults to `"2023-06-01"`.
     #[serde(default)]
     pub anthropic_version: Option<String>,
+    /// Embed images (user messages, tool results) so vision-capable
+    /// models can see them. Defaults: `true` for `anthropic`, `false`
+    /// for `deepseek` (whose hosted models are text-only — flip to
+    /// `true` when `base_url` points at a vision-capable
+    /// OpenAI-compatible endpoint). With this off,
+    /// images degrade to `[image omitted: …]` placeholder text.
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
 
     /// Total attempts the retry wrapper will make for one round trip
     /// before surfacing the last transient error to the engine.
@@ -276,6 +286,15 @@ pub struct LlmSection {
     /// `0.5` = up to 50 % jitter added. Default 0.5.
     #[serde(default)]
     pub retry_jitter_ratio: Option<f64>,
+}
+
+impl LlmSection {
+    /// `supports_vision` as the client applies it: unset means on for
+    /// `anthropic` and off for `deepseek`.
+    pub fn effective_supports_vision(&self) -> bool {
+        self.supports_vision
+            .unwrap_or(!matches!(self.provider.parse(), Ok(LlmProvider::DeepSeek)))
+    }
 }
 
 fn default_provider() -> String {
@@ -392,7 +411,8 @@ pub struct EngineSection {
     /// Compaction handles the steady-state case but only fires after
     /// a successful turn; this cap protects against single huge
     /// tool_results / imports overwhelming the context window before
-    /// compaction can run. Default 1.5 MiB.
+    /// compaction can run. Default 1.5 MB, i.e. 1 500 000 bytes
+    /// ([`DEFAULT_HISTORY_MAX_BYTES`]).
     #[serde(default)]
     pub history_max_bytes: Option<usize>,
 
@@ -468,6 +488,51 @@ pub struct EngineSection {
     /// veto. Default `false`.
     #[serde(default)]
     pub memory_write_approval: Option<bool>,
+
+    /// Per-image budget for images a tool returns, measured on the
+    /// base64 payload (the unit `history_max_bytes` uses; same as hermes's
+    /// `vision.embed_target_bytes`). Read passes smaller PNG / JPEG /
+    /// static GIF / WebP through and downscales / re-encodes everything
+    /// else (animated GIFs: first frame only) to fit.
+    /// Raise it for text-heavy screenshots or scans that blur at the
+    /// default; lower it for tight context budgets. Must lie in
+    /// 64 KiB..=5 MiB and be at most half of `history_max_bytes` —
+    /// otherwise the history byte cap would strip a fresh image before
+    /// the model ever sees it. Default 256 KiB, shrunk automatically to
+    /// fit when only `history_max_bytes` was lowered (see
+    /// [`EngineSection::effective_image_max_bytes`]).
+    #[serde(default)]
+    pub image_max_bytes: Option<usize>,
+
+    /// Longest-edge cap in pixels for images a tool returns. Must lie in
+    /// 256..=8000. Default 1568 (Anthropic's recommended maximum).
+    #[serde(default)]
+    pub image_max_edge_px: Option<u32>,
+}
+
+/// Default for `[engine] history_max_bytes`. Shared by runtime wiring and
+/// the image-budget validation that has to compare against it.
+pub const DEFAULT_HISTORY_MAX_BYTES: usize = 1_500_000;
+
+impl EngineSection {
+    /// The image budget actually applied: the configured
+    /// `image_max_bytes`, or else the default shrunk to half of
+    /// `history_max_bytes` (never below `ImageLimits::MIN_BYTES`, the
+    /// floor tools clamp to anyway — so what the admin snapshot reports
+    /// is what Read uses). The shrink keeps configs that only lowered the
+    /// history cap (before this knob existed) starting up, without
+    /// letting the cap strip every fresh image.
+    pub fn effective_image_max_bytes(&self) -> usize {
+        if let Some(n) = self.image_max_bytes {
+            return n;
+        }
+        match self.history_max_bytes.unwrap_or(DEFAULT_HISTORY_MAX_BYTES) {
+            0 => ImageLimits::DEFAULT_MAX_BYTES,
+            history => ImageLimits::DEFAULT_MAX_BYTES
+                .min(history / 2)
+                .max(ImageLimits::MIN_BYTES),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -688,6 +753,7 @@ impl Config {
                 self.llm.provider
             );
         }
+        self.validate_image_budget()?;
         for p in &self.plugins {
             if p.name.is_empty() {
                 anyhow::bail!("plugins[].name must be non-empty");
@@ -707,6 +773,49 @@ impl Config {
             if s.command.is_empty() {
                 anyhow::bail!("mcp[{}].command must be non-empty", s.name);
             }
+        }
+        Ok(())
+    }
+
+    /// `[engine] image_max_bytes` / `image_max_edge_px`: each in range,
+    /// and an explicitly set byte budget small enough that the history
+    /// byte cap can hold a fresh capture. Failing at startup beats the
+    /// alternative — a model that silently never sees any image. (An
+    /// unset budget is derived to fit; see `effective_image_max_bytes`.)
+    fn validate_image_budget(&self) -> Result<()> {
+        if let Some(n) = self.engine.image_max_bytes {
+            if !(ImageLimits::MIN_BYTES..=ImageLimits::MAX_BYTES).contains(&n) {
+                anyhow::bail!(
+                    "engine.image_max_bytes = {n} is out of range; valid values are {}..={}",
+                    ImageLimits::MIN_BYTES,
+                    ImageLimits::MAX_BYTES
+                );
+            }
+        }
+        if let Some(n) = self.engine.image_max_edge_px {
+            if !(ImageLimits::MIN_EDGE_PX..=ImageLimits::MAX_EDGE_PX).contains(&n) {
+                anyhow::bail!(
+                    "engine.image_max_edge_px = {n} is out of range; valid values are {}..={}",
+                    ImageLimits::MIN_EDGE_PX,
+                    ImageLimits::MAX_EDGE_PX
+                );
+            }
+        }
+        let Some(image) = self.engine.image_max_bytes else {
+            return Ok(());
+        };
+        let history = self
+            .engine
+            .history_max_bytes
+            .unwrap_or(DEFAULT_HISTORY_MAX_BYTES);
+        // 0 disables the history cap, so there is nothing to collide with.
+        if history > 0 && image * 2 > history {
+            anyhow::bail!(
+                "engine.image_max_bytes = {image} is more than half of \
+                 engine.history_max_bytes = {history}; the history byte cap would strip a \
+                 fresh image before the model sees it. Lower image_max_bytes or raise \
+                 history_max_bytes"
+            );
         }
         Ok(())
     }
@@ -862,6 +971,87 @@ api_key = "test-key"
         assert_eq!(cfg.llm.model, "deepseek-chat");
         assert_eq!(cfg.server.http_listen, "127.0.0.1:8080");
         assert!(cfg.plugins.is_empty());
+    }
+
+    fn engine_config(engine: &str) -> Result<Config> {
+        let f = write_temp(&format!(
+            r#"
+[server]
+data_root = "./data"
+[tenant]
+id = "default"
+[llm]
+api_key = "x"
+[engine]
+{engine}
+"#
+        ));
+        Config::load(f.path())
+    }
+
+    #[test]
+    fn image_budget_accepts_in_range_values() {
+        // Without this: a valid image budget (e.g. 2048 px for screenshots)
+        // could be refused at startup, and the server would not start.
+        let cfg = engine_config("image_max_bytes = 524288\nimage_max_edge_px = 2048").unwrap();
+        assert_eq!(cfg.engine.image_max_bytes, Some(524_288));
+        assert_eq!(cfg.engine.image_max_edge_px, Some(2048));
+    }
+
+    #[test]
+    fn image_budget_rejects_out_of_range_values() {
+        // Without this: an out-of-range image budget started silently, Read
+        // clamped it to another value, and the admin view showed the wrong
+        // one.
+        for (line, key) in [
+            ("image_max_bytes = 1024", "engine.image_max_bytes"),
+            ("image_max_bytes = 6000000", "engine.image_max_bytes"),
+            ("image_max_edge_px = 100", "engine.image_max_edge_px"),
+            ("image_max_edge_px = 9000", "engine.image_max_edge_px"),
+        ] {
+            let err = engine_config(line).unwrap_err().to_string();
+            assert!(
+                err.contains(key) && err.contains("out of range"),
+                "{line}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_budget_must_fit_history_cap() {
+        // Without this: an image budget over half the history cap was
+        // accepted, and the byte cap stripped fresh images before the model
+        // saw them. 1 MiB is more than half the default 1.5 MB cap.
+        let err = engine_config("image_max_bytes = 1048576")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("history_max_bytes"), "{err}");
+        // Raising the history cap makes the same budget valid…
+        engine_config("image_max_bytes = 1048576\nhistory_max_bytes = 4000000").unwrap();
+        // …and a disabled cap (0) has nothing to collide with.
+        engine_config("image_max_bytes = 1048576\nhistory_max_bytes = 0").unwrap();
+    }
+
+    #[test]
+    fn unset_image_budget_shrinks_to_fit_a_lowered_history_cap() {
+        // Without this: a config that only lowered history_max_bytes kept
+        // the 256 KiB image default, and the byte cap stripped fresh images.
+        // Such a config must keep starting; the derived budget fits half
+        // the cap.
+        let cfg = engine_config("history_max_bytes = 500000").unwrap();
+        assert_eq!(cfg.engine.effective_image_max_bytes(), 250_000);
+        // A cap too small to halve sensibly reports the floor tools use.
+        let cfg = engine_config("history_max_bytes = 100000").unwrap();
+        assert_eq!(
+            cfg.engine.effective_image_max_bytes(),
+            ImageLimits::MIN_BYTES
+        );
+        // Untouched configs keep the plain default.
+        let cfg = engine_config("").unwrap();
+        assert_eq!(
+            cfg.engine.effective_image_max_bytes(),
+            ImageLimits::DEFAULT_MAX_BYTES
+        );
     }
 
     #[test]

@@ -124,10 +124,19 @@ pub enum WireContentBlock {
     ToolResult {
         tool_use_id: String,
         /// API allows a string or an array of blocks; we always send an
-        /// array of `text` blocks for symmetry with `WireContentBlock`.
+        /// array of `text` / `image` blocks for symmetry with
+        /// `WireContentBlock`.
         content: Vec<WireContentBlock>,
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
+    },
+    /// Image block. `snaca_core::ImageSource` already serialises to
+    /// Anthropic's exact wire shape (`{"type":"base64","media_type":...,
+    /// "data":...}` / `{"type":"url","url":...}`), so it is used
+    /// verbatim. Valid in `user` messages and inside `tool_result`
+    /// content; Anthropic never emits it in assistant responses.
+    Image {
+        source: snaca_core::ImageSource,
     },
 }
 

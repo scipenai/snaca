@@ -57,8 +57,8 @@ pub use snaca_state::{
     ThreadSummaryRow,
 };
 pub use snaca_tools_api::{
-    ApprovalRequirement, HostContext, HostContextError, Tool, ToolCapabilities, ToolContext,
-    ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
+    ApprovalRequirement, HostContext, HostContextError, ImageLimits, Tool, ToolCapabilities,
+    ToolContext, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolResult,
 };
 pub use snaca_workspace::{WorkspaceError, WorkspaceLayout};
 

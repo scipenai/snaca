@@ -11,10 +11,13 @@
 //! enqueue *two* responses: the turn's terminal assistant message + the
 //! summariser's reply.
 
-use snaca_core::{ContentBlock, Message, MessageId, ProjectId, Role, TenantId, ThreadId, Usage};
+use snaca_core::{
+    ContentBlock, ImageSource, Message, MessageId, ProjectId, Role, SessionId, TenantId, ThreadId,
+    ToolUseId, Usage,
+};
 use snaca_engine::{Engine, EngineConfig, TurnRequest};
 use snaca_llm::{MessageResponse, StopReason};
-use snaca_state::Database;
+use snaca_state::{Database, NewMessage, NewThread};
 use snaca_tools_api::ToolRegistryBuilder;
 use snaca_workspace::WorkspaceLayout;
 use std::sync::Arc;
@@ -390,6 +393,124 @@ async fn protect_first_n_preserves_head_messages() {
     assert!(
         head_idx < preamble_idx,
         "preserved head must precede the SUMMARY preamble (got head={head_idx} preamble={preamble_idx})"
+    );
+}
+
+/// Append `content` to `thread` as `role`, returning the new row's id.
+async fn seed(
+    db: &Database,
+    thread: &ThreadId,
+    role: Role,
+    content: Vec<ContentBlock>,
+) -> MessageId {
+    db.append_message(&NewMessage {
+        thread_id: thread.clone(),
+        session_id: SessionId::new(),
+        role,
+        content,
+    })
+    .await
+    .unwrap()
+    .id
+}
+
+/// A Read call and its image result, seeded as one tool round trip.
+async fn seed_image_read(db: &Database, thread: &ThreadId, id: &str) {
+    seed(
+        db,
+        thread,
+        Role::Assistant,
+        vec![ContentBlock::tool_use(id, "Read", serde_json::json!({}))],
+    )
+    .await;
+    let image = ContentBlock::Image {
+        source: ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "A".repeat(1000),
+        },
+    };
+    seed(
+        db,
+        thread,
+        Role::Tool,
+        vec![ContentBlock::tool_result(ToolUseId::new(id), vec![image])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn preserved_head_goes_through_the_image_defences() {
+    // Without this: the head kept by `protect_first_n` skipped retirement,
+    // the byte cap and collapse, so an image Read in the thread's first
+    // turn was re-sent on every request for the rest of its life.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = WorkspaceLayout::new(tmp.path()).unwrap();
+    let db = Database::open_in_memory().await.unwrap();
+    let thread = ThreadId::new("t-head-image");
+    db.insert_thread(&NewThread {
+        id: thread.clone(),
+        tenant_id: TenantId::new("tenant_a"),
+        project_id: ProjectId::from_raw("proj_x"),
+    })
+    .await
+    .unwrap();
+    let text = |t: &str| vec![ContentBlock::text(t)];
+
+    // Head: the first turn Reads an image.
+    seed(&db, &thread, Role::User, text("look at first.png")).await;
+    seed_image_read(&db, &thread, "head").await;
+    // Compacted band.
+    let from = seed(&db, &thread, Role::User, text("middle")).await;
+    let until = seed(&db, &thread, Role::Assistant, text("middle reply")).await;
+    // Live: three later turns, an image each — the newest-3 budget.
+    for i in 0..3 {
+        seed(&db, &thread, Role::User, text(&format!("look at {i}.png"))).await;
+        seed_image_read(&db, &thread, &format!("live{i}")).await;
+    }
+    db.set_thread_summary(&thread, "SUMMARY", &until, Some(&from), 2, 0)
+        .await
+        .unwrap();
+
+    let llm = Arc::new(MockLlmClient::new());
+    let mut cfg = EngineConfig::default_for("mock-model");
+    cfg.compact_after_input_tokens = None;
+    cfg.protect_first_n = 3;
+    let tools = ToolRegistryBuilder::default().add(EchoTool).build();
+    let engine = Engine::new(llm.clone(), tools, db, workspace, cfg);
+    llm.enqueue(assistant_text("ok"));
+    engine
+        .handle_turn(turn_request("t-head-image", "thanks"))
+        .await
+        .unwrap();
+
+    let req = llm.observed_requests().pop().unwrap();
+    let results: Vec<(String, bool)> = req
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Some((
+                tool_use_id.as_str().to_string(),
+                content
+                    .iter()
+                    .any(|c| matches!(c, ContentBlock::Image { .. })),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("head".to_string(), false),
+            ("live0".to_string(), true),
+            ("live1".to_string(), true),
+            ("live2".to_string(), true),
+        ],
+        "head image retired as the 4th-newest"
     );
 }
 

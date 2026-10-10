@@ -1,6 +1,7 @@
 //! Per-call context passed to tool implementations.
 
 use crate::host_context::HostContext;
+use crate::image_limits::ImageLimits;
 use snaca_core::{ProjectId, SessionId, TenantId};
 use std::any::Any;
 use std::collections::HashMap;
@@ -129,6 +130,10 @@ struct Inner {
     /// `snaca-cli memory approve|reject`. Default `false` (write
     /// directly). Mirrors hermes's `write_approval` switch.
     memory_write_approval: bool,
+    /// Budget tools normalise captured images to (Read's downscale /
+    /// re-encode). The engine injects its configured value per turn;
+    /// `ImageLimits::default()` otherwise.
+    image_limits: ImageLimits,
     /// Typed reverse-RPC handle to the embedding host (R2). Unlike the
     /// `Arc<dyn Any>` slots above, `HostContext` is defined in this crate, so
     /// the accessor is typed rather than downcast. `None` (the default) makes
@@ -160,6 +165,7 @@ impl ToolContext {
                 cancellation_token: None,
                 db_handle: None,
                 memory_write_approval: false,
+                image_limits: ImageLimits::default(),
                 host_context: None,
             }),
         }
@@ -264,6 +270,11 @@ impl ToolContext {
         self.with_inner(|inner| inner.memory_write_approval = on)
     }
 
+    /// Set the per-image budget tools normalise captured images to.
+    pub fn with_image_limits(self, limits: ImageLimits) -> Self {
+        self.with_inner(|inner| inner.image_limits = limits)
+    }
+
     /// Attach a typed reverse-RPC handle to the embedding host (R2/R3). Tools
     /// call `host_context()` to reach it. The engine injects one per turn via
     /// its `HostContextFactory`; the transport lives in the host.
@@ -276,6 +287,12 @@ impl ToolContext {
     /// caller of this getter.
     pub fn memory_write_approval(&self) -> bool {
         self.inner.memory_write_approval
+    }
+
+    /// Per-image budget for tools that return pixels. Not range-checked
+    /// here — tools apply `ImageLimits::clamped` before using it.
+    pub fn image_limits(&self) -> ImageLimits {
+        self.inner.image_limits
     }
 
     /// Opaque getter for the attached task registry. Caller downcasts

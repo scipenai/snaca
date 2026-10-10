@@ -10,6 +10,8 @@ description = "SNACA LLM provider abstraction (DeepSeek + Anthropic)"
 
 [dependencies]
 snaca-core.workspace = true
+# Decoding inline GIFs at the send-time gate to detect animation.
+data-encoding.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 futures.workspace = true

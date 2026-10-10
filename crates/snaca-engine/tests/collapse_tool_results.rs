@@ -10,6 +10,7 @@
 //! - large tool_results from collapsible tools shrink to a marker
 //! - large tool_results from *unknown* tools stay verbatim (safe default)
 //! - errors never collapse
+//! - only text collapses — images beside it stay
 //! - threshold = 0 disables collapse entirely
 
 use chrono::Utc;
@@ -240,5 +241,85 @@ fn keep_recent_zero_collapses_everything_eligible() {
     assert!(
         body.starts_with("<Grep result:"),
         "expected Grep marker, got: {body}"
+    );
+}
+
+fn read_result_with_image(tool_use_id: &str, text: &str, b64_len: usize) -> Message {
+    Message {
+        id: MessageId::new(),
+        role: Role::Tool,
+        content: vec![ContentBlock::tool_result(
+            ToolUseId::new(tool_use_id),
+            vec![ContentBlock::text(text), png(b64_len)],
+        )],
+        created_at: Utc::now(),
+    }
+}
+
+fn png(b64_len: usize) -> ContentBlock {
+    ContentBlock::Image {
+        source: snaca_core::ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "A".repeat(b64_len),
+        },
+    }
+}
+
+fn tool_result_body(m: &Message) -> &[ContentBlock] {
+    match &m.content[0] {
+        ContentBlock::ToolResult { content, .. } => content,
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn old_image_result_is_left_to_the_image_defences() {
+    // Without this: collapse would weigh the pixels, so an image the
+    // current turn is still working with — a long tool loop pushes it out
+    // of the `keep_recent` tail — would be elided, and the model would
+    // answer about a picture it can no longer see. Retiring images is the
+    // job of `retire_stale_tool_images` and the byte cap, which know the
+    // turn boundary.
+    let messages = vec![
+        user("compare photo.png with the next one"),
+        assistant_calling("call-1", "Read"),
+        read_result_with_image("call-1", "png 64x64", 4096),
+        assistant_calling("call-2", "Read"),
+        // Kept-tail pair:
+        tool_result("call-2", "small"),
+        assistant_text("ok"),
+    ];
+
+    let out = collapse_old_tool_results(messages, 2, 1024);
+
+    let body = tool_result_body(&out[2]);
+    assert!(
+        matches!(body, [ContentBlock::Text { text }, ContentBlock::Image { .. }] if text == "png 64x64"),
+        "image result must stay verbatim, got: {body:?}"
+    );
+}
+
+#[test]
+fn collapsing_large_text_keeps_the_images_beside_it() {
+    // Without this: eliding a big text body would take its images with it,
+    // bypassing the newest-3 rule and the turn boundary that govern them.
+    let big = "x".repeat(2048);
+    let messages = vec![
+        user("hi"),
+        assistant_calling("call-1", "Read"),
+        read_result_with_image("call-1", &big, 4096),
+        assistant_text("done"),
+        // Kept-tail pair:
+        user("next"),
+        assistant_text("ok"),
+    ];
+
+    let out = collapse_old_tool_results(messages, 2, 1024);
+
+    let body = tool_result_body(&out[2]);
+    assert!(
+        matches!(body, [ContentBlock::Text { text }, ContentBlock::Image { .. }]
+            if text.starts_with("<Read result: 2048 bytes elided")),
+        "text collapsed, image kept: {body:?}"
     );
 }

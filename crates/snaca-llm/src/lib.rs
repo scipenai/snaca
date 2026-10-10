@@ -12,12 +12,14 @@
 //! - [`response`] — `MessageResponse` + `StopReason`
 //! - [`client`]   — `LlmClient` trait + `ProviderCaps`
 //! - [`deepseek`] — DeepSeek client (OpenAI-compatible) + canonical conversions
+//! - `images` — shared image-block helpers for provider converters (crate-private)
 
 pub mod anthropic;
 pub mod classify;
 pub mod client;
 pub mod deepseek;
 pub mod error;
+mod images;
 pub mod request;
 pub mod response;
 pub mod retry;

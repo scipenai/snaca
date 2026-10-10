@@ -57,6 +57,22 @@ pub enum ImageSource {
     Base64 { media_type: String, data: String },
 }
 
+impl ImageSource {
+    /// Inline media types every supported vision provider accepts:
+    /// Anthropic's set, which OpenAI also takes — except animated GIFs
+    /// (OpenAI wants static ones). A media type can't express animation,
+    /// so the Read tool keeps only a GIF's first frame and the send-time
+    /// gate checks GIF payloads for extra frames on OpenAI-family wires
+    /// (history and custom tools bypass Read). The single source
+    /// for both the provider send-time gate and the Read tool's
+    /// passthrough check, so a format one accepts the other never refuses.
+    pub const INLINE_MEDIA_TYPES: [&'static str; 4] =
+        ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+    /// Per-image cap on an inline base64 payload (Anthropic's 5 MB limit).
+    pub const MAX_INLINE_BASE64_BYTES: usize = 5 * 1024 * 1024;
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }

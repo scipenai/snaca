@@ -17,6 +17,7 @@ type FormState = {
   llmApiKey: string;
   llmModel: string;
   llmBaseUrl: string;
+  llmSupportsVision: string;
   llmTimeoutSecs: string;
   llmAnthropicVersion: string;
   llmRetryMaxAttempts: string;
@@ -31,6 +32,8 @@ type FormState = {
   maxTokens: string;
   historyLimit: string;
   historyMaxBytes: string;
+  imageMaxBytes: string;
+  imageMaxEdgePx: string;
   turnTimeoutSecs: string;
   concurrentToolLimit: string;
   collapseToolResultsThreshold: string;
@@ -330,6 +333,13 @@ export function System() {
                 <TextField label={t("system.model")} value={form.llmModel} onChange={(v) => updateField("llmModel", v)} hint={t("system.help.model")} />
                 <TextField label={t("system.api_key")} value={form.llmApiKey} onChange={(v) => updateField("llmApiKey", v)} placeholder="${DEEPSEEK_API_KEY}" hint={t("system.help.api_key")} />
                 <TextField label={t("system.base_url")} value={form.llmBaseUrl} onChange={(v) => updateField("llmBaseUrl", v)} placeholder="https://api.deepseek.com" hint={t("system.help.base_url")} />
+                <SelectField
+                  label={t("system.supports_vision")}
+                  value={form.llmSupportsVision}
+                  onChange={(v) => updateField("llmSupportsVision", v)}
+                  options={["auto", "true", "false"]}
+                  hint={t("system.help.supports_vision")}
+                />
                 <TextField label={t("system.timeout_secs")} value={form.llmTimeoutSecs} onChange={(v) => updateField("llmTimeoutSecs", v)} inputMode="numeric" hint={t("system.help.timeout_secs")} />
                 <TextField label={t("system.tavily_api_key")} value={form.tavilyApiKey} onChange={(v) => updateField("tavilyApiKey", v)} placeholder="${TAVILY_API_KEY}" hint={t("system.help.tavily_api_key")} />
                 <TextField label={t("system.anthropic_version")} value={form.llmAnthropicVersion} onChange={(v) => updateField("llmAnthropicVersion", v)} placeholder="2023-06-01" hint={t("system.help.anthropic_version")} />
@@ -348,7 +358,9 @@ export function System() {
                 <TextField label={t("system.max_iterations")} value={form.maxIterations} onChange={(v) => updateField("maxIterations", v)} inputMode="numeric" hint={t("system.help.max_iterations")} />
                 <TextField label={t("system.max_tokens")} value={form.maxTokens} onChange={(v) => updateField("maxTokens", v)} inputMode="numeric" hint={t("system.help.max_tokens")} />
                 <TextField label={t("system.history_limit")} value={form.historyLimit} onChange={(v) => updateField("historyLimit", v)} inputMode="numeric" hint={t("system.help.history_limit")} />
-                <TextField label={t("system.history_max_bytes")} value={form.historyMaxBytes} onChange={(v) => updateField("historyMaxBytes", v)} inputMode="numeric" placeholder="1572864" hint={t("system.help.history_max_bytes")} />
+                <TextField label={t("system.history_max_bytes")} value={form.historyMaxBytes} onChange={(v) => updateField("historyMaxBytes", v)} inputMode="numeric" placeholder="1500000" hint={t("system.help.history_max_bytes")} />
+                <TextField label={t("system.image_max_bytes")} value={form.imageMaxBytes} onChange={(v) => updateField("imageMaxBytes", v)} inputMode="numeric" placeholder="262144" hint={t("system.help.image_max_bytes")} />
+                <TextField label={t("system.image_max_edge_px")} value={form.imageMaxEdgePx} onChange={(v) => updateField("imageMaxEdgePx", v)} inputMode="numeric" placeholder="1568" hint={t("system.help.image_max_edge_px")} />
                 <TextField label={t("system.turn_timeout_secs")} value={form.turnTimeoutSecs} onChange={(v) => updateField("turnTimeoutSecs", v)} inputMode="numeric" hint={t("system.help.turn_timeout_secs")} />
                 <TextField label={t("system.concurrent_tool_limit")} value={form.concurrentToolLimit} onChange={(v) => updateField("concurrentToolLimit", v)} inputMode="numeric" placeholder="5" hint={t("system.help.concurrent_tool_limit")} />
                 <TextField label={t("system.collapse_tool_results_threshold")} value={form.collapseToolResultsThreshold} onChange={(v) => updateField("collapseToolResultsThreshold", v)} inputMode="numeric" placeholder="1024" hint={t("system.help.collapse_tool_results_threshold")} />
@@ -656,6 +668,7 @@ function formFromToml(toml: string): FormState {
     llmApiKey: getString(toml, "llm", "api_key") ?? "",
     llmModel: getString(toml, "llm", "model") ?? "deepseek-chat",
     llmBaseUrl: getString(toml, "llm", "base_url") ?? "",
+    llmSupportsVision: String(getBoolean(toml, "llm", "supports_vision") ?? "auto"),
     llmTimeoutSecs: getScalar(toml, "llm", "timeout_secs") ?? "",
     llmAnthropicVersion: getString(toml, "llm", "anthropic_version") ?? "",
     llmRetryMaxAttempts: getScalar(toml, "llm", "retry_max_attempts") ?? "",
@@ -670,6 +683,8 @@ function formFromToml(toml: string): FormState {
     maxTokens: getScalar(toml, "engine", "max_tokens") ?? "",
     historyLimit: getScalar(toml, "engine", "history_limit") ?? "",
     historyMaxBytes: getScalar(toml, "engine", "history_max_bytes") ?? "",
+    imageMaxBytes: getScalar(toml, "engine", "image_max_bytes") ?? "",
+    imageMaxEdgePx: getScalar(toml, "engine", "image_max_edge_px") ?? "",
     turnTimeoutSecs: getScalar(toml, "engine", "turn_timeout_secs") ?? "",
     concurrentToolLimit: getScalar(toml, "engine", "concurrent_tool_limit") ?? "",
     collapseToolResultsThreshold: getScalar(toml, "engine", "collapse_tool_results_threshold") ?? "",
@@ -723,6 +738,8 @@ function applyFormField(
       return setTomlValue(toml, "llm", "model", quote(String(value)));
     case "llmBaseUrl":
       return setTomlValue(toml, "llm", "base_url", optionalString(value));
+    case "llmSupportsVision":
+      return setTomlValue(toml, "llm", "supports_vision", value === "auto" ? null : String(value));
     case "llmTimeoutSecs":
       return setTomlValue(toml, "llm", "timeout_secs", optionalNumber(value));
     case "llmAnthropicVersion":
@@ -751,6 +768,10 @@ function applyFormField(
       return setTomlValue(toml, "engine", "history_limit", optionalNumber(value));
     case "historyMaxBytes":
       return setTomlValue(toml, "engine", "history_max_bytes", optionalNumber(value));
+    case "imageMaxBytes":
+      return setTomlValue(toml, "engine", "image_max_bytes", optionalNumber(value));
+    case "imageMaxEdgePx":
+      return setTomlValue(toml, "engine", "image_max_edge_px", optionalNumber(value));
     case "turnTimeoutSecs":
       return setTomlValue(toml, "engine", "turn_timeout_secs", optionalNumber(value));
     case "concurrentToolLimit":

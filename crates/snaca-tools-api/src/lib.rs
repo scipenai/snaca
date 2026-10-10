@@ -31,6 +31,7 @@
 pub mod context;
 pub mod error;
 pub mod host_context;
+pub mod image_limits;
 pub mod output;
 pub mod registry;
 pub mod tool;
@@ -38,6 +39,7 @@ pub mod tool;
 pub use context::{OutboundFile, ReadRecord, ReadTracker, ToolContext};
 pub use error::{ToolError, ToolResult};
 pub use host_context::{HostContext, HostContextError};
+pub use image_limits::ImageLimits;
 pub use output::ToolOutput;
 pub use registry::{ToolRegistry, ToolRegistryBuilder, ToolSchema};
 pub use tool::{ApprovalRequirement, Tool, ToolCapabilities};

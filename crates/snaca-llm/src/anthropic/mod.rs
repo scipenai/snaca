@@ -53,6 +53,11 @@ pub struct AnthropicConfig {
     /// debugging or when the operator wants to compare cached vs
     /// uncached cost in isolation.
     pub enable_prompt_cache: bool,
+    /// Embed user-message and tool-result images as Anthropic `image`
+    /// blocks so vision-capable Claude models see them. Default `true`
+    /// — every Claude 3+ model is multimodal. Flip to `false` to
+    /// degrade images to placeholder text.
+    pub supports_vision: bool,
 }
 
 impl AnthropicConfig {
@@ -64,6 +69,7 @@ impl AnthropicConfig {
             anthropic_version: DEFAULT_API_VERSION.into(),
             request_timeout: DEFAULT_TIMEOUT,
             enable_prompt_cache: true,
+            supports_vision: true,
         }
     }
 
@@ -89,6 +95,11 @@ impl AnthropicConfig {
 
     pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
         self.enable_prompt_cache = enabled;
+        self
+    }
+
+    pub fn with_vision(mut self, enabled: bool) -> Self {
+        self.supports_vision = enabled;
         self
     }
 }
@@ -148,6 +159,7 @@ impl LlmClient for AnthropicClient {
             &request,
             false,
             self.config.enable_prompt_cache,
+            self.config.supports_vision,
         )?;
         debug!(
             provider = "anthropic",
@@ -196,6 +208,7 @@ impl LlmClient for AnthropicClient {
             &request,
             true,
             self.config.enable_prompt_cache,
+            self.config.supports_vision,
         )?;
         debug!(
             provider = "anthropic",

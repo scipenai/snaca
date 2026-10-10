@@ -5,11 +5,15 @@
 //!
 //! Format-aware dispatch by extension:
 //!  - `.pdf` → text extracted via `snaca_memory::pdf_extract`.
-//!  - `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` → returned
-//!    as a `ContentBlock::Image` so vision-capable models see the
-//!    pixels. Non-vision models will get an "image not viewable"
-//!    placeholder in the text fallback; that's accepted — sniffing
-//!    model capabilities is the engine's job, not the tool's.
+//!  - `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.tif` /
+//!    `.tiff` → returned as a `ContentBlock::Image` so vision-capable
+//!    models see the pixels, after `image_prep` validates and
+//!    normalises it (format sniffed from content; oversized,
+//!    non-PNG/JPEG/GIF/WebP, EXIF-rotated and animated-GIF images are
+//!    downscaled and re-encoded as JPEG). Image files get a 32 MB cap
+//!    instead of the 5 MB text cap.
+//!    Non-vision models get an `[image omitted: …]` placeholder at the
+//!    provider boundary; sniffing model capabilities is not the tool's job.
 //!  - `.ipynb` → Jupyter cells rendered as fenced code / markdown,
 //!    with outputs collapsed to a `=== output ===` segment.
 //!  - `.docx` / `.xlsx` / `.pptx` → not parsed natively. Read returns
@@ -24,7 +28,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use snaca_core::{ContentBlock, ImageSource};
 use snaca_tools_api::{
-    ApprovalRequirement, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput, ToolResult,
+    ApprovalRequirement, ImageLimits, Tool, ToolCapabilities, ToolContext, ToolError, ToolOutput,
+    ToolResult,
 };
 use snaca_workspace::resolve_within;
 use std::path::Path;
@@ -32,6 +37,19 @@ use std::path::Path;
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Images get a larger raw-file cap: phone photos and 4K screenshots
+/// routinely exceed 5 MB, and they are downscaled to the context's
+/// `ImageLimits` anyway. Decoding stays bounded by `image_prep`'s own
+/// allocation / dimension guards.
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Process-wide cap on concurrent image decodes. The engine pre-runs every
+/// read-only tool call as soon as the model finishes emitting it, without
+/// a concurrency limit, so one reply with N image Reads would otherwise
+/// decode N images at once — and a single decode can peak at several
+/// hundred MB. Sized for memory, not CPU.
+pub(crate) static IMAGE_PREP_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
 
 #[derive(Debug, Deserialize)]
 struct ReadInput {
@@ -115,7 +133,25 @@ impl Tool for ReadTool {
                 input.path
             )));
         }
-        if metadata.len() > MAX_BYTES {
+        // Format-aware dispatch keys on the lowercased extension; images
+        // are recognised up front because they get their own size cap.
+        let ext = resolved
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        let is_image = ext
+            .as_deref()
+            .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e));
+        if is_image && metadata.len() > MAX_IMAGE_BYTES {
+            // No offset/limit hint: an image can't be read in slices.
+            return Err(ToolError::Execution(format!(
+                "{} is {} bytes; refusing to read an image larger than {} bytes",
+                input.path,
+                metadata.len(),
+                MAX_IMAGE_BYTES
+            )));
+        }
+        if !is_image && metadata.len() > MAX_BYTES {
             return Err(ToolError::Execution(format!(
                 "{} is {} bytes; refusing to read more than {} bytes (use offset/limit)",
                 input.path,
@@ -136,18 +172,14 @@ impl Tool for ReadTool {
             ctx.record_read(&resolved, mtime, metadata.len());
         }
 
-        // Format-aware dispatch by lowercased extension. Falls through
-        // to plain-text rendering when the extension is unknown.
-        let ext = resolved
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase());
+        if is_image {
+            return render_image(bytes, &input.path, ctx.image_limits()).await;
+        }
+        // Falls through to plain-text rendering when the extension is
+        // unknown.
         if let Some(ext) = ext.as_deref() {
             match ext {
                 "pdf" => return render_pdf(&bytes, input.pages.as_deref(), &input.path),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => {
-                    return render_image(&bytes, ext);
-                }
                 "ipynb" => return render_notebook(&bytes, &input.path),
                 "docx" | "xlsx" | "pptx" => {
                     return Ok(ToolOutput::text(office_nudge(ext, bytes.len())));
@@ -284,26 +316,38 @@ fn office_nudge(ext: &str, byte_len: usize) -> String {
     )
 }
 
-/// Wrap raw image bytes into a `ContentBlock::Image` so vision-capable
-/// models see the pixels directly. Non-vision providers will get an
-/// `<image: media/type>` placeholder if some other path renders this
-/// block to text — that fallback lives in `ToolOutput::render_text`.
-fn render_image(bytes: &[u8], ext: &str) -> ToolResult {
-    let media = match ext {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "application/octet-stream",
-    };
-    let encoded = BASE64.encode(bytes);
-    Ok(ToolOutput::blocks(vec![ContentBlock::Image {
+/// Wrap image bytes into a `ContentBlock::Image` so vision-capable models
+/// see the pixels directly, after [`crate::image_prep::prepare_image`]
+/// has validated and normalised them to the context's `ImageLimits`
+/// (decode + resize is CPU-bound, so it runs off the async workers). A
+/// re-encoded image is preceded by a text note saying so. For non-vision
+/// models the provider converter degrades the block to an
+/// `[image omitted: …]` placeholder.
+async fn render_image(bytes: Vec<u8>, display_path: &str, budget: ImageLimits) -> ToolResult {
+    let permit = IMAGE_PREP_PERMITS
+        .acquire()
+        .await
+        .map_err(|e| ToolError::Execution(format!("image processing unavailable: {e}")))?;
+    // The permit moves into the blocking task: if this turn is cancelled
+    // mid-decode, the decode keeps running and must keep its slot.
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::image_prep::prepare_image(bytes, budget)
+    })
+    .await
+    .map_err(|e| ToolError::Execution(format!("image processing task failed: {e}")))?
+    .map_err(|e| ToolError::Execution(format!("{display_path}: {e}")))?;
+    let mut blocks = Vec::with_capacity(2);
+    if let Some(note) = prepared.note {
+        blocks.push(ContentBlock::text(note));
+    }
+    blocks.push(ContentBlock::Image {
         source: ImageSource::Base64 {
-            media_type: media.to_string(),
-            data: encoded,
+            media_type: prepared.media_type.to_string(),
+            data: BASE64.encode(&prepared.bytes),
         },
-    }]))
+    });
+    Ok(ToolOutput::blocks(blocks))
 }
 
 /// Render a Jupyter notebook (.ipynb) — minimum-effort transformation
@@ -563,6 +607,97 @@ mod tests {
             }
             other => panic!("expected Blocks output, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn image_over_text_cap_is_still_read() {
+        // Without this: a phone photo or 4K screenshot over 5 MB is refused
+        // with a useless "use offset/limit" hint instead of being downscaled.
+        let img = image::RgbImage::from_pixel(1500, 1400, image::Rgb([0, 128, 0]));
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bmp, image::ImageFormat::Bmp).unwrap();
+        let bmp = bmp.into_inner();
+        assert!(bmp.len() as u64 > MAX_BYTES);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bmp"), &bmp).unwrap();
+
+        let out = ReadTool
+            .execute(json!({"path": "big.bmp"}), &ctx(dir.path()))
+            .await
+            .unwrap();
+        let ToolOutput::Blocks(blocks) = out else {
+            panic!("expected Blocks output");
+        };
+        assert!(matches!(
+            blocks.last(),
+            Some(ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. }
+            }) if media_type == "image/jpeg"
+        ));
+    }
+
+    #[tokio::test]
+    async fn media_type_comes_from_content_not_extension() {
+        // Without this: a JPEG saved as `.png` (common for downloads and
+        // IM attachments) is labelled image/png, and the send-time gate
+        // refuses the mismatch on every turn it is replayed from history,
+        // so the model never sees the image.
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([200, 30, 30]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("photo.png"), jpeg.into_inner()).unwrap();
+
+        let out = ReadTool
+            .execute(json!({"path": "photo.png"}), &ctx(dir.path()))
+            .await
+            .unwrap();
+        let ToolOutput::Blocks(blocks) = out else {
+            panic!("expected Blocks output");
+        };
+        assert!(matches!(
+            blocks.last(),
+            Some(ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. }
+            }) if media_type == "image/jpeg"
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_decodes_wait_for_a_free_slot() {
+        // Without this: every image Read in a reply decodes at once (the
+        // engine's prerun is unthrottled), multiplying a decode's
+        // several-hundred-MB peak by the number of images.
+        let dir = tempfile::tempdir().unwrap();
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([0, 0, 200]));
+        img.save(dir.path().join("dot.png")).unwrap();
+        let ctx = ctx(dir.path());
+
+        let held = IMAGE_PREP_PERMITS.acquire_many(2).await.unwrap();
+        let read = ReadTool.execute(json!({"path": "dot.png"}), &ctx);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut read)
+                .await
+                .is_err(),
+            "Read must wait while every slot is taken"
+        );
+        drop(held);
+        assert!(read.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn undecodable_image_is_an_error_not_an_image() {
+        // Without this: a file the decoder rejects could be stored raw as an
+        // image block (up to 32 MB), refused at the wire on every replay,
+        // instead of failing the Read with a reason.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.png"), b"not really a png").unwrap();
+        let err = ReadTool
+            .execute(json!({"path": "broken.png"}), &ctx(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("broken.png"), "{err}");
     }
 
     #[tokio::test]

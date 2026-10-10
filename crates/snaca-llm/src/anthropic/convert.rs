@@ -9,7 +9,12 @@
 //!   1:1 to wire blocks. `Thinking { signature: Some }` round-trips so
 //!   the model can read its prior reasoning trace if `extended_thinking`
 //!   is enabled.
-//! - `Role::User` text → single `text` block.
+//! - `Role::User` text → single `text` block; `Image` blocks are passed
+//!   through 1:1 (base64 or URL source). With images present, an empty
+//!   text block is dropped so the API never sees `text: ""`.
+//! - `Role::Tool` message `ToolResult` content keeps both `text` and
+//!   `image` blocks — vision-capable models see tool-returned pixels
+//!   (e.g. the Read tool's image render) natively.
 //!
 //! ## Inbound (response) translation
 //! - Wire `text` → `ContentBlock::Text`
@@ -25,6 +30,7 @@ use crate::anthropic::wire::{
     WireTool, EPHEMERAL_CACHE,
 };
 use crate::error::{LlmError, LlmResult};
+use crate::images::{omitted_placeholder, split_images, ImagePolicy};
 use crate::request::{MessageRequest, SystemSegment, ToolSchema};
 use crate::response::{MessageResponse, StopReason};
 use snaca_core::{ContentBlock, Message, MessageId, Role, ToolUseId};
@@ -39,7 +45,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// the operator can opt out via `AnthropicConfig.enable_prompt_cache`.
 #[cfg(test)]
 pub fn build_messages_request(req: &MessageRequest, stream: bool) -> LlmResult<MessagesRequest> {
-    build_messages_request_with_cache(req, stream, true)
+    build_messages_request_with_cache(req, stream, true, true)
 }
 
 /// Same as `build_messages_request` but with explicit control over
@@ -47,13 +53,15 @@ pub fn build_messages_request(req: &MessageRequest, stream: bool) -> LlmResult<M
 /// default) attaches an ephemeral cache_control to the last system
 /// block and the last tool; `false` emits the legacy single-string
 /// `system` and bare `tools` shape — useful when an operator opts
-/// out for debugging.
+/// out for debugging. `supports_vision = false` degrades image
+/// blocks to placeholder text instead of wire `image` blocks.
 pub fn build_messages_request_with_cache(
     req: &MessageRequest,
     stream: bool,
     enable_cache: bool,
+    supports_vision: bool,
 ) -> LlmResult<MessagesRequest> {
-    let (extra_system, messages) = split_system_and_messages(&req.messages)?;
+    let (extra_system, messages) = split_system_and_messages(&req.messages, supports_vision)?;
 
     let system = build_system_field(req, extra_system, enable_cache);
 
@@ -172,9 +180,11 @@ fn build_system_field(
 
 fn split_system_and_messages(
     messages: &[Message],
+    supports_vision: bool,
 ) -> LlmResult<(Option<String>, Vec<WireMessage>)> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut wire: Vec<WireMessage> = Vec::new();
+    let images = ImagePolicy::anthropic(supports_vision);
     for msg in messages {
         match msg.role {
             Role::System => {
@@ -184,10 +194,20 @@ fn split_system_and_messages(
                 }
             }
             Role::User => {
-                let text = ContentBlock::collect_text(&msg.content);
+                let (text, mut blocks) =
+                    split_images(&msg.content, images, |source| WireContentBlock::Image {
+                        source: source.clone(),
+                    });
+                // Preserve the historical single-text-block shape; the
+                // empty text block is only dropped when images already
+                // make the message non-empty (Anthropic rejects empty
+                // text blocks alongside other content).
+                if !text.is_empty() || blocks.is_empty() {
+                    blocks.insert(0, WireContentBlock::Text { text });
+                }
                 wire.push(WireMessage {
                     role: "user".into(),
-                    content: vec![WireContentBlock::Text { text }],
+                    content: blocks,
                 });
             }
             Role::Assistant => {
@@ -237,11 +257,26 @@ fn split_system_and_messages(
                     {
                         blocks.push(WireContentBlock::ToolResult {
                             tool_use_id: tool_use_id.as_str().to_string(),
+                            // Anthropic accepts image blocks inside
+                            // tool_result content — pass vision inputs
+                            // (e.g. the Read tool's base64 render)
+                            // straight through instead of dropping
+                            // them. Vision-off deployments get a text
+                            // placeholder so the model knows pixels
+                            // were there.
                             content: content
                                 .iter()
                                 .filter_map(|c| match c {
                                     ContentBlock::Text { text } => {
                                         Some(WireContentBlock::Text { text: text.clone() })
+                                    }
+                                    ContentBlock::Image { source } => {
+                                        Some(match omitted_placeholder(source, images) {
+                                            None => WireContentBlock::Image {
+                                                source: source.clone(),
+                                            },
+                                            Some(text) => WireContentBlock::Text { text },
+                                        })
                                     }
                                     _ => None,
                                 })
@@ -302,9 +337,9 @@ pub fn parse_messages_response(resp: MessagesResponse) -> LlmResult<MessageRespo
                     input,
                 });
             }
-            WireContentBlock::ToolResult { .. } => {
+            WireContentBlock::ToolResult { .. } | WireContentBlock::Image { .. } => {
                 return Err(LlmError::MalformedResponse(
-                    "assistant response contained tool_result block".into(),
+                    "assistant response contained tool_result or image block".into(),
                 ));
             }
         }
@@ -524,7 +559,7 @@ mod tests {
             SystemSegment::cacheable("BASE"),
             SystemSegment::volatile("RECALL"),
         ]);
-        let wire = build_messages_request_with_cache(&r, false, false).unwrap();
+        let wire = build_messages_request_with_cache(&r, false, false, true).unwrap();
         match &wire.system {
             Some(SystemField::Text(t)) => assert_eq!(t, "BASE\n\nRECALL"),
             other => panic!("expected Text form when cache disabled, got {other:?}"),
@@ -540,7 +575,7 @@ mod tests {
                 description: "read".into(),
                 input_schema: json!({"type": "object"}),
             }]);
-        let wire = build_messages_request_with_cache(&r, false, false).unwrap();
+        let wire = build_messages_request_with_cache(&r, false, false, true).unwrap();
         // System emitted as bare string when cache is off.
         assert!(matches!(wire.system, Some(SystemField::Text(_))));
         assert!(wire.tools[0].cache_control.is_none());
@@ -640,6 +675,213 @@ mod tests {
         assert_eq!(wire.tools.len(), 1);
         assert_eq!(wire.tools[0].name, "Read");
         assert_eq!(wire.tools[0].input_schema, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn user_image_blocks_pass_through() {
+        // Without this: an image the user sends would be dropped from the
+        // Anthropic request, or sent in a source shape Anthropic rejects (the
+        // wire reuses snaca-core's ImageSource serde), and the model answers
+        // about a picture it never saw.
+        let img = ContentBlock::Image {
+            source: snaca_core::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgoAAEC".into(),
+            },
+        };
+        let r = req(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::text("what is this?"), img],
+        )]);
+        let wire = build_messages_request(&r, false).unwrap();
+        assert_eq!(wire.messages.len(), 1);
+        let blocks = &wire.messages[0].content;
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], WireContentBlock::Text { text } if text == "what is this?"));
+        match &blocks[1] {
+            WireContentBlock::Image { source } => match source {
+                snaca_core::ImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "iVBORw0KGgoAAEC");
+                }
+                other => panic!("expected base64 source, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+        // Serialises to Anthropic's exact image wire shape.
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["messages"][0]["content"][1]["type"], json!("image"));
+        assert_eq!(
+            json["messages"][0]["content"][1]["source"]["type"],
+            json!("base64")
+        );
+        assert_eq!(
+            json["messages"][0]["content"][1]["source"]["media_type"],
+            json!("image/png")
+        );
+    }
+
+    #[test]
+    fn image_only_user_message_drops_empty_text_block() {
+        // Without this: an image-only user message (a screenshot sent with no
+        // caption) also carries an empty text block, which Anthropic rejects.
+        let r = req(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Image {
+                source: snaca_core::ImageSource::Url {
+                    url: "https://example.com/cat.png".into(),
+                },
+            }],
+        )]);
+        let wire = build_messages_request(&r, false).unwrap();
+        let blocks = &wire.messages[0].content;
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            WireContentBlock::Image {
+                source: snaca_core::ImageSource::Url { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_result_image_blocks_pass_through() {
+        // Without this: pixels a tool returns (Read on a screenshot) would be
+        // stripped from the tool_result, and the model describes an image it
+        // never received.
+        let r = req(vec![Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![
+                    ContentBlock::text("rendered cat.png"),
+                    ContentBlock::Image {
+                        source: snaca_core::ImageSource::Base64 {
+                            media_type: "image/jpeg".into(),
+                            data: "/9j/ZZZ".into(),
+                        },
+                    },
+                ],
+            )],
+        )]);
+        let wire = build_messages_request(&r, false).unwrap();
+        match &wire.messages[0].content[0] {
+            WireContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.len(), 2);
+                assert!(
+                    matches!(&content[0], WireContentBlock::Text { text } if text == "rendered cat.png")
+                );
+                assert!(matches!(
+                    &content[1],
+                    WireContentBlock::Image {
+                        source: snaca_core::ImageSource::Base64 { media_type, .. }
+                    } if media_type == "image/jpeg"
+                ));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_off_degrades_images_to_placeholders() {
+        // Without this: with supports_vision off (a text-only model behind the
+        // Anthropic wire) image blocks still go out, the request 400s, and the
+        // stored image re-breaks every later turn in the thread.
+        let img_user = Message::new(
+            Role::User,
+            vec![ContentBlock::Image {
+                source: snaca_core::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgoAAEC".into(),
+                },
+            }],
+        );
+        let img_tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![ContentBlock::Image {
+                    source: snaca_core::ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "/9j/AAEC".into(),
+                    },
+                }],
+            )],
+        );
+        let r = req(vec![img_user, img_tool]);
+        let wire = build_messages_request_with_cache(&r, false, true, false).unwrap();
+        // User message: text placeholder only.
+        let blocks = &wire.messages[0].content;
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], WireContentBlock::Text { text }
+            if text.contains("[image omitted: image/png")));
+        // Tool result: text placeholder instead of the image block.
+        match &wire.messages[1].content[0] {
+            WireContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(&content[0], WireContentBlock::Text { text }
+                    if text.contains("[image omitted: image/jpeg")));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animated_gif_in_history_is_still_sent_to_anthropic() {
+        // Without this: the static-GIF rule for OpenAI-family wires could
+        // leak into Anthropic, which accepts animated GIFs, and the image
+        // would be dropped for nothing.
+        let r = req(vec![Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![ContentBlock::Image {
+                    source: snaca_core::ImageSource::Base64 {
+                        media_type: "image/gif".into(),
+                        data: crate::images::tests::gif_base64(2),
+                    },
+                }],
+            )],
+        )]);
+        let wire = build_messages_request_with_cache(&r, false, true, true).unwrap();
+        match &wire.messages[0].content[0] {
+            WireContentBlock::ToolResult { content, .. } => {
+                assert!(
+                    matches!(&content[0], WireContentBlock::Image { .. }),
+                    "{content:?}"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_on_still_refuses_unsupported_image_format() {
+        // Without this: an `image/bmp` block goes to the wire with vision
+        // on, Anthropic 400s, and the stored result re-breaks every later
+        // request in the thread.
+        let img_tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![ContentBlock::Image {
+                    source: snaca_core::ImageSource::Base64 {
+                        media_type: "image/bmp".into(),
+                        data: "AAEC".into(),
+                    },
+                }],
+            )],
+        );
+        let r = req(vec![img_tool]);
+        let wire = build_messages_request_with_cache(&r, false, true, true).unwrap();
+        match &wire.messages[0].content[0] {
+            WireContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(&content[0], WireContentBlock::Text { text }
+                    if text == "[image omitted: image/bmp — unsupported image format]"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     fn make_response(json: serde_json::Value) -> MessagesResponse {

@@ -24,6 +24,8 @@ pub mod grep;
 #[cfg(any(feature = "web-fetch", feature = "web-search"))]
 pub(crate) mod http_client;
 #[cfg(feature = "fs-read")]
+pub(crate) mod image_prep;
+#[cfg(feature = "fs-read")]
 pub mod ls;
 #[cfg(feature = "memory")]
 pub mod memory;

@@ -36,6 +36,14 @@ model = "deepseek-chat"
 # Override only if you're using a proxy or a self-hosted compatible endpoint.
 # base_url = "https://api.deepseek.com"
 
+# Embed images so vision-capable models can see them (user-message images
+# and tool-returned pixels). Defaults: true for `anthropic`, false for
+# `deepseek` (hosted DeepSeek models are text-only — flip to true if
+# `base_url` points at a vision-capable OpenAI-compatible endpoint).
+# When off, images degrade to
+# `[image omitted: …]` placeholder text.
+# supports_vision = false
+
 # Max idle gap between SSE chunks (and total wait for a non-streaming
 # body), in seconds. Default 120. Applied as `read_timeout`, not a total
 # request budget — thinking models legitimately stream reasoning_content
@@ -164,6 +172,24 @@ model = "deepseek-chat"
 # approve with `snaca-cli memory approve <id>` (or `reject <id>`).
 # Default false.
 # memory_write_approval = false
+
+# Per-image budget for images a tool returns (Read). Smaller PNG / JPEG /
+# static GIF / WebP pass through untouched; anything larger, BMP / TIFF, an
+# EXIF-rotated photo or an animated GIF (first frame only) is downscaled
+# and re-encoded as JPEG to fit, with a note to the model.
+# image_max_bytes is measured on the base64 payload — the same unit as
+# history_max_bytes. Raise it for text-heavy screenshots or scans that
+# blur at the default; lower it
+# for tight context budgets. Range 65536..=5242880; must be at most half
+# of history_max_bytes or startup fails (unset, it shrinks to fit
+# automatically). Default 262144 (256 KiB, about 192 KiB of raw image).
+# image_max_bytes = 262144
+#
+# Longest-edge cap in pixels. Range 256..=8000. Default 1568 (Anthropic's
+# recommended maximum; OpenAI high-detail goes up to 2048). Above 2000,
+# note that Anthropic limits images to 2000 px in a request carrying more
+# than 20.
+# image_max_edge_px = 1568
 
 [im_input]
 # IM platforms often split files and text into separate messages. The

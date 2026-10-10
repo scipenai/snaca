@@ -86,6 +86,39 @@ api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-chat"
 ```
 
+Images are embedded for vision-capable models by default on `anthropic`;
+the `deepseek` provider defaults to text-only (its hosted models don't
+accept images). Override with `supports_vision = true|false` — e.g. set
+it to `true` when `base_url` points the `deepseek` provider at a
+vision-capable OpenAI-compatible endpoint. With vision off, images
+degrade to `[image omitted: …]` placeholder text so the model still knows
+an attachment was present.
+
+`Read` normalises images before they enter history: PNG / JPEG / static
+GIF / WebP up to 256 KiB (base64) and 1568 px pass through unchanged;
+larger images, other formats (BMP, TIFF), EXIF-rotated photos and animated
+GIFs (first frame only) are downscaled and re-encoded as JPEG, with a short
+note telling the model what changed. Image files up to 32 MB are accepted
+(other files stay capped at 5 MB). Corrupt files, and images too large to
+decode safely, are reported as a tool error instead of being sent. Only the
+newest 3 tool-result images stay in context: the current turn's are never
+removed, but they count toward the 3, so earlier turns' images go first.
+Removed ones are replaced with a marker and the model can Read the file
+again. Both limits are configurable under
+`[engine]`:
+
+```toml
+[engine]
+# image_max_bytes = 262144     # base64 bytes, 65536..=5242880; at most half of history_max_bytes
+# image_max_edge_px = 1568     # 256..=8000
+```
+
+Raise `image_max_bytes` for text-heavy screenshots or scans; startup fails
+with a clear error if the budget would not fit the history byte cap (when
+unset, it shrinks automatically to fit). If `base_url` points `anthropic` at a
+text-only endpoint, set `supports_vision = false` (startup logs a warning
+when it is left unset).
+
 Useful container/local differences:
 
 - Use `server.http_listen = "0.0.0.0:8080"` inside containers.

@@ -1,5 +1,7 @@
 //! Engine configuration knobs.
 
+use snaca_tools_api::ImageLimits;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Default LLM model name. Overridden per-request only if explicitly set.
@@ -127,13 +129,14 @@ pub struct EngineConfig {
 
     /// Hard byte cap on the loaded history's serialised content
     /// before the LLM call. When the loaded history exceeds this,
-    /// `load_history` drops the oldest messages until it fits. This
+    /// `load_history` clears old tool results and images, then drops the
+    /// oldest messages until it fits. This
     /// is the last-resort safety net — `compact_after_input_tokens`
     /// is the preferred path, but only fires *after* a successful
     /// turn, so a single huge import (PDF / DOCX with ~MB of
     /// extracted text) can blow the context window before
-    /// compaction ever runs. Default 1.5 MiB ≈ 350-400k tokens for
-    /// English / mixed CJK.
+    /// compaction ever runs. Default 1.5 MB (1 500 000 bytes) ≈ 350-400k
+    /// tokens for English / mixed CJK.
     pub history_max_bytes: usize,
 
     /// Wall-clock cap on one turn. `None` = no global timeout
@@ -154,10 +157,11 @@ pub struct EngineConfig {
     pub concurrent_tool_limit: usize,
 
     /// Byte threshold at which old read-only tool_results are
-    /// collapsed in the loaded history. A result whose total text
-    /// content is ≥ this many bytes gets replaced with a one-line
-    /// marker (`<Read foo.rs: 12345 bytes>`) for any message older
-    /// than the kept tail. Set to 0 to disable. Default 1024 — large
+    /// collapsed in the loaded history. A result whose text is ≥ this
+    /// many bytes has it replaced with a one-line marker
+    /// (`<Read result: 12345 bytes elided …>`) for any message older than
+    /// the kept tail; images beside it stay, governed by image retirement
+    /// and the byte cap. Set to 0 to disable. Default 1024 — large
     /// enough that small file reads stay verbatim, small enough that
     /// a single big Grep doesn't dominate the context. Only applies
     /// to built-in read-only tools (Read / Grep / Glob / LS /
@@ -227,6 +231,18 @@ pub struct EngineConfig {
     /// entries in `user/` profile space the human owner had no
     /// chance to veto. Default `false`.
     pub memory_write_approval: bool,
+
+    /// Per-image budget, in base64 bytes, for images a tool returns (Read
+    /// downscales / re-encodes to fit). Same unit as `history_max_bytes`.
+    /// Attached to every turn's `ToolContext`; tools clamp it into
+    /// `ImageLimits::{MIN,MAX}_BYTES`. Keep it well under
+    /// `history_max_bytes`, or the byte cap strips a fresh image before
+    /// the model sees it. Default 256 KiB.
+    pub image_max_bytes: usize,
+
+    /// Longest-edge cap in pixels for images a tool returns. Clamped
+    /// into `ImageLimits::{MIN,MAX}_EDGE_PX`. Default 1568.
+    pub image_max_edge_px: u32,
 }
 
 /// Absolute ceiling on the raw candidate-row pool pulled from the DB
@@ -275,6 +291,8 @@ impl EngineConfig {
             max_output_token_escalation_attempts: 2,
             max_output_token_ceiling: 32_768,
             memory_write_approval: false,
+            image_max_bytes: ImageLimits::DEFAULT_MAX_BYTES,
+            image_max_edge_px: ImageLimits::DEFAULT_MAX_EDGE_PX,
         }
     }
 }

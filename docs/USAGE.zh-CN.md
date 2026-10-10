@@ -151,6 +151,7 @@ model = "deepseek-chat"         # R1：deepseek-reasoner
 # base_url   = "https://api.deepseek.com"
 # timeout_secs = 120
 # anthropic_version = "2023-06-01"   # 仅 anthropic provider 用得上
+# supports_vision = false            # 图片是否嵌入请求（见下）
 
 [engine]
 max_iterations = 8
@@ -161,6 +162,8 @@ compact_keep_recent = 6
 # memory_extractor = true           # 开 turn 后台记忆提取
 # memory_write_approval = false     # MemoryWrite 是否先进入 pending 等人工审批
 # history_max_bytes = 1500000       # 最后一道兜底字节剪裁
+# image_max_bytes = 262144          # 单张图片压缩预算（按 base64 字节计），见下方图片说明
+# image_max_edge_px = 1568          # 图片最长边像素上限
 
 # 可选：IM 多条碎片输入组装（默认开启）
 [im_input]
@@ -212,6 +215,31 @@ RUST_LOG = "info,snaca_plugin_lark=debug,open_lark=info"
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/some/path"]
 ```
+
+图片默认对 `anthropic` 嵌入请求（视觉模型可直接读取）；`deepseek` 默认纯文本（其官方
+模型不接受图片）——当 `base_url` 指向具备视觉能力的 OpenAI 兼容端点时，把
+`supports_vision` 设为 `true` 即可。视觉关闭时，图片会降级为 `[image omitted: …]`
+占位文本，模型至少知道有附件存在。
+
+`Read` 读取图片时会先做规整：base64 后 256 KiB 且 1568 px 以内的 PNG / JPEG /
+静态 GIF / WebP 原样保留；更大的图片、其他格式（BMP、TIFF）、带 EXIF 旋转信息的照片
+以及动态 GIF（只取第一帧）会缩小并转成 JPEG，同时附一行说明告诉模型做了什么处理。
+图片文件上限为 32 MB（其他文件仍为 5 MB）。损坏的文件、以及大到无法安全解码的图片，
+直接作为工具错误返回，不会发给模型。工具返回的图片只保留最新 3 张：当前轮次的图片
+不会被移除，但也计入这 3 张，所以先移除的是之前轮次的；被移除的换成标记，模型需要时
+可以重新 Read。两个上限都可在 `[engine]`
+中配置：
+
+```toml
+[engine]
+# image_max_bytes = 262144     # 按 base64 字节计，65536..=5242880；不得超过 history_max_bytes 的一半
+# image_max_edge_px = 1568     # 256..=8000
+```
+
+文字密集的截图或扫描件可以调大 `image_max_bytes`；如果预算放不进历史字节上限，
+启动时会直接报错并说明原因（未配置时会自动缩小到合适的值）。如果 `base_url` 把
+`anthropic` 指向纯文本接口，请设置 `supports_vision = false`
+（未设置时启动会打印一条警告）。
 
 ### 配置要点
 

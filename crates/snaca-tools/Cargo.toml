@@ -17,7 +17,7 @@ snaca-skills = { workspace = true, optional = true }
 snaca-memory = { workspace = true, optional = true }
 snaca-state = { workspace = true, optional = true }
 async-trait.workspace = true
-tokio = { workspace = true, features = ["fs", "process", "io-util", "time", "sync"] }
+tokio = { workspace = true, features = ["fs", "process", "io-util", "rt", "time", "sync"] }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
@@ -28,6 +28,8 @@ regex = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 data-encoding = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+gif = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
@@ -47,7 +49,7 @@ default = [
     "tasks",
     "pdf",
 ]
-fs-read = ["dep:data-encoding", "dep:globset", "dep:regex", "dep:walkdir"]
+fs-read = ["dep:data-encoding", "dep:gif", "dep:globset", "dep:image", "dep:regex", "dep:walkdir"]
 fs-write = ["fs-read"]
 shell = ["dep:dirs", "tasks"]
 todo = []
@@ -64,3 +66,7 @@ pdf = ["dep:snaca-memory", "snaca-memory/pdf"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 tempfile = "3"
+
+[[test]]
+name = "read_image_alloc_cap"
+required-features = ["fs-read"]

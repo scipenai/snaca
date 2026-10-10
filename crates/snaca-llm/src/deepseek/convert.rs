@@ -4,24 +4,43 @@
 //! - **Outbound (request)**: `MessageRequest` → `ChatRequest`. System prompt
 //!   becomes a `role: "system"` message. `Role::Tool` messages are split:
 //!   each `ToolResult` block becomes its own `role: "tool"` wire message
-//!   (OpenAI convention). `Thinking` blocks are dropped — DeepSeek does not
-//!   accept them in history.
+//!   (OpenAI convention). `Thinking` text is replayed as the assistant
+//!   message's `reasoning_content` (DeepSeek's thinking models require it);
+//!   signatures are never sent. `Image` blocks follow the OpenAI multimodal
+//!   conventions: user messages carry `image_url` content parts (data URLs
+//!   for base64) when `supports_vision` is on; tool-result images are
+//!   text-only on the wire, so they are re-surfaced as a follow-up user
+//!   message. With vision off (the default — DeepSeek's hosted models are
+//!   text-only), images degrade to `[image omitted: …]` placeholder text.
 //! - **Inbound (response)**: `ChatResponse` → `MessageResponse`. Multiple
 //!   `tool_calls` become multiple `ContentBlock::ToolUse` blocks; the order
 //!   is preserved. `reasoning_content` (R1) becomes a `ContentBlock::Thinking`
 //!   inserted before the text block.
 
 use crate::deepseek::wire::{
-    ChatRequest, ChatResponse, WireMessage, WireTool, WireToolCall, WireToolCallFunction,
-    WireToolDefinition,
+    ChatRequest, ChatResponse, WireContent, WireContentPart, WireImageUrl, WireMessage, WireTool,
+    WireToolCall, WireToolCallFunction, WireToolDefinition,
 };
 use crate::error::{LlmError, LlmResult};
+use crate::images::{image_url_of, split_images, tool_images_message_parts, ImagePolicy};
 use crate::request::{MessageRequest, ToolSchema};
 use crate::response::{MessageResponse, StopReason};
-use snaca_core::{ContentBlock, Message, MessageId, Role, ToolUseId};
+use snaca_core::{ContentBlock, ImageSource, Message, MessageId, Role, ToolUseId};
 use std::time::SystemTime;
 
+/// Test shorthand for the text-only default (DeepSeek's hosted
+/// `deepseek-chat` / `deepseek-reasoner` models are text-only). The
+/// client always calls [`build_chat_request_with_vision`].
+#[cfg(test)]
 pub fn build_chat_request(req: &MessageRequest, stream: bool) -> LlmResult<ChatRequest> {
+    build_chat_request_with_vision(req, stream, false)
+}
+
+pub fn build_chat_request_with_vision(
+    req: &MessageRequest,
+    stream: bool,
+    supports_vision: bool,
+) -> LlmResult<ChatRequest> {
     let mut messages = Vec::with_capacity(req.messages.len() + 1);
 
     // Top-level system prompt → first system wire message. DeepSeek's
@@ -32,7 +51,7 @@ pub fn build_chat_request(req: &MessageRequest, stream: bool) -> LlmResult<ChatR
         if !system.is_empty() {
             messages.push(WireMessage {
                 role: "system".into(),
-                content: Some(system),
+                content: Some(WireContent::Text(system)),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -42,7 +61,7 @@ pub fn build_chat_request(req: &MessageRequest, stream: bool) -> LlmResult<ChatR
     }
 
     for msg in &req.messages {
-        push_message(msg, &mut messages)?;
+        push_message(msg, &mut messages, supports_vision)?;
     }
 
     let tools = req.tools.iter().map(tool_schema_to_wire).collect();
@@ -62,13 +81,13 @@ pub fn build_chat_request(req: &MessageRequest, stream: bool) -> LlmResult<ChatR
     })
 }
 
-fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
+fn push_message(msg: &Message, out: &mut Vec<WireMessage>, supports_vision: bool) -> LlmResult<()> {
     match msg.role {
         Role::System => {
             let text = ContentBlock::collect_text(&msg.content);
             out.push(WireMessage {
                 role: "system".into(),
-                content: Some(text),
+                content: Some(WireContent::Text(text)),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -76,10 +95,29 @@ fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
             });
         }
         Role::User => {
-            let text = ContentBlock::collect_text(&msg.content);
+            // Images the gate refuses (text-only model, unsupported
+            // format, oversized) degrade to explicit placeholder lines so
+            // the model at least knows an image was there.
+            let (text, images) = split_images(
+                &msg.content,
+                ImagePolicy::openai(supports_vision),
+                image_url_part,
+            );
+            let content = if images.is_empty() {
+                WireContent::Text(text)
+            } else {
+                // OpenAI-style multimodal user message: text part first
+                // (when non-empty), then image parts in order.
+                let mut parts = Vec::with_capacity(images.len() + 1);
+                if !text.is_empty() {
+                    parts.push(WireContentPart::Text { text });
+                }
+                parts.extend(images);
+                WireContent::Parts(parts)
+            };
             out.push(WireMessage {
                 role: "user".into(),
-                content: Some(text),
+                content: Some(content),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -136,7 +174,11 @@ fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
             }
             out.push(WireMessage {
                 role: "assistant".into(),
-                content: if text.is_empty() { None } else { Some(text) },
+                content: if text.is_empty() {
+                    None
+                } else {
+                    Some(WireContent::Text(text))
+                },
                 reasoning_content: if reasoning.is_empty() {
                     None
                 } else {
@@ -153,6 +195,12 @@ fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
         }
         Role::Tool => {
             // Each ToolResult becomes its own `role: "tool"` wire message.
+            // OpenAI tool messages are text-only, so any image blocks a
+            // tool returned are deferred: with vision they are re-surfaced
+            // as one follow-up user message (the standard OpenAI-family
+            // workaround); without vision they degrade to placeholder text
+            // appended to the tool message itself.
+            let mut deferred_images: Vec<(String, Vec<WireContentPart>)> = Vec::new();
             for block in &msg.content {
                 if let ContentBlock::ToolResult {
                     tool_use_id,
@@ -160,10 +208,17 @@ fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
                     is_error: _,
                 } = block
                 {
-                    let text = ContentBlock::collect_text(content);
+                    let (text, images) = split_images(
+                        content,
+                        ImagePolicy::openai(supports_vision),
+                        image_url_part,
+                    );
+                    if !images.is_empty() {
+                        deferred_images.push((tool_use_id.as_str().to_string(), images));
+                    }
                     out.push(WireMessage {
                         role: "tool".into(),
-                        content: Some(text),
+                        content: Some(WireContent::Text(text)),
                         reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: Some(tool_use_id.as_str().to_string()),
@@ -171,9 +226,29 @@ fn push_message(msg: &Message, out: &mut Vec<WireMessage>) -> LlmResult<()> {
                     });
                 }
             }
+            if let Some(parts) =
+                tool_images_message_parts(deferred_images, |text| WireContentPart::Text { text })
+            {
+                out.push(WireMessage {
+                    role: "user".into(),
+                    content: Some(WireContent::Parts(parts)),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
         }
     }
     Ok(())
+}
+
+fn image_url_part(source: &ImageSource) -> WireContentPart {
+    WireContentPart::ImageUrl {
+        image_url: WireImageUrl {
+            url: image_url_of(source),
+        },
+    }
 }
 
 fn tool_schema_to_wire(s: &ToolSchema) -> WireTool {
@@ -273,6 +348,31 @@ mod tests {
     use serde_json::json;
     use snaca_core::{ContentBlock, Message, Role};
 
+    #[test]
+    fn animated_gif_in_history_is_not_sent() {
+        // Without this: a tool result from before the upgrade holding an
+        // animated GIF is replayed as an image part on every request, and an
+        // OpenAI-family endpoint rejects the whole thread.
+        let tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![ContentBlock::Image {
+                    source: snaca_core::ImageSource::Base64 {
+                        media_type: "image/gif".into(),
+                        data: crate::images::tests::gif_base64(2),
+                    },
+                }],
+            )],
+        );
+        let req = MessageRequest::new("m").with_messages(vec![tool]);
+        let wire =
+            serde_json::to_string(&build_chat_request_with_vision(&req, false, true).unwrap())
+                .unwrap();
+        assert!(!wire.contains("image_url"), "{wire}");
+        assert!(wire.contains("animated GIF"), "{wire}");
+    }
+
     fn user(text: &str) -> Message {
         Message::user_text(text)
     }
@@ -306,6 +406,12 @@ mod tests {
         }
     }
 
+    /// Flat string view of a wire message's content, for assertions on
+    /// messages that are still emitted in the plain-string shape.
+    fn content_text(msg: &WireMessage) -> Option<&str> {
+        msg.content.as_ref().and_then(|c| c.as_text())
+    }
+
     #[test]
     fn system_prompt_becomes_first_message() {
         let req = MessageRequest::new("deepseek-chat")
@@ -314,7 +420,7 @@ mod tests {
         let wire = build_chat_request(&req, false).unwrap();
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, "system");
-        assert_eq!(wire.messages[0].content.as_deref(), Some("You are SNACA"));
+        assert_eq!(content_text(&wire.messages[0]), Some("You are SNACA"));
         assert_eq!(wire.messages[1].role, "user");
     }
 
@@ -331,7 +437,7 @@ mod tests {
         let wire = build_chat_request(&req, false).unwrap();
         assert_eq!(wire.messages[0].role, "system");
         assert_eq!(
-            wire.messages[0].content.as_deref(),
+            content_text(&wire.messages[0]),
             Some("BASE\n\nMEMORY\n\nRECALL")
         );
     }
@@ -340,7 +446,7 @@ mod tests {
     fn assistant_text_only_serializes_content() {
         let req = MessageRequest::new("deepseek-chat").with_messages(vec![assistant_text("ok")]);
         let wire = build_chat_request(&req, false).unwrap();
-        assert_eq!(wire.messages[0].content.as_deref(), Some("ok"));
+        assert_eq!(content_text(&wire.messages[0]), Some("ok"));
         assert!(wire.messages[0].tool_calls.is_none());
     }
 
@@ -369,7 +475,7 @@ mod tests {
         assert_eq!(wire.messages.len(), 1);
         assert_eq!(wire.messages[0].role, "tool");
         assert_eq!(wire.messages[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(wire.messages[0].content.as_deref(), Some("file contents"));
+        assert_eq!(content_text(&wire.messages[0]), Some("file contents"));
     }
 
     #[test]
@@ -383,7 +489,7 @@ mod tests {
             .with_messages(vec![empty_assistant, assistant_text("ok")]);
         let wire = build_chat_request(&req, false).unwrap();
         assert_eq!(wire.messages.len(), 1);
-        assert_eq!(wire.messages[0].content.as_deref(), Some("ok"));
+        assert_eq!(content_text(&wire.messages[0]), Some("ok"));
     }
 
     #[test]
@@ -400,7 +506,7 @@ mod tests {
         );
         let req = MessageRequest::new("deepseek-chat").with_messages(vec![assistant_with_thinking]);
         let wire = build_chat_request(&req, false).unwrap();
-        assert_eq!(wire.messages[0].content.as_deref(), Some("answer"));
+        assert_eq!(content_text(&wire.messages[0]), Some("answer"));
         assert_eq!(
             wire.messages[0].reasoning_content.as_deref(),
             Some("think think")
@@ -576,5 +682,178 @@ mod tests {
         let parsed = parse_chat_response(resp).unwrap();
         assert_eq!(parsed.usage.cache_read_input_tokens, Some(80));
         assert_eq!(parsed.usage.cache_creation_input_tokens, Some(20));
+    }
+
+    fn user_msg_with_image() -> Message {
+        Message::new(
+            Role::User,
+            vec![
+                ContentBlock::text("what is in this picture?"),
+                ContentBlock::Image {
+                    source: snaca_core::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgoAAEC".into(),
+                    },
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn vision_on_user_image_becomes_content_parts() {
+        // Without this: an image a user sends to a vision model over Chat
+        // Completions would go out as text only, or with a data URL the
+        // endpoint can't parse, and the model never sees it.
+        let req = MessageRequest::new("vision-model").with_messages(vec![user_msg_with_image()]);
+        let wire = build_chat_request_with_vision(&req, false, true).unwrap();
+        let msg = &wire.messages[0];
+        assert_eq!(msg.role, "user");
+        match &msg.content {
+            Some(WireContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                assert!(
+                    matches!(&parts[0], WireContentPart::Text { text } if text == "what is in this picture?")
+                );
+                match &parts[1] {
+                    WireContentPart::ImageUrl { image_url } => {
+                        assert_eq!(image_url.url, "data:image/png;base64,iVBORw0KGgoAAEC");
+                    }
+                    other => panic!("expected ImageUrl part, got {other:?}"),
+                }
+            }
+            other => panic!("expected Parts content, got {other:?}"),
+        }
+        // Serialises to OpenAI's multimodal shape.
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json["messages"][0]["content"][1]["type"],
+            json!("image_url")
+        );
+        assert_eq!(
+            json["messages"][0]["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,iVBORw0KGgoAAEC")
+        );
+    }
+
+    #[test]
+    fn vision_on_url_image_passes_url_through() {
+        // Without this: a URL image from a custom tool or SDK caller could be
+        // mangled on the Chat Completions wire, or ride behind an empty text
+        // part that stricter OpenAI-compatible endpoints reject.
+        let req = MessageRequest::new("vision-model").with_messages(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Image {
+                source: snaca_core::ImageSource::Url {
+                    url: "https://example.com/cat.png".into(),
+                },
+            }],
+        )]);
+        let wire = build_chat_request_with_vision(&req, false, true).unwrap();
+        match &wire.messages[0].content {
+            Some(WireContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 1, "empty text part is dropped");
+                assert!(matches!(
+                    &parts[0],
+                    WireContentPart::ImageUrl { image_url }
+                        if image_url.url == "https://example.com/cat.png"
+                ));
+            }
+            other => panic!("expected Parts content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_off_user_image_degrades_to_placeholder_text() {
+        // Without this: on DeepSeek's text-only models (the default) a user's
+        // image goes out as an image_url part and the request is rejected — on
+        // every later turn too, since the image stays in history.
+        let req = MessageRequest::new("deepseek-chat").with_messages(vec![user_msg_with_image()]);
+        let wire = build_chat_request_with_vision(&req, false, false).unwrap();
+        assert_eq!(wire.messages[0].role, "user");
+        match &wire.messages[0].content {
+            Some(WireContent::Text(text)) => {
+                assert!(text.contains("what is in this picture?"));
+                assert!(text.contains("[image omitted: image/png"));
+            }
+            other => panic!("expected Text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_on_tool_result_image_deferred_to_user_message() {
+        // Without this: Chat Completions tool messages are text-only, so an
+        // image a tool returns would be dropped and the vision model answers
+        // without ever seeing it.
+        let tool_result = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![
+                    ContentBlock::text("cat.png:"),
+                    ContentBlock::Image {
+                        source: snaca_core::ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "iVBORw0KGgoAAEC".into(),
+                        },
+                    },
+                ],
+            )],
+        );
+        let req = MessageRequest::new("vision-model").with_messages(vec![tool_result]);
+        let wire = build_chat_request_with_vision(&req, false, true).unwrap();
+        // tool message (text only) + follow-up user message carrying the image.
+        assert_eq!(wire.messages.len(), 2);
+        assert_eq!(wire.messages[0].role, "tool");
+        assert_eq!(
+            content_text(&wire.messages[0]),
+            Some("cat.png:"),
+            "tool message stays text-only"
+        );
+        assert_eq!(wire.messages[1].role, "user");
+        match &wire.messages[1].content {
+            Some(WireContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], WireContentPart::Text { text }
+                    if text.contains("call_1")));
+                assert!(matches!(
+                    &parts[1],
+                    WireContentPart::ImageUrl { image_url }
+                        if image_url.url == "data:image/png;base64,iVBORw0KGgoAAEC"
+                ));
+            }
+            other => panic!("expected Parts content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_off_tool_result_image_appends_placeholder() {
+        // Without this: on a text-only model (DeepSeek's default) a tool's
+        // image is still sent as an image part in a follow-up user message,
+        // and the request is rejected.
+        let tool_result = Message::new(
+            Role::Tool,
+            vec![ContentBlock::tool_result(
+                ToolUseId::new("call_1"),
+                vec![
+                    ContentBlock::text("cat.png:"),
+                    ContentBlock::Image {
+                        source: snaca_core::ImageSource::Base64 {
+                            media_type: "image/jpeg".into(),
+                            data: "/9j/AAEC".into(),
+                        },
+                    },
+                ],
+            )],
+        );
+        let req = MessageRequest::new("deepseek-chat").with_messages(vec![tool_result]);
+        let wire = build_chat_request_with_vision(&req, false, false).unwrap();
+        assert_eq!(wire.messages.len(), 1, "no deferred user message");
+        match &wire.messages[0].content {
+            Some(WireContent::Text(text)) => {
+                assert!(text.contains("cat.png:"));
+                assert!(text.contains("[image omitted: image/jpeg"));
+            }
+            other => panic!("expected Text content, got {other:?}"),
+        }
     }
 }

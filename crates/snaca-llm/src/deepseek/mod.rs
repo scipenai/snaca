@@ -45,6 +45,13 @@ pub struct DeepSeekConfig {
     pub base_url: String,
     pub default_model: String,
     pub request_timeout: Duration,
+    /// Embed images (user attachments and tool-returned pixels) as
+    /// OpenAI `image_url` content parts; with `false` they degrade to
+    /// `[image omitted: …]` placeholder text. Default `false` —
+    /// DeepSeek's hosted `deepseek-chat` / `deepseek-reasoner` are
+    /// text-only. Flip to `true` when `base_url` points at a
+    /// vision-capable OpenAI-compatible endpoint (e.g. Qwen-VL, GLM-4V).
+    pub supports_vision: bool,
 }
 
 impl DeepSeekConfig {
@@ -54,6 +61,7 @@ impl DeepSeekConfig {
             base_url: DEFAULT_BASE_URL.into(),
             default_model: DEFAULT_MODEL.into(),
             request_timeout: DEFAULT_TIMEOUT,
+            supports_vision: false,
         }
     }
 
@@ -69,6 +77,11 @@ impl DeepSeekConfig {
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.request_timeout = t;
+        self
+    }
+
+    pub fn with_vision(mut self, enabled: bool) -> Self {
+        self.supports_vision = enabled;
         self
     }
 }
@@ -129,7 +142,8 @@ impl LlmClient for DeepSeekClient {
         if request.model.is_empty() {
             request.model = self.config.default_model.clone();
         }
-        let body = convert::build_chat_request(&request, false)?;
+        let body =
+            convert::build_chat_request_with_vision(&request, false, self.config.supports_vision)?;
         debug!(
             provider = "deepseek",
             model = %body.model,
@@ -171,7 +185,8 @@ impl LlmClient for DeepSeekClient {
         if request.model.is_empty() {
             request.model = self.config.default_model.clone();
         }
-        let body = convert::build_chat_request(&request, true)?;
+        let body =
+            convert::build_chat_request_with_vision(&request, true, self.config.supports_vision)?;
         debug!(
             provider = "deepseek",
             model = %body.model,
