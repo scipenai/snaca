@@ -12,9 +12,9 @@
 //! `with_memory_extractor(LlmMemoryExtractor::new(llm.clone(), ...))`
 //! actually fires.
 
-use snaca_core::{ProjectId, TenantId, ThreadId};
+use snaca_core::{Message, ProjectId, TenantId, ThreadId};
 use snaca_engine::{Engine, EngineConfig, TurnRequest};
-use snaca_engine::{FilteredMemoryExtractor, LlmMemoryExtractor, SensitiveFilter};
+use snaca_engine::{FilteredMemoryExtractor, LlmMemoryExtractor, MemoryExtractor, SensitiveFilter};
 use snaca_memory::{MemoryScope, MemoryStore};
 use snaca_state::Database;
 use snaca_tools_api::ToolRegistryBuilder;
@@ -214,4 +214,24 @@ async fn extractor_with_garbage_llm_output_is_a_noop() {
         all.is_empty(),
         "garbage LLM output should produce zero entries; got {all:?}"
     );
+}
+
+#[tokio::test]
+async fn extractor_leaves_room_for_reasoning() {
+    // Without this: thinking models count their reasoning against the
+    // extraction call's output cap. At the old 512, a ~2 K-char transcript
+    // made qwen3.8-flash run out mid-reasoning on 1 call in 8 and return
+    // no text, silently losing that turn's memories.
+    let llm = Arc::new(MockLlmClient::new());
+    llm.enqueue(assistant_text("[]"));
+    let extractor = LlmMemoryExtractor::new(llm.clone(), "mock-model".to_string());
+    extractor
+        .extract(
+            &TenantId::new("t"),
+            &ProjectId::from_raw("p"),
+            &[Message::user_text("call me Ann from now on")],
+        )
+        .await;
+    let max_tokens = llm.observed_requests()[0].max_tokens;
+    assert!(max_tokens.is_some_and(|m| m >= 2048), "{max_tokens:?}");
 }

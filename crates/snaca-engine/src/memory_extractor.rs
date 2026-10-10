@@ -151,6 +151,15 @@ const EXTRACTOR_SYSTEM_PROMPT: &str =
      *non-obvious* about it, which is the part worth keeping. The current \
      extractor cannot ask, so it returns nothing.";
 
+/// Output budget for the extraction call. The answer is a short JSON
+/// array, but thinking models reason first and the reasoning counts
+/// against the same budget (Responses' `max_output_tokens`, Anthropic's
+/// `max_tokens`). At the old 512, qwen3.8-flash ran out mid-reasoning on
+/// 1 call in 8 over a ~2 K-char transcript and returned no text at all.
+/// Only generated tokens are billed, so the headroom costs nothing on
+/// calls that don't use it.
+const EXTRACTOR_MAX_TOKENS: u32 = 4096;
+
 /// LLM-backed extractor. Builds a small structured-output prompt from
 /// the turn's transcript, calls the LLM once, parses the JSON reply
 /// into [`MemoryProposal`]s. Robust to bad output: parse failures or
@@ -347,7 +356,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
             .with_system(EXTRACTOR_SYSTEM_PROMPT)
             .with_messages(vec![user_msg])
             .with_tools(Vec::new())
-            .with_max_tokens(512);
+            .with_max_tokens(EXTRACTOR_MAX_TOKENS);
         let resp = match self.llm.create_message(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -365,6 +374,16 @@ impl MemoryExtractor for LlmMemoryExtractor {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if text.trim().is_empty() {
+            // Usually a thinking model that spent the whole budget
+            // reasoning (`stop_reason = MaxTokens`); name that rather than
+            // report an empty reply as malformed JSON.
+            warn!(
+                stop_reason = ?resp.stop_reason,
+                "memory extractor: LLM returned no text; skipping"
+            );
+            return Vec::new();
+        }
         let mut out = Self::parse_proposals(&text);
 
         // Validate names + scopes locally. Drop the bad entries with a
