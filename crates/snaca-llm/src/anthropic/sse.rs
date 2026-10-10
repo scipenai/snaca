@@ -187,25 +187,18 @@ where
     S: Stream<Item = LlmResult<Bytes>> + Send + 'static,
 {
     let stream = async_stream::try_stream! {
-        let mut buf = String::new();
+        let mut buf = crate::transport::SseLineBuffer::default();
         let mut event_type = String::new();
         let mut event_data = String::new();
         let mut input = std::pin::pin!(input);
 
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
-            // Lossy is fine: SSE is required to be UTF-8, and even if a
-            // byte-split chunk lands mid-codepoint we recover on the next
-            // chunk because the line we care about is fully buffered.
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // Split on raw bytes, decode per line: a chunk boundary can
+            // land mid-codepoint (see `SseLineBuffer`).
+            buf.push(&chunk);
 
-            while let Some(nl) = buf.find('\n') {
-                let mut line = buf[..nl].to_string();
-                buf.drain(..=nl);
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-
+            while let Some(line) = buf.next_line() {
                 if line.is_empty() {
                     if !event_data.is_empty() {
                         if let Some(ev) = translate_event(&event_type, &event_data)? {

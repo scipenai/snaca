@@ -288,21 +288,15 @@ where
     S: Stream<Item = LlmResult<Bytes>> + Send + 'static,
 {
     let stream = async_stream::try_stream! {
-        let mut buf = String::new();
+        let mut buf = crate::transport::SseLineBuffer::default();
         let mut state = StreamState::new();
         let mut input = std::pin::pin!(input);
 
         'outer: while let Some(chunk) = input.next().await {
             let chunk = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.push(&chunk);
 
-            while let Some(nl) = buf.find('\n') {
-                let mut line = buf[..nl].to_string();
-                buf.drain(..=nl);
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-
+            while let Some(line) = buf.next_line() {
                 let Some(payload) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -611,5 +605,39 @@ data: [DONE]\n\
         assert_eq!(text, "Hi");
         // [DONE] forced a synthetic MessageStop.
         assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn split_chunk_mid_codepoint_keeps_cjk_intact() {
+        // Without this: a CJK character cut by a network chunk boundary
+        // became two U+FFFD in DeepSeek's streamed text and tool-argument
+        // JSON.
+        use futures::executor::block_on;
+        use futures::stream;
+
+        let raw = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n"
+            .as_bytes();
+        let cut = raw.iter().position(|&b| b >= 0x80).unwrap() + 1;
+        let s = stream::iter(vec![
+            Ok::<_, LlmError>(Bytes::from(raw[..cut].to_vec())),
+            Ok(Bytes::from(raw[cut..].to_vec())),
+        ]);
+        let events: Vec<StreamEvent> = block_on(async {
+            parse_byte_stream(s)
+                .filter_map(|r| async { r.ok() })
+                .collect()
+                .await
+        });
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta {
+                    delta: ContentDelta::Text { text },
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "你好");
     }
 }

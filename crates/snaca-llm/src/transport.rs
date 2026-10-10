@@ -14,6 +14,8 @@
 //!   [`classify_error`] factor out the non-2xx response handling that
 //!   each provider mod.rs would otherwise repeat across the
 //!   stream/non-stream code paths.
+//! - SSE line framing: [`SseLineBuffer`] splits the raw byte stream on
+//!   `\n` *before* UTF-8 decoding, shared by every provider's SSE parser.
 
 use crate::classify::classify_http_error;
 use crate::error::{LlmError, LlmResult};
@@ -143,4 +145,67 @@ where
             Err(LlmError::StreamInterrupted(chain))
         }
     })
+}
+
+/// Byte-level line splitter for SSE bodies.
+///
+/// Network chunk boundaries are arbitrary: a multi-byte UTF-8 code point
+/// (any CJK character) can straddle two chunks. Decoding each chunk on its
+/// own turns both halves into U+FFFD and corrupts streamed text and
+/// tool-argument JSON. `\n` is a single byte that never occurs inside a
+/// multi-byte sequence, so buffering raw bytes and decoding only complete
+/// lines is always codepoint-safe.
+#[derive(Debug, Default)]
+pub(crate) struct SseLineBuffer {
+    buf: Vec<u8>,
+    /// Leading bytes of `buf` already searched and known to hold no `\n`,
+    /// so a long line arriving in many chunks is scanned once, not once
+    /// per chunk.
+    scanned: usize,
+}
+
+impl SseLineBuffer {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Next complete line with its `\n` (and a trailing `\r`) stripped,
+    /// or `None` until a full line is buffered.
+    pub(crate) fn next_line(&mut self) -> Option<String> {
+        let Some(offset) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') else {
+            self.scanned = self.buf.len();
+            return None;
+        };
+        let nl = self.scanned + offset;
+        self.scanned = 0;
+        let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod sse_line_buffer_tests {
+    use super::SseLineBuffer;
+
+    #[test]
+    fn multibyte_char_split_across_chunks_survives() {
+        // Without this: a CJK character cut by a network chunk boundary
+        // becomes two U+FFFD in streamed text and tool-argument JSON.
+        let line = "data: {\"text\":\"你好\"}\r\n".as_bytes();
+        // Split inside the 3-byte encoding of '你'.
+        let cut = line.iter().position(|&b| b >= 0x80).unwrap() + 1;
+        let mut buf = SseLineBuffer::default();
+        buf.push(&line[..cut]);
+        assert_eq!(buf.next_line(), None);
+        buf.push(&line[cut..]);
+        assert_eq!(
+            buf.next_line().as_deref(),
+            Some("data: {\"text\":\"你好\"}")
+        );
+        assert_eq!(buf.next_line(), None);
+    }
 }
