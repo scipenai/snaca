@@ -168,11 +168,9 @@ compact_keep_recent = 6
 # 可选：IM 多条碎片输入组装（默认开启）
 [im_input]
 # assembly_enabled = true
-# text_debounce_ms = 1500              # 连发短文本合成一轮
-# attachment_wait_secs = 90            # 文件先到时等待用户补要求
-# referential_text_wait_secs = 45      # "帮我看这个文件" 先到时等待后续文件
-# pending_expire_secs = 300            # 提醒后仍无补充则丢弃 pending
-# file_only_autorun = false            # false=文件-only 不自动跑 LLM
+# text_debounce_ms = 1500              # 连发的文字（或文字+文件）合成一轮，每来一条重新计时
+# attachment_wait_secs = 8             # 只有文件时等这么久，看有没有后续说明；到时间按原样提交
+# hard_cap_secs = 30                   # 从第一条消息算起最多等这么久，到时间一定提交
 
 # IM 插件，可写多个，进程级互相隔离
 [[plugins]]
@@ -446,10 +444,12 @@ LLM 看得到下面这套工具（顺序可能因 MCP / Skill 而扩展）：
 - **下行**（agent → 用户）：让 SNACA 用 `SendFile` 工具发文件，例如「把刚才生成的 markdown 用 SendFile 发给我」。
 - **上行**（用户 → agent）：直接在飞书拖文件 / 图片。SNACA 会先把同一用户的短时间多条 IM 输入组装成一轮：
   - `文件 → 处理要求`、`处理要求 → 文件`、`多个文件 → 处理要求` 都会合并后再进 agent。
-  - 只有文件、没有要求时，默认只暂存并提示用户继续发送处理要求；发送「开始处理」才按默认方式提交，发送「取消」会丢弃 pending。
-  - 普通连发文本只做短 debounce；`/snaca ...` 命令、审批/问题回复不参与组装。
+  - 只有文件、没有要求时，等 `attachment_wait_secs`（默认 8 秒）看有没有后续说明；等不到就把文件按原样提交，由模型判断怎么处理。等待期间发「取消」会丢弃这批待处理的文件。
+  - 组装只看时间和消息结构，不看消息内容。一轮开始之后才到的文件或说明，会作为下一轮处理——比如发图后超过 8 秒才补的文字，会得到第二条回复。
+  - 普通连发文本只做短 debounce（`text_debounce_ms`，默认 1.5 秒）；`/snaca ...` 命令、审批/问题回复不参与组装。
+  - 从第一条消息算起最多等 `hard_cap_secs`（默认 30 秒），避免一直等不到输入而卡住。
   - 群聊按 `(chat_id, user_id, reply_to)` 隔离，避免 A 的文件绑定到 B 的文字。
-  - `[im_input]` 可调等待窗口；`file_only_autorun = true` 可恢复文件-only 超时后自动处理。
+  - 等待窗口都在 `[im_input]` 里调；想让补充说明来得慢一些也能合并，就调大 `attachment_wait_secs`（并让 `hard_cap_secs` 不小于它）。
 - 文件真正提交给 agent 后，SNACA 落地两份：
   1. `<workspace>/<basename>` 让 Read/Bash 可见
   2. 走 memory 导入流水线：MD / code / zip 进程内解；PDF 走 `snaca-server/pdf` feature；DOCX / XLSX / PPTX 走仓库自带的 `office-extract` skill 出进程抽取（缺依赖时报错可见，主进程不挂）
